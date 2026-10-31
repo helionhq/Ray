@@ -1,0 +1,12 @@
+.env
+.env.*
+node_modules/
+target/
+dist/
+research/audio/
+research/out/
+*.log
+src-tauri/gen/
+.vite/
+*.pdb
+*.tsbuildinfo
