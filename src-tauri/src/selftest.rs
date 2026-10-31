@@ -1,0 +1,296 @@
+//! `ray --selftest <file.wav>` / `ray --selftest-stream <file.wav>`
+//!
+//! Headless verification of the real pipeline against the real APIs. Reads a
+//! 16 kHz mono PCM16 WAV, transcribes it through the shipping code path, runs
+//! cleanup, and prints both results. Keys come from Windows Credential Manager
+//! or the environment; nothing is compiled in.
+
+use std::time::Duration;
+
+use crate::config::{self, PipelineConfig};
+use crate::{cleanup, secrets, stt};
+
+pub fn run_selftest(path: &str, streaming: bool) -> i32 {
+    let wav = match read_wav(path) {
+        Ok(wav) => wav,
+        Err(error) => {
+            eprintln!("[selftest] {error}");
+            return 2;
+        }
+    };
+    let key = secrets::get(secrets::ASSEMBLYAI);
+    let Some(api_key) = key else {
+        eprintln!("[selftest] ASSEMBLYAI_API_KEY is not set (environment or Credential Manager)");
+        return 2;
+    };
+    let mut config = PipelineConfig::default();
+    if let Ok(mode) = std::env::var("RAY_STT_MODE") {
+        if !mode.trim().is_empty() {
+            config.stt.mode = mode.trim().to_string();
+        }
+    }
+    if std::env::var("RAY_TEST_FORCE_FALLBACK").is_ok() {
+        if let Some(provider) = config.cleanup.providers.get_mut(0) {
+            provider.base_url = "https://127.0.0.1:9/v1".into();
+        }
+    }
+    let dictionary: Vec<String> = std::env::var("RAY_TEST_DICTIONARY")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|term| term.trim().to_string())
+                .filter(|term| !term.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut keyterms = dictionary.clone();
+    for name in &config.known_names {
+        if !keyterms.iter().any(|term| term.eq_ignore_ascii_case(name)) {
+            keyterms.push(name.clone());
+        }
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[selftest] could not start the runtime: {error}");
+            return 2;
+        }
+    };
+
+    runtime.block_on(async move {
+        let http = match reqwest::Client::builder()
+            .user_agent("Ray/0.1 selftest")
+            .build()
+        {
+            Ok(http) => http,
+            Err(error) => {
+                eprintln!("[selftest] http client: {error}");
+                return 2;
+            }
+        };
+
+        println!(
+            "[selftest] {} · {:.1}s · model {} · {}",
+            path,
+            wav.samples.len() as f32 / 16_000.0,
+            if streaming {
+                &config.stt.sync_live.model
+            } else {
+                &config.stt.batch.model
+            },
+            if streaming { &config.stt.mode } else { "batch" }
+        );
+
+        let raw = if streaming {
+            let session =
+                stt::spawn_live(api_key, config.stt.clone(), keyterms.clone(), http.clone());
+            let bytes = pcm16_bytes(&wav.samples);
+            let mut sent = 0usize;
+            for chunk in bytes.chunks(3_200) {
+                if session.audio_sender().send(chunk.to_vec()).is_err() {
+                    eprintln!("[selftest] live task closed the audio channel");
+                    break;
+                }
+                sent += chunk.len();
+                tokio::time::sleep(Duration::from_millis(90)).await;
+            }
+            println!("[selftest] sent {} bytes of audio", sent);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            match session.finish(Duration::from_secs(20)).await {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("[selftest] streaming failed: {error}");
+                    return 1;
+                }
+            }
+        } else {
+            let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
+            match stt::transcribe_wav(&http, &api_key, &keyterms, wav_bytes, &config.stt).await {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("[selftest] batch transcription failed: {error}");
+                    return 1;
+                }
+            }
+        };
+
+        println!("\n--- RAW ---\n{raw}");
+
+        let result = cleanup::cleanup(
+            &http,
+            &config.cleanup,
+            config::EMBEDDED_PROMPT,
+            &raw,
+            &dictionary,
+            &config.known_names,
+            "Notepad",
+        )
+        .await;
+        println!(
+            "\n--- CLEAN ({}) ---\n{}",
+            result
+                .provider
+                .clone()
+                .unwrap_or_else(|| "raw fallback".into()),
+            result.text
+        );
+        if let Some(note) = result.note {
+            println!("\n[selftest] note: {note}");
+        }
+        0
+    })
+}
+
+struct WavFile {
+    samples: Vec<i16>,
+}
+
+fn read_wav(path: &str) -> Result<WavFile, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("Could not read {path}: {error}"))?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(format!("{path} is not a RIFF/WAVE file"));
+    }
+    let mut position = 12usize;
+    let mut format: Option<(u16, u16, u32, u16)> = None;
+    let mut data: Option<Vec<u8>> = None;
+    while position + 8 <= bytes.len() {
+        let id = &bytes[position..position + 4];
+        let size = u32::from_le_bytes(
+            bytes[position + 4..position + 8]
+                .try_into()
+                .map_err(|_| "bad chunk size")?,
+        ) as usize;
+        let start = position + 8;
+        let mut end = start.saturating_add(size);
+        // Streaming encoders (including Deepgram's WAV output) leave a
+        // placeholder size on the data chunk. Accept the rest of the file.
+        if id == b"data" && end > bytes.len() {
+            end = bytes.len();
+        }
+        if end > bytes.len() {
+            break;
+        }
+        match id {
+            b"fmt " if size >= 16 => {
+                let code = u16::from_le_bytes([bytes[start], bytes[start + 1]]);
+                let channels = u16::from_le_bytes([bytes[start + 2], bytes[start + 3]]);
+                let rate = u32::from_le_bytes([
+                    bytes[start + 4],
+                    bytes[start + 5],
+                    bytes[start + 6],
+                    bytes[start + 7],
+                ]);
+                let bits = u16::from_le_bytes([bytes[start + 14], bytes[start + 15]]);
+                format = Some((code, channels, rate, bits));
+            }
+            b"data" => data = Some(bytes[start..end].to_vec()),
+            _ => {}
+        }
+        position = end + (size & 1);
+    }
+
+    let (code, channels, sample_rate, bits) =
+        format.ok_or_else(|| "WAV has no fmt chunk".to_string())?;
+    if bits != 16 || (code != 1 && code != 0xFFFE) {
+        return Err(format!(
+            "Expected 16-bit PCM WAV, got format {code} with {bits}-bit samples"
+        ));
+    }
+    if sample_rate != 16_000 {
+        return Err(format!(
+            "Expected 16 kHz audio, got {sample_rate} Hz. Resample it first."
+        ));
+    }
+    if channels == 0 {
+        return Err("WAV has zero channels".into());
+    }
+    let data = data.ok_or_else(|| "WAV has no data chunk".to_string())?;
+    let frames: Vec<i16> = data
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let samples = if channels == 1 {
+        frames
+    } else {
+        frames
+            .chunks(channels as usize)
+            .map(|frame| {
+                let sum: i32 = frame.iter().map(|sample| *sample as i32).sum();
+                (sum / frame.len() as i32) as i16
+            })
+            .collect()
+    };
+    Ok(WavFile { samples })
+}
+
+fn pcm16_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+/// `ray --selftest-mic`: verifies that the real capture path opens the
+/// microphone and produces PCM without speaking.
+pub fn run_mic_test() -> i32 {
+    use std::sync::atomic::Ordering;
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[mic] could not start the runtime: {error}");
+            return 2;
+        }
+    };
+    runtime.block_on(async {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let capture = match tokio::task::spawn_blocking(move || crate::audio::start(None, tx)).await
+        {
+            Ok(Ok(capture)) => capture,
+            Ok(Err(error)) => {
+                eprintln!("[mic] {error}");
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("[mic] task failed: {error}");
+                return 1;
+            }
+        };
+        let level = capture.level_handle();
+        let mut peak = 0f32;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peak = peak.max(f32::from_bits(level.load(Ordering::Relaxed)));
+        }
+        let samples = tokio::task::spawn_blocking(move || {
+            let mut capture = capture;
+            capture.stop()
+        })
+        .await
+        .unwrap_or_default();
+        drop(rx);
+        println!(
+            "[mic] {} samples ({:.1}s at 16 kHz), peak level {:.2}",
+            samples.len(),
+            samples.len() as f32 / 16_000.0,
+            peak
+        );
+        if samples.len() >= 16_000 {
+            0
+        } else {
+            eprintln!("[mic] expected at least one second of audio");
+            1
+        }
+    })
+}

@@ -1,0 +1,68 @@
+{
+  "known_names": [
+    "Arham", "Helion", "Ray", "Claude", "ChatGPT", "Grok", "Groq", "Gemini",
+    "Anthropic", "OpenAI", "Vercel", "Tauri", "Supabase", "Linear", "Notion",
+    "Kubernetes", "PostgreSQL", "Next.js", "shadcn", "Tailwind", "TypeScript",
+    "GitHub", "Slack", "Deepgram", "AssemblyAI", "Typeless", "Rust", "pnpm"
+  ],
+  "stt": {
+    "provider": "assemblyai",
+    "streaming": true,
+    "mode": "sync_live",
+    "speech_model": "universal-3-6-pro",
+    "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
+    "language_codes": ["en"],
+    "sample_rate": 16000,
+    "encoding": "pcm_s16le",
+    "format_turns": true,
+    "max_turn_silence": 700,
+    "end_of_turn_confidence_threshold": 0.4,
+    "force_endpoint_timeout_ms": 2500,
+    "terminate_timeout_ms": 1800,
+    "connect_timeout_ms": 8000,
+    "keyterms_limit": 100,
+    "sync_live": {
+      "endpoint": "https://sync.assemblyai.com/v1/transcribe/live",
+      "model": "universal-3-5-pro",
+      "max_audio_seconds": 120,
+      "request_timeout_ms": 300000
+    },
+    "batch": {
+      "endpoint": "https://sync.assemblyai.com/v1/transcribe",
+      "model": "universal-3-5-pro",
+      "v2_fallback": true,
+      "speech_models": ["universal-3-5-pro", "universal-2"],
+      "poll_interval_ms": 700,
+      "timeout_ms": 45000
+    }
+  },
+  "cleanup": {
+    "enabled": true,
+    "temperature": 0.0,
+    "max_tokens": 1200,
+    "timeout_ms": 15000,
+    "retries": 2,
+    "backoff_ms": [300, 900],
+    "providers": [
+      {
+        "id": "assemblyai",
+        "base_url": "https://llm-gateway.assemblyai.com/v1",
+        "model": "gemma-4-31b",
+        "api_key_secret": "assemblyai"
+      },
+      {
+        "id": "groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "openai/gpt-oss-120b",
+        "api_key_secret": "groq",
+        "extra_body": { "reasoning_effort": "low" }
+      },
+      {
+        "id": "vercel",
+        "base_url": "https://ai-gateway.vercel.sh/v1",
+        "model": "openai/gpt-4o-mini",
+        "api_key_secret": "vercel"
+      }
+    ]
+  }
+}
