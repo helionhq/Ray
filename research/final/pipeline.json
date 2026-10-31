@@ -1,0 +1,198 @@
+{
+  "schema": "ray.dictation.pipeline.v1",
+  "generated": "2026-11-01",
+  "recommendation": "AssemblyAI Sync live STT (Universal-3.5 Pro) + our own LLM cleanup pass (Gemma 4 31B on AssemblyAI LLM Gateway, Groq gpt-oss-120b fallback)",
+  "audio_capture": {
+    "format": "pcm_s16le",
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "chunk_ms": 200,
+    "notes": "Capture 16 kHz mono; keep a WAV/PCM buffer locally as the batch-fallback payload."
+  },
+  "stt": {
+    "provider": "assemblyai",
+    "product": "Sync STT",
+    "primary": {
+      "mode": "live_streaming_upload",
+      "endpoint": "https://sync.assemblyai.com/v1/transcribe/live",
+      "method": "POST",
+      "headers": {
+        "Authorization": "<ASSEMBLYAI_API_KEY>  (raw key; 'Bearer ' prefix optional)",
+        "X-AAI-Model": "universal-3-5-pro",
+        "Content-Type": "multipart/form-data; boundary=<boundary>",
+        "Transfer-Encoding": "chunked"
+      },
+      "multipart_order": [
+        "config (application/json) - MUST be sent before audio",
+        "audio (audio/pcm) - raw S16LE, streamed as captured"
+      ],
+      "config": {
+        "sample_rate": 16000,
+        "channels": 1,
+        "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
+        "keyterms_prompt": [
+          "Arham",
+          "Helion",
+          "Ray",
+          "Claude",
+          "ChatGPT",
+          "Grok",
+          "Groq",
+          "Gemini",
+          "Anthropic",
+          "OpenAI",
+          "Vercel",
+          "Tauri",
+          "Supabase",
+          "Linear",
+          "Notion",
+          "Kubernetes",
+          "PostgreSQL",
+          "Next.js",
+          "shadcn",
+          "Tailwind",
+          "TypeScript",
+          "GitHub",
+          "Slack",
+          "Deepgram",
+          "AssemblyAI",
+          "Typeless",
+          "Rust",
+          "pnpm"
+        ],
+        "timestamps": false,
+        "language_codes": [
+          "en"
+        ]
+      },
+      "limits": {
+        "max_audio_seconds": 120,
+        "max_request_seconds": 300,
+        "max_keyterms": 100,
+        "max_keyterm_chars": 8000,
+        "max_prompt_chars": 6000
+      },
+      "response": "JSON: {text, words[{text,confidence}], confidence, audio_duration_ms, session_id, request_time_ms}",
+      "post_stop_finalize_ms_measured": {
+        "p50": 600,
+        "range": [
+          483,
+          1571
+        ]
+      },
+      "notes": "Server transcribes during upload; only the tail + final decode remain after the user stops. No partial transcripts are returned. 120 s cap per request: for longer dictations, close and reopen the request at a silence boundary (or fall back to batch) and concatenate."
+    },
+    "fallback": {
+      "mode": "batch",
+      "endpoint": "https://sync.assemblyai.com/v1/transcribe",
+      "headers": {
+        "Authorization": "<ASSEMBLYAI_API_KEY>",
+        "X-AAI-Model": "universal-3-5-pro"
+      },
+      "body": "multipart: config (JSON, includes prompt + keyterms_prompt) + audio (audio/wav or audio/pcm)",
+      "limits": {
+        "max_audio_seconds": 1200,
+        "max_bytes": 268435456
+      },
+      "when": "live connection fails, 429/503, or upload exceeds 120 s without a clean break"
+    },
+    "rejected": {
+      "product": "AssemblyAI Dictation API",
+      "endpoint": "https://dictation.assemblyai.com/v1/transcribe",
+      "reason": "Faster to integrate but loses content (deletes instruction-like sentences; dropped words), fails contextual name disambiguation (Grok/Groq), and rewrite latency is higher (p50 1.85-1.94 s, p95 3.6 s). Price $0.62/hr incl. rewrite."
+    },
+    "pricing_note": "Sync STT $0.45/hr + $0.05/hr keyterms on the current pricing page; some AssemblyAI pages list $0.30/hr. Budget at $0.45."
+  },
+  "llm_cleanup": {
+    "request": {
+      "system_prompt_file": "research/final/cleanup_system_prompt.md",
+      "placeholders": {
+        "{{DICTIONARY}}": "comma-separated user dictionary terms",
+        "{{KNOWN_NAMES}}": "comma-separated built-in product/company list",
+        "{{APP_NAME}}": "foreground app/process name or 'unknown'"
+      },
+      "user_message_template": "<transcript>\n{{TRANSCRIPT}}\n</transcript>",
+      "temperature": 0,
+      "max_tokens": 1200,
+      "stream": true,
+      "timeout_ms": 15000
+    },
+    "primary": {
+      "provider": "assemblyai_llm_gateway",
+      "base_url": "https://llm-gateway.assemblyai.com/v1",
+      "model": "gemma-4-31b",
+      "auth_header": "Authorization: Bearer <ASSEMBLYAI_API_KEY>",
+      "pricing_per_million_tokens": {
+        "input": 0.14,
+        "output": 0.4
+      },
+      "rate_limit": "30 requests/min per model (paid accounts; free accounts cannot use LLM Gateway)",
+      "measured_latency_ms": {
+        "p50": 1558,
+        "p95": 1872,
+        "max": 3372
+      },
+      "quality": "best: contextual Grok/Groq, paragraphing, lists, instruction preservation"
+    },
+    "fallback": {
+      "provider": "groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "model": "openai/gpt-oss-120b",
+      "auth_header": "Authorization: Bearer <GROQ_API_KEY>",
+      "extra_params": {
+        "reasoning_effort": "low"
+      },
+      "pricing": "free tier",
+      "rate_limit_observed": {
+        "requests_per_day": 1000,
+        "tokens_per_minute": 8000,
+        "tokens_per_day": 200000
+      },
+      "measured_latency_ms": {
+        "p50": 476,
+        "p95": 890,
+        "max": 1108
+      },
+      "when": "gateway 429/5xx/timeout, or if lowest latency is required",
+      "capacity_note": "Free tier TPD (~200k) limits a heavy user to ~150 dictations/day at ~1.35k tokens each. Use as fallback/fast mode, not primary."
+    },
+    "last_resort": {
+      "behavior": "insert the raw STT transcript",
+      "note": "Always better than dropping the dictation; raw text is punctuated and readable."
+    },
+    "retry_policy": {
+      "retries": 2,
+      "backoff_ms": [
+        300,
+        900
+      ],
+      "on": [
+        429,
+        500,
+        502,
+        503,
+        504
+      ],
+      "then": "switch to fallback model once, then raw transcript"
+    }
+  },
+  "pipeline": {
+    "steps": [
+      "1. Hotkey down: open STT live request, send config part immediately, then PCM chunks every ~200 ms.",
+      "2. Hotkey up: send final multipart boundary; await JSON transcript (post-stop ~0.5-0.7 s typical).",
+      "3. Build system prompt with dictionary + known names + foreground app name; send transcript in <transcript> tags.",
+      "4. Stream LLM response; on first token show progress in the HUD; insert complete text at caret on completion.",
+      "5. If STT returns empty/short noise, do nothing; if LLM fails, insert raw transcript."
+    ],
+    "end_to_end_latency_ms_estimate": {
+      "typical_10s_dictation_with_gemma": 2100,
+      "typical_10s_dictation_with_gpt_oss_120b": 1000,
+      "long_60s_dictation_with_gemma": 3400
+    },
+    "cost_estimate_per_1000_dictations_15s": {
+      "stt_usd": 2,
+      "llm_gemma_usd": 0.3,
+      "note": "STT at $0.45-0.50/hr including keyterms; ~4.2 h audio"
+    }
+  }
+}
