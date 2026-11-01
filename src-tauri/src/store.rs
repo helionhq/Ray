@@ -103,11 +103,7 @@ impl Store {
             .map_err(|error| format!("Serialize local state: {error}"))?;
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, text).map_err(|error| format!("Write local state: {error}"))?;
-        if fs::rename(&tmp, &self.path).is_err() {
-            // Windows will not rename over an existing file.
-            let _ = fs::remove_file(&self.path);
-            fs::rename(&tmp, &self.path).map_err(|error| format!("Save local state: {error}"))?;
-        }
+        fs::rename(&tmp, &self.path).map_err(|error| format!("Save local state: {error}"))?;
         Ok(())
     }
 

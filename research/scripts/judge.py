@@ -107,15 +107,21 @@ def main() -> None:
             user = (f"<transcript>\n{r['transcript']}\n</transcript>\n\n"
                     f"<ideal>\n{s['ideal']}\n</ideal>\n\n<model_output>\n{r['text']}\n</model_output>")
             raw = call(args.judge, JUDGE_SYSTEM, user)
-            j = parse(raw)
             time.sleep(args.sleep)
+            if raw.startswith("__ERR__"):
+                print(f"  judge call fail {sid}: {raw[:120]}")
+                continue
+            j = parse(raw)
             if not j:
                 print(f"  judge parse fail {sid}: {raw[:120]}")
+                continue
+            if any(d not in j or isinstance(j[d], bool) or not isinstance(j[d], (int, float)) for d in dims):
+                print(f"  judge bad dimensions {sid}: {raw[:120]}")
                 continue
             j["id"] = sid
             rows.append(j)
             for d in dims:
-                agg[d].append(j.get(d, 0))
+                agg[d].append(j[d])
         if not rows:
             continue
         summary[tag] = {

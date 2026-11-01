@@ -152,14 +152,10 @@ async fn run_sync_live(
                     return true;
                 }
             }
-            let mut stopped = *segment_stop.borrow();
+            let mut stopped = false;
             while !stopped {
                 tokio::select! {
-                    changed = segment_stop.changed() => {
-                        if changed.is_err() || *segment_stop.borrow() {
-                            stopped = true;
-                        }
-                    }
+                    biased;
                     chunk = audio_rx.recv() => {
                         match chunk {
                             Some(bytes) => {
@@ -173,6 +169,11 @@ async fn run_sync_live(
                                 }
                             }
                             None => stopped = true,
+                        }
+                    }
+                    changed = segment_stop.changed() => {
+                        if changed.is_err() || *segment_stop.borrow() {
+                            stopped = true;
                         }
                     }
                 }

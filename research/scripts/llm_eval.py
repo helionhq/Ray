@@ -84,6 +84,8 @@ def stream_chat(base: str, key: str, model: str, system: str, user: str, tempera
             time.sleep(2.0 * (retries + 1))
             return stream_chat(base, key, model, system, user, temperature, retries + 1, reasoning)
         return {"ok": False, "error": f"HTTP {e.code}: {body[:400]}", "total_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        return {"ok": False, "error": f"network error: {e}", "total_ms": round((time.perf_counter() - t0) * 1000, 1)}
 
 
 def main() -> None:

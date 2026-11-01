@@ -33,12 +33,12 @@ pub struct Snapshot {
 }
 
 #[tauri::command]
-pub fn get_snapshot(
+pub async fn get_snapshot(
     store: State<'_, Arc<Store>>,
     dictation: State<'_, Arc<Dictation>>,
-) -> Snapshot {
+) -> Result<Snapshot, String> {
     let data = store.snapshot();
-    Snapshot {
+    Ok(Snapshot {
         history: data.history,
         dictionary: data.dictionary,
         settings: data.settings,
@@ -51,7 +51,7 @@ pub fn get_snapshot(
         config: dictation.config_summary(),
         launch_at_login: windows_util::launch_at_login(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-    }
+    })
 }
 
 #[tauri::command]

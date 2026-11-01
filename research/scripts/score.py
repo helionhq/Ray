@@ -12,8 +12,8 @@ from pathlib import Path
 
 from common import FINAL, OUT, corpus
 
-FILLERS = re.compile(r"\b(um+|uh+|erm+|ah+|you know|i mean|sort of|kind of|like,)\b", re.I)
-CORRECTION_CUES = re.compile(r"\b(no,? actually|sorry,|wait,? no|i mean,)\b", re.I)
+FILLERS = re.compile(r"\b(um+|uh+|erm+|ah+|you know|i mean|sort of|kind of|like,)(?!\w)", re.I)
+CORRECTION_CUES = re.compile(r"\b(no,? actually|sorry,|wait,? no|i mean,)(?!\w)", re.I)
 
 
 def norm_words(s: str) -> list[str]:
@@ -96,7 +96,7 @@ def main() -> None:
         for sid, r in results.items():
             if not r.get("ok"):
                 continue
-            s = score_one(scripts[sid], r["text"], stt[sid]["text"], names)
+            s = score_one(scripts[sid], r["text"], (stt.get(sid) or {}).get("text") or "", names)
             s["id"] = sid
             s["ttft_ms"] = r.get("ttft_ms")
             s["total_ms"] = r.get("total_ms")

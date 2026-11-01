@@ -124,17 +124,17 @@ def stream_live(host: str, path: str, cfg: dict, audio: bytes, chunk_ms: int = 5
 
 
 def log_spend(mode: str, seconds: float, note: str = "") -> None:
-    rate = 0.62 if mode.startswith("dictation") else 0.45
+    rate = 0.62 if mode.startswith("dictation") else 0.50
     cost = seconds / 3600 * rate
     path = OUT.parent / "SPEND.md"
     if not path.exists():
         path.write_text(
-            "# AssemblyAI spend log\n\n| run | mode | audio min | est. rate $/hr | est. cost $ | note |\n"
-            "|---|---|---|---|---|---|\n",
+            "# AssemblyAI spend log\n\n| run | mode | audio min | est. cost $ | note |\n"
+            "|---|---|---:|---:|---|\n",
             encoding="utf-8",
         )
     with path.open("a", encoding="utf-8") as f:
-        f.write(f"| {time.strftime('%Y-%m-%d %H:%M')} | {mode} | {seconds / 60:.2f} | {rate:.2f} | {cost:.4f} | {note} |\n")
+        f.write(f"| {time.strftime('%Y-%m-%d %H:%M')} | {mode} | {seconds / 60:.2f} | {cost:.4f} | {note} |\n")
 
 
 def main() -> None:
@@ -180,7 +180,7 @@ def main() -> None:
             cfg = cfg_base(names)
             if instruction:
                 cfg["llm_instruction"] = instruction
-                cfg["rewrite_mode"] = rewrite_mode
+                cfg["rewrite_mode"] = args.rewrite_mode
             r = stream_live("dictation.assemblyai.com", "/v1/transcribe/live", cfg, wav_bytes(path), realtime=args.realtime)
         else:
             cfg = {k: v for k, v in cfg_base(names).items() if k != "stt_prompt"}

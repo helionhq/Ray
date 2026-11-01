@@ -16,7 +16,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 enum Saved {
     Text(String),
     Image(ImageData<'static>),
-    Empty,
+    /// The clipboard held something we cannot read back (files, rich content,
+    /// or nothing at all). Leave it untouched on restore.
+    Unknown,
 }
 
 fn with_clipboard<T>(
@@ -47,7 +49,7 @@ fn save_clipboard() -> Saved {
     if let Ok(image) = image {
         return Saved::Image(image);
     }
-    Saved::Empty
+    Saved::Unknown
 }
 
 fn restore_clipboard(saved: Saved) {
@@ -58,9 +60,9 @@ fn restore_clipboard(saved: Saved) {
         Saved::Image(image) => {
             let _ = with_clipboard(move |clipboard| clipboard.set_image(image.clone()));
         }
-        Saved::Empty => {
-            let _ = with_clipboard(|clipboard| clipboard.clear());
-        }
+        // Unknown content cannot be restored; leave the clipboard as-is rather
+        // than destroying it.
+        Saved::Unknown => {}
     }
 }
 

@@ -145,6 +145,16 @@ pub fn start(
             let _ = thread.join();
             Err(message)
         }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // The worker exited without reporting ready; join it and surface
+            // whatever error it recorded.
+            let _ = thread.join();
+            Err(error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "The audio capture stopped unexpectedly".into()))
+        }
         Err(_) => {
             stop.store(true, Ordering::SeqCst);
             let _ = thread.join();

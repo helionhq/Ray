@@ -242,11 +242,11 @@ fn sanitize(content: &str) -> String {
         }
         text = text.trim().to_string();
     }
-    if text.len() >= 2
-        && ((text.starts_with('"') && text.ends_with('"'))
-            || (text.starts_with('“') && text.ends_with('”')))
+    if let Some(inner) = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .or_else(|| text.strip_prefix('“').and_then(|rest| rest.strip_suffix('”')))
     {
-        let inner = &text[1..text.len() - 1];
         if !inner.contains('"') && !inner.contains('“') {
             text = inner.trim().to_string();
         }
@@ -299,6 +299,7 @@ mod tests {
     fn strips_code_fences_and_quotes() {
         assert_eq!(sanitize("```text\nHello there.\n```"), "Hello there.");
         assert_eq!(sanitize("\"Hello there.\""), "Hello there.");
+        assert_eq!(sanitize("“Hello there.”"), "Hello there.");
         assert_eq!(
             sanitize("He said \"hello\" to me."),
             "He said \"hello\" to me."
