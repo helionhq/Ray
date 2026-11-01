@@ -536,25 +536,206 @@ fn has_meridiem(text: &str) -> bool {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Meridiem {
+    Am,
+    Pm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ClockTime {
+    hour: u32,
+    minute: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CueHalf {
+    Am,
+    Pm,
+    /// Noon and midnight can be written either way ("12 p.m." or "12 a.m.").
+    Twelve,
+}
+
+/// Words, lowercased, with surrounding punctuation stripped. Interior
+/// punctuation stays: "3:30," -> "3:30" and "p.m." -> "p.m".
+fn time_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| !character.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// "3", "3:30", "11" -> a clock time. Hours outside 1..=12 are not times;
+/// that keeps "330" from being read as an hour.
+fn parse_clock(text: &str) -> Option<ClockTime> {
+    let (hour_text, minute_text) = text
+        .split_once(':')
+        .map_or((text, None), |(hour, minute)| (hour, Some(minute)));
+    if hour_text.is_empty()
+        || hour_text.len() > 2
+        || !hour_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let hour = hour_text.parse::<u32>().ok()?;
+    let minute = match minute_text {
+        None => 0,
+        Some(minute) => {
+            if minute.len() != 2 || !minute.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            minute.parse::<u32>().ok()?
+        }
+    };
+    ((1..=12).contains(&hour) && minute <= 59).then_some(ClockTime { hour, minute })
+}
+
+/// Split a trailing "am"/"pm" off "3pm" or "3:30PM". A bare "am" (as in "I
+/// am") has no digit in front of it and is left alone.
+fn split_meridiem_suffix(text: &str) -> Option<(&str, Meridiem)> {
+    for (suffix, meridiem) in [("am", Meridiem::Am), ("pm", Meridiem::Pm)] {
+        if let Some(clock) = text.strip_suffix(suffix) {
+            if clock.ends_with(|character: char| character.is_ascii_digit()) {
+                return Some((clock, meridiem));
+            }
+        }
+    }
+    None
+}
+
+/// Parse one token as a clock time with its meridiem if it carries one.
+fn parse_time(text: &str) -> Option<(ClockTime, Option<Meridiem>)> {
+    let (clock, meridiem) = match split_meridiem_suffix(text) {
+        Some((clock, meridiem)) => (clock, Some(meridiem)),
+        None => (text, None),
+    };
+    parse_clock(clock).map(|clock| (clock, meridiem))
+}
+
+/// A standalone "am"/"pm"/"a.m"/"p.m" token, never one with digits.
+fn meridiem_word(text: &str) -> Option<Meridiem> {
+    if text.chars().any(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    match text.replace('.', "").as_str() {
+        "am" => Some(Meridiem::Am),
+        "pm" => Some(Meridiem::Pm),
+        _ => None,
+    }
+}
+
+/// Every "3:30 p.m." / "3pm" / "3 PM" in the cleaned output, paired with the
+/// clock time it belongs to. Each one has to be verified separately.
+fn cleaned_meridiems(cleaned: &str) -> Vec<(ClockTime, Meridiem)> {
+    let tokens = time_tokens(cleaned);
+    let mut found = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Some((clock, attached)) = parse_time(token) else {
+            continue;
+        };
+        if let Some(meridiem) = attached {
+            found.push((clock, meridiem));
+        } else if let Some(meridiem) = tokens.get(index + 1).and_then(|next| meridiem_word(next)) {
+            found.push((clock, meridiem));
+        }
+    }
+    found
+}
+
+fn cue_half(word: &str) -> Option<CueHalf> {
+    match word {
+        "morning" => Some(CueHalf::Am),
+        "afternoon" | "evening" | "night" | "tonight" => Some(CueHalf::Pm),
+        "noon" | "midnight" => Some(CueHalf::Twelve),
+        _ => None,
+    }
+}
+
+fn cue_matches(cue: CueHalf, clock: ClockTime, meridiem: Meridiem) -> bool {
+    match cue {
+        CueHalf::Am => meridiem == Meridiem::Am,
+        CueHalf::Pm => meridiem == Meridiem::Pm,
+        CueHalf::Twelve => clock.hour == 12,
+    }
+}
+
+/// Small linking words that may sit between a time and its cue ("3:30 in the
+/// afternoon", "this afternoon at 3:30", "3 tomorrow night"). A word outside
+/// this set means the cue belongs to a different clause, so it cannot justify
+/// this time.
+const CUE_LINKS: [&str; 23] = [
+    "a", "about", "after", "an", "around", "at", "by", "coming", "for", "from", "in", "next", "of",
+    "on", "that", "the", "this", "through", "till", "to", "today", "tomorrow", "until",
+];
+
+fn linked_by_cue_words(tokens: &[String], first: usize, second: usize) -> bool {
+    let (low, high) = if first < second {
+        (first + 1, second)
+    } else {
+        (second + 1, first)
+    };
+    high - low <= 3
+        && tokens[low..high]
+            .iter()
+            .all(|word| CUE_LINKS.contains(&word.as_str()))
+}
+
+/// True when a time-of-day cue within a few words of this time supports the
+/// requested meridiem. A cue elsewhere in the sentence does not count.
+fn cue_supports(tokens: &[String], index: usize, clock: ClockTime, meridiem: Meridiem) -> bool {
+    // At most three linking words may sit between the time and the cue.
+    const DISTANCE: usize = 4;
+    let start = index.saturating_sub(DISTANCE);
+    let end = (index + DISTANCE + 1).min(tokens.len());
+    (start..end).any(|other| {
+        other != index
+            && cue_half(&tokens[other]).is_some_and(|cue| cue_matches(cue, clock, meridiem))
+            && linked_by_cue_words(tokens, index, other)
+    })
+}
+
+/// Does the transcript back this exact time and meridiem? Either the speaker
+/// said the meridiem on that time ("3:30 pm") or a matching cue was attached
+/// to it ("3:30 in the afternoon", "this afternoon at 3:30").
+fn transcript_supports(tokens: &[String], clock: ClockTime, meridiem: Meridiem) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        let Some((spoken, attached)) = parse_time(token) else {
+            return false;
+        };
+        if spoken != clock {
+            return false;
+        }
+        let attached =
+            attached.or_else(|| tokens.get(index + 1).and_then(|next| meridiem_word(next)));
+        match attached {
+            // An explicit marker of the other half of the day is a change,
+            // not an omission; a nearby cue must not override it.
+            Some(said) => said == meridiem,
+            None => cue_supports(tokens, index, clock, meridiem),
+        }
+    })
+}
+
 /// The model must not invent a time of day. "Thursday at 3:30" became "3:30
-/// p.m." in round 2; only allow the marker when the speaker supplied it or a
-/// time-of-day word that justifies it.
+/// p.m." in round 2; only allow a marker when the transcript attaches that
+/// meridiem, or a matching time-of-day cue, to the same time. A cue elsewhere
+/// ("tomorrow morning ... at 3:30") is not evidence for this time.
 fn adds_meridiem(cleaned: &str, transcript: &str) -> bool {
-    if !has_meridiem(cleaned) || has_meridiem(transcript) {
+    if !has_meridiem(cleaned) {
         return false;
     }
-    const CUES: [&str; 9] = [
-        "morning",
-        "afternoon",
-        "evening",
-        "night",
-        "noon",
-        "midnight",
-        "tonight",
-        "a.m.",
-        "p.m.",
-    ];
-    !CUES.iter().any(|cue| contains_word(transcript, cue))
+    let added = cleaned_meridiems(cleaned);
+    if added.is_empty() {
+        // A marker we cannot attach to a clock time is not trustworthy.
+        return true;
+    }
+    let transcript = time_tokens(transcript);
+    added
+        .iter()
+        .any(|(clock, meridiem)| !transcript_supports(&transcript, *clock, *meridiem))
 }
 
 /// "Goff reply" became "Gough replied" in round 1: the model invented a person.
@@ -773,15 +954,73 @@ mod tests {
             "Book the room for Thursday at 3:30 p.m.",
             "Book the room for Thursday at 3:30."
         ));
+        // A cue elsewhere in the transcript must not justify this time.
+        assert!(!is_plausible(
+            "Meet tomorrow morning and call Dana at 3:30 p.m.",
+            "meet tomorrow morning and call Dana at 3:30"
+        ));
+        assert!(!is_plausible(
+            "We said this afternoon that we'd call Dana at 3:30 p.m.",
+            "we said this afternoon that we'd call Dana at 3:30"
+        ));
+        // A cue on the same time of day is enough.
         assert!(is_plausible("Call at 3:30 p.m.", "call at 3:30 pm"));
         assert!(is_plausible(
             "Call at 3:30 p.m.",
             "call at 3:30 in the afternoon"
         ));
-        // "I am" must not count as a clock marker.
+        assert!(is_plausible(
+            "Call at 3:30 p.m.",
+            "this afternoon at 3:30 works"
+        ));
+        assert!(is_plausible("Call at 3 p.m.", "call at 3 tonight"));
+        // The cue must match the half of day.
+        assert!(!is_plausible(
+            "Call at 3:30 p.m.",
+            "call at 3:30 in the morning"
+        ));
+        assert!(!is_plausible(
+            "Call at 3:30 a.m.",
+            "call at 3:30 in the afternoon"
+        ));
+        // Noon and midnight can justify 12 either way.
+        assert!(is_plausible("Lunch at 12 p.m.", "lunch at 12 noon"));
+        assert!(is_plausible("Lunch at 12 a.m.", "lunch at 12 midnight"));
+        assert!(!is_plausible("Lunch at 3 p.m.", "lunch at 12 noon"));
+        // "I am" must not count as a clock marker, nor should "am" alone.
         assert!(!is_plausible(
             "I am out on Friday at 3 p.m.",
             "I am out on Friday at 3"
+        ));
+        assert!(is_plausible("I am out at 3.", "I am out at 3."));
+    }
+
+    #[test]
+    fn checks_each_meridiem_against_its_own_time() {
+        // Only 3:30 is supported by the cue; 5 is not.
+        assert!(!is_plausible(
+            "Book 3:30 p.m. and 5 p.m.",
+            "book 3:30 in the afternoon and 5"
+        ));
+        assert!(is_plausible(
+            "Book 3:30 p.m.",
+            "book 3:30 in the afternoon and 5"
+        ));
+        // An explicit marker on one time does not cover another.
+        assert!(!is_plausible(
+            "Call 3:30 p.m. and 5 p.m.",
+            "call 3:30 pm and 5"
+        ));
+    }
+
+    #[test]
+    fn accepts_meridiem_spelling_variants_when_the_transcript_has_them() {
+        assert!(is_plausible("Call at 3 PM.", "call at 3 pm"));
+        assert!(is_plausible("Call at 3pm.", "call at 3 pm"));
+        assert!(is_plausible("Call at 11 a.m.", "call at 11 in the morning"));
+        assert!(is_plausible(
+            "Call at 3:30PM.",
+            "call at 3:30 in the evening"
         ));
     }
 
