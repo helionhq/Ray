@@ -46,3 +46,28 @@ from the artifacts. The two round-2 sweeps that do record usage (119.6k input / 
 on gemma-4-31b; 119.1k / 2.1k on qwen3.5-4b-32k-fast) add **~$0.03** at list rates, so the
 artifact-backed total is at least **~$0.94** before unrecorded round-2 calls. Deepgram TTS
 (~$0.38) is separate and not AssemblyAI.
+
+## Round 3 (current prompt re-run + held-out corpus)
+
+| run | mode | audio min | est. cost $ | note |
+|---|---|---:|---:|---|
+| app_v9 | sync live | 9.05 | 0.0754 | pre-fix 29-clip regression, warm |
+| hard_v9 | sync live | 5.41 | 0.0451 | pre-fix 18-clip hard, warm |
+| heldout_v9 | sync live | 4.64 | 0.0387 | pre-fix 20-clip held-out, warm |
+| heldout_bullets_probe | sync live | 0.23 | 0.0019 | ho-bullets ASR retry, same audio |
+| heldout_v9 bullets rerun | sync live | 0.23 | 0.0019 | ho-bullets after TTS voice fix |
+| app_v10 | sync live | 9.05 | 0.0754 | broad-rule prompt, regression |
+| hard_v10 | sync live | 5.41 | 0.0451 | broad-rule prompt, hard |
+| heldout_v10 partial | sync live | 0.52 | 0.0043 | broad-rule, stopped after 2 clips |
+| app_v11 | sync live | 9.05 | 0.0754 | final prompt, regression, warm |
+| hard_v11 | sync live | 5.41 | 0.0451 | final prompt, hard, warm |
+| heldout_v11 | sync live | 4.64 | 0.0387 | final prompt, 20-clip held-out, warm |
+| **round-3 subtotal** | | **53.64** | **0.4470** | |
+
+Round 3 adds **~$0.45** of AssemblyAI STT (pre-fix, broad-rule and final suites plus two
+single-clip retries), bringing artifact-backed STT spend to roughly **$1.30**. The 20-clip
+held-out corpus cost ~**$0.113** of Deepgram TTS (3,588 characters for the initial
+generation plus 175 characters to regenerate `ho-bullets` with a different voice). LLM
+Gateway cleanup and judge calls are not token-recorded by the app path or `judge.py`; at
+roughly 185 cleanup calls and 265 judge calls (including the corrected-ideal hard re-judge)
+they are about **$0.11** at list rates. Total spend remains well under the $10 cap.

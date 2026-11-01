@@ -66,3 +66,50 @@ hedged path. `sweep.py` resumes a partially finished tag, so a 429 pause does no
 Outputs land in `research/out/` (gitignored). `SPEND.md` is appended by `stt_test.py`.
 
 Provider endpoints and auth headers are documented in `research/final/pipeline.json`.
+
+## Round 3: current-prompt re-run and held-out corpus
+
+`research/corpus/heldout_scripts.json` is a 20-clip out-of-sample corpus: new people,
+places, products, numbers and scenarios, ids prefixed `ho-`. It was checked for shared
+4/5-grams and content numbers against the prompt examples and both existing corpora, so it
+does not reuse a sentence, name pairing, number or scenario. The run-on-list rule was
+narrowed after the first two post-fix attempts; `app_v11` / `hard_v11` / `heldout_v11` are
+the final runs on the frozen eval binary, and `app_v9` / `hard_v9` / `heldout_v9` are the
+pre-fix baseline.
+
+```bash
+cd research/scripts
+
+# Held-out TTS (~4.6 min audio, ~$0.11 Deepgram). --corpus defaults to hard_scripts.json.
+python gen_hard_audio.py --corpus ../corpus/heldout_scripts.json
+
+# Build, then copy the binary to a private path. Running target/debug/ray.exe directly locks
+# it, which breaks `pnpm tauri dev`; the copy is also the frozen binary behind the numbers.
+# After a prompt edit, rebuild into a separate target dir so the dev binary is untouched:
+#   cd ../src-tauri
+#   CARGO_TARGET_DIR='D:\dev\ray\src-tauri\target\eval-build' cargo build
+#   cp target/eval-build/debug/ray.exe target/eval/ray.exe
+cd ../review
+export RAY_REVIEW_EXE='D:\dev\ray\src-tauri\target\eval\ray.exe'
+python run_app_corpus.py --tag app_v11 --warm
+python run_app_corpus.py --tag hard_v11 --corpus ../corpus/hard_scripts.json --warm
+python run_app_corpus.py --tag heldout_v11 --corpus ../corpus/heldout_scripts.json --warm
+
+# Score / judge. App-path runs write out/stt/<tag>.json and out/llm/<tag>.json, so the
+# score tag and the --source stub are both <tag>.
+cd ../scripts
+python score.py --tags app_v11 --corpus ../corpus/scripts.json --source ../out/stt/app_v11.json
+python score.py --tags hard_v11 --corpus ../corpus/hard_scripts.json --source ../out/stt/hard_v11.json
+python score.py --tags heldout_v11 --corpus ../corpus/heldout_scripts.json --source ../out/stt/heldout_v11.json
+python judge.py --tags app_v11 --corpus ../corpus/scripts.json --source app_v11 --provider aai --judge qwen3.5-4b-32k-fast --sleep 2
+python judge.py --tags hard_v11 --corpus ../corpus/hard_scripts.json --source hard_v11 --provider aai --judge qwen3.5-4b-32k-fast --sleep 2
+python judge.py --tags heldout_v11 --corpus ../corpus/heldout_scripts.json --source heldout_v11 --provider aai --judge qwen3.5-4b-32k-fast --sleep 2
+```
+
+`run_app_corpus.py` merges into an existing tag, so `--ids <id>` can repair one clip without
+re-running the corpus. `judge.py` exits non-zero and reports a corpus mismatch when none of
+a tag's transcript ids are in the selected corpus; a mixed tag judges the matching ids and
+warns. The `ho-bullets` audio was regenerated once with a different Aura-2 voice after the
+first voice produced a deterministic ASR failure; the script above rebuilds all held-out
+audio from the corpus voices.
+

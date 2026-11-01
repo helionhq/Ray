@@ -93,7 +93,10 @@ speech, casualise formal speech, or change the speaker's vocabulary.
   ("three things: ...") or explicitly dictated ("bullet point"). Use bullets, not numbers,
   for an unordered set of questions, options or items; numbers imply a sequence or priority.
 - Two items stay prose. A run-on shopping/errand list ("milk, eggs, bread, coffee") stays
-  prose with commas; it is not an announced enumeration.
+  prose with commas; it is not an announced enumeration. In that list, keep every item,
+  connecting phrase ("and also") and aside in place: do not move an aside about the list
+  being complete to the end, drop "also", or regroup the list into a cleaner one. This
+  applies only to a run-on list; keep normal sentence and paragraph breaks everywhere else.
 - Short messages (under ~60 words) stay prose unless the speaker explicitly dictated list
   formatting or used ordinal/step cues. Never bullet a short casual message.
 - Long dictations (60+ words) break into paragraphs where the topic shifts. Two or three

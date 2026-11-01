@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -99,6 +100,7 @@ def main() -> None:
     stt = json.loads((OUT / "stt" / f"{args.source}.json").read_text(encoding="utf-8"))
 
     summary = {}
+    failed_tags = []
     for tag in args.tags.split(","):
         path = OUT / "llm" / f"{tag}.json"
         results = json.loads(path.read_text(encoding="utf-8"))
@@ -106,12 +108,16 @@ def main() -> None:
         agg = {d: [] for d in dims}
         rows = []
         ids = set(args.ids.split(",")) if args.ids else None
+        ok_records = 0
+        mismatched = 0
         for sid, r in results.items():
             if ids and sid not in ids:
                 continue
             if not r.get("ok"):
                 continue
+            ok_records += 1
             if sid not in scripts:
+                mismatched += 1
                 continue
             s = scripts[sid]
             user = (f"<transcript>\n{r['transcript']}\n</transcript>\n\n"
@@ -133,7 +139,12 @@ def main() -> None:
             for d in dims:
                 agg[d].append(j[d])
         if not rows:
+            if ok_records and mismatched == ok_records:
+                print(f"{tag:<52} no transcript ids match the corpus ({mismatched} checked); check --corpus")
+                failed_tags.append(tag)
             continue
+        if mismatched:
+            print(f"  {tag}: judged {len(rows)} ids; skipped {mismatched} ids not in the corpus")
         summary[tag] = {
             "n": len(rows),
             **{f"mean_{d}": round(sum(agg[d]) / len(agg[d]), 2) for d in dims},
@@ -144,8 +155,13 @@ def main() -> None:
               f"fmt={summary[tag]['mean_formatting']} safe={summary[tag]['mean_instruction_safety']}")
     path = OUT / "judge_results.json"
     merged = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    for tag in failed_tags:
+        merged.pop(tag, None)
     merged.update(summary)
     path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+    if failed_tags:
+        print(f"judge: no ids matched the corpus for: {', '.join(failed_tags)}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
