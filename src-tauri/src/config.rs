@@ -206,13 +206,6 @@ impl Default for CleanupConfig {
                     api_key_secret: "groq".into(),
                     extra_body: Some(serde_json::json!({ "reasoning_effort": "low" })),
                 },
-                CleanupProvider {
-                    id: "vercel".into(),
-                    base_url: "https://ai-gateway.vercel.sh/v1".into(),
-                    model: "openai/gpt-4o-mini".into(),
-                    api_key_secret: "vercel".into(),
-                    extra_body: None,
-                },
             ],
         }
     }
@@ -279,6 +272,8 @@ mod tests {
         assert_eq!(config.stt.sync_live.model, "universal-3-5-pro");
         assert_eq!(config.cleanup.providers[0].model, "gemma-4-31b");
         assert_eq!(config.cleanup.providers[1].model, "openai/gpt-oss-120b");
+        assert_eq!(config.cleanup.providers.len(), 2);
+        assert!(config.cleanup.providers.iter().all(|p| p.id != "vercel"));
         assert!(config.known_names.iter().any(|name| name == "Helion"));
         assert!(!EMBEDDED_PROMPT.trim().is_empty());
     }

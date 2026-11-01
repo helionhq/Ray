@@ -291,27 +291,19 @@ impl Dictation {
         let mut raw: Option<String> = None;
 
         if let Some(stream) = stream {
-            let too_long = pipeline.stt.mode.eq_ignore_ascii_case("sync_live")
-                && started.elapsed().as_secs()
-                    >= pipeline.stt.sync_live.max_audio_seconds.saturating_sub(3);
-            if too_long {
-                eprintln!("[ray] recording exceeded the Sync live limit; using batch");
-                stream.abort();
+            let timeout = if pipeline.stt.mode.eq_ignore_ascii_case("sync_live") {
+                Duration::from_millis(pipeline.stt.force_endpoint_timeout_ms + 5_000)
             } else {
-                let timeout = if pipeline.stt.mode.eq_ignore_ascii_case("sync_live") {
-                    Duration::from_millis(pipeline.stt.force_endpoint_timeout_ms + 5_000)
-                } else {
-                    Duration::from_millis(
-                        pipeline.stt.force_endpoint_timeout_ms
-                            + pipeline.stt.terminate_timeout_ms
-                            + 3_000,
-                    )
-                };
-                match stream.finish(timeout).await {
-                    Ok(text) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
-                    Ok(_) => eprintln!("[ray] streaming returned no text; trying batch"),
-                    Err(error) => eprintln!("[ray] streaming failed; trying batch: {error}"),
-                }
+                Duration::from_millis(
+                    pipeline.stt.force_endpoint_timeout_ms
+                        + pipeline.stt.terminate_timeout_ms
+                        + 3_000,
+                )
+            };
+            match stream.finish(timeout).await {
+                Ok(text) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
+                Ok(_) => eprintln!("[ray] streaming returned no text; trying batch"),
+                Err(error) => eprintln!("[ray] streaming failed; trying batch: {error}"),
             }
         }
 

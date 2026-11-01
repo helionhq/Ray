@@ -249,12 +249,6 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
           "First fallback; the fastest cleanup path when the gateway is busy.",
           "Paste your Groq key",
         )}
-        {keyEditor(
-          "vercel",
-          "Vercel AI Gateway key",
-          "Optional third provider. Used only if the first two fail.",
-          "Paste your AI Gateway key",
-        )}
         <div className="setting-row setting-row-stack">
           <div className="setting-help">
             Model chain: {snapshot.config.cleanup_models.join("  →  ")}

@@ -6,7 +6,7 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar
 
 ## What it does
 
-- **Right Alt toggles recording.** A low-level keyboard hook swallows the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held turns it into a normal chord (AltGr etc.) and cancels the recording. **Esc** cancels.
+- **Right Alt toggles recording.** A low-level keyboard hook swallows both edges of the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held cancels the recording and lets that key through. **Esc** cancels.
 - **AssemblyAI Sync live** streams 16 kHz mono PCM while you talk. Stopping leaves only the tail and final decode (~0.5 s typical). If live fails, Ray falls back to Sync batch, then the asynchronous v2 batch API, using the locally buffered WAV.
 - **Cleanup** sends the transcript through an OpenAI-compatible chat endpoint. Default chain: `gemma-4-31b` on the AssemblyAI LLM Gateway (same key as STT) → `openai/gpt-oss-120b` on Groq → Vercel AI Gateway if you add a key. If every provider fails, the raw transcript is pasted rather than lost.
 - **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard.
@@ -38,7 +38,6 @@ For development and headless tests, the app also accepts environment variables w
 
 - `ASSEMBLYAI_API_KEY`
 - `GROQ_API_KEY`
-- `VERCEL_AI_GATEWAY_KEY` (or `AI_GATEWAY_API_KEY`)
 
 Put them in a local `.env` (gitignored) and export it before launching, or set them in the shell. The AssemblyAI key powers both STT and the primary cleanup model.
 
@@ -108,8 +107,8 @@ The bar window is a separate Tauri window (`bar.html`). It is styled with `WS_EX
 
 ## Known limits
 
-- Sync live accepts up to 120 s of audio per request; longer dictations automatically use the batch endpoint.
+- Sync live accepts up to 120 s of audio per request; longer dictations roll over to a new live request and the segment transcripts are concatenated. If the live path fails, the batch endpoint is used.
 - Pasting into elevated (admin) windows can be blocked by Windows UIPI.
-- On layouts where Right Alt is AltGr, pressing Right Alt alone may be interpreted by the layout; holding it and pressing another key cancels dictation and restores the chord.
+- On layouts where Right Alt is AltGr, pressing Right Alt alone may be interpreted by the layout; holding it and pressing another key cancels dictation. The modifier itself is not forwarded in that case.
 - Groq's free tier has a daily token cap; the app falls back to the next provider or raw text.
 - Multi-monitor placement is implemented but only verified on a single monitor.

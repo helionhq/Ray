@@ -269,6 +269,11 @@ fn is_plausible(cleaned: &str, transcript: &str) -> bool {
     if transcript_len <= 12 && cleaned_len > 80 {
         return false;
     }
+    // Cleanup shortens a little (fillers, self-corrections), but a long
+    // transcript that loses most of its content is a bad answer, not cleanup.
+    if transcript_len > 200 && cleaned_len * 3 < transcript_len {
+        return false;
+    }
     true
 }
 

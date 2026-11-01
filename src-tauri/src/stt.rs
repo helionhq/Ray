@@ -9,35 +9,27 @@
 //! - Universal Streaming over WebSocket (partial turns while speaking).
 //! - Sync batch, then the older asynchronous v2 upload/poll API, using the
 //!   locally buffered WAV when live fails.
-
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use crate::config::{BatchConfig, SttConfig};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
-
-use crate::config::{BatchConfig, SttConfig};
-
 const WEBSOCKET_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
 const V2_URL: &str = "https://api.assemblyai.com/v2";
-
 static BOUNDARY_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// One live transcription session, whichever protocol the config selects.
 pub enum LiveSession {
     WebSocket(StreamSession),
     SyncLive(SyncLiveSession),
 }
-
 impl LiveSession {
     pub fn audio_sender(&self) -> mpsc::UnboundedSender<Vec<u8>> {
         match self {
@@ -45,14 +37,12 @@ impl LiveSession {
             Self::SyncLive(session) => session.audio_tx.clone(),
         }
     }
-
     pub async fn finish(self, timeout: Duration) -> Result<String, String> {
         match self {
             Self::WebSocket(session) => session.finish(timeout).await,
             Self::SyncLive(session) => session.finish(timeout).await,
         }
     }
-
     pub fn abort(self) {
         match self {
             Self::WebSocket(session) => session.abort(),
@@ -60,7 +50,6 @@ impl LiveSession {
         }
     }
 }
-
 pub fn spawn_live(
     api_key: String,
     config: SttConfig,
@@ -73,17 +62,14 @@ pub fn spawn_live(
         LiveSession::SyncLive(spawn_sync_live(api_key, config, keyterms, http))
     }
 }
-
 // ---------------------------------------------------------------------------
 // Sync live (recommended)
 // ---------------------------------------------------------------------------
-
 pub struct SyncLiveSession {
     pub audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<String, String>>,
 }
-
 impl SyncLiveSession {
     pub async fn finish(self, timeout: Duration) -> Result<String, String> {
         let _ = self.stop_tx.send(true);
@@ -93,13 +79,11 @@ impl SyncLiveSession {
             Err(_) => Err("Sync live did not finish in time".into()),
         }
     }
-
     pub fn abort(self) {
         let _ = self.stop_tx.send(true);
         self.task.abort();
     }
 }
-
 pub fn spawn_sync_live(
     api_key: String,
     config: SttConfig,
@@ -117,124 +101,124 @@ pub fn spawn_sync_live(
         task,
     }
 }
-
 async fn run_sync_live(
     api_key: &str,
     config: &SttConfig,
     keyterms: &[String],
     mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut stop_rx: watch::Receiver<bool>,
+    stop_rx: watch::Receiver<bool>,
     http: reqwest::Client,
 ) -> Result<String, String> {
-    let boundary = boundary();
-    let config_json = sync_config(config, keyterms)?;
-    let head = format!(
-        "--{boundary}\r\nContent-Disposition: form-data; name=\"config\"\r\n\
-         Content-Type: application/json\r\n\r\n{config_json}\r\n\
-         --{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; \
-         filename=\"audio.pcm\"\r\nContent-Type: audio/pcm\r\n\r\n"
-    );
-    let tail = format!("\r\n--{boundary}--\r\n");
-
-    let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, io::Error>>(128);
-    body_tx
-        .send(Ok(Bytes::from(head)))
-        .await
-        .map_err(|_| "Could not start the upload")?;
-
-    let truncated = Arc::new(AtomicBool::new(false));
-    let pump_truncated = truncated.clone();
-    let max_bytes =
-        (config.sync_live.max_audio_seconds.max(1) * config.sample_rate as u64 * 2) as usize;
-    tokio::spawn(async move {
-        let mut total = 0usize;
-        loop {
-            tokio::select! {
-                changed = stop_rx.changed() => {
-                    if changed.is_err() || *stop_rx.borrow() {
-                        break;
-                    }
+    // Stay a little under the endpoint's 120 s audio cap per request.
+    let segment_seconds = config.sync_live.max_audio_seconds.saturating_sub(2).max(1);
+    let max_bytes = (segment_seconds * config.sample_rate as u64 * 2) as usize;
+    let mut transcripts: Vec<String> = Vec::new();
+    let mut pending: Option<Vec<u8>> = None;
+    loop {
+        let boundary = boundary();
+        let config_json = sync_config(config, keyterms)?;
+        let head = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"config\"\r\nContent-Type: application/json\r\n\r\n{config_json}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"audio.pcm\"\r\nContent-Type: audio/pcm\r\n\r\n"
+        );
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, io::Error>>(128);
+        body_tx
+            .send(Ok(Bytes::from(head)))
+            .await
+            .map_err(|_| "Could not start the upload")?;
+        let mut segment_stop = stop_rx.clone();
+        let request = http
+            .post(&config.sync_live.endpoint)
+            .header("authorization", api_key)
+            .header("X-AAI-Model", &config.sync_live.model)
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .timeout(Duration::from_millis(
+                config.sync_live.request_timeout_ms.max(30_000),
+            ))
+            .body(reqwest::Body::wrap_stream(futures_util::stream::unfold(
+                body_rx,
+                |mut rx| async move { rx.recv().await.map(|item| (item, rx)) },
+            )));
+        let send_task = tokio::spawn(request.send());
+        let pump = async {
+            let mut sent = 0usize;
+            if let Some(chunk) = pending.take() {
+                sent += chunk.len();
+                if body_tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                    let _ = body_tx.send(Ok(Bytes::from(tail))).await;
+                    return true;
                 }
-                chunk = audio_rx.recv() => {
-                    match chunk {
-                        Some(bytes) => {
-                            if total + bytes.len() > max_bytes {
-                                pump_truncated.store(true, Ordering::SeqCst);
-                                continue;
-                            }
-                            total += bytes.len();
-                            if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
-                                return;
-                            }
+            }
+            let mut stopped = *segment_stop.borrow();
+            while !stopped {
+                tokio::select! {
+                    changed = segment_stop.changed() => {
+                        if changed.is_err() || *segment_stop.borrow() {
+                            stopped = true;
                         }
-                        None => break,
+                    }
+                    chunk = audio_rx.recv() => {
+                        match chunk {
+                            Some(bytes) => {
+                                if sent + bytes.len() > max_bytes {
+                                    pending = Some(bytes);
+                                    break;
+                                }
+                                sent += bytes.len();
+                                if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                                    stopped = true;
+                                }
+                            }
+                            None => stopped = true,
+                        }
                     }
                 }
             }
+            let _ = body_tx.send(Ok(Bytes::from(tail))).await;
+            stopped
+        };
+        let stopped = pump.await;
+        drop(body_tx);
+        let response = send_task
+            .await
+            .map_err(|error| format!("Sync live task failed: {error}"))?
+            .map_err(|error| format!("Sync live request failed: {error}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("Could not read the Sync live response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "AssemblyAI Sync live {status}: {}",
+                api_message(&text)
+            ));
         }
-        // Flush audio captured just before the stop signal.
-        while let Ok(bytes) = audio_rx.try_recv() {
-            if total + bytes.len() <= max_bytes {
-                total += bytes.len();
-                if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
-                    return;
-                }
-            } else {
-                pump_truncated.store(true, Ordering::SeqCst);
-            }
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("AssemblyAI sent invalid JSON: {error}"))?;
+        let transcript = value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !transcript.is_empty() {
+            transcripts.push(transcript.to_string());
         }
-        let _ = body_tx.send(Ok(Bytes::from(tail))).await;
-    });
-
-    let stream = futures_util::stream::unfold(body_rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
-    });
-    let request = http
-        .post(&config.sync_live.endpoint)
-        .header("authorization", api_key)
-        .header("X-AAI-Model", &config.sync_live.model)
-        .header(
-            "content-type",
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .timeout(Duration::from_millis(
-            config.sync_live.request_timeout_ms.max(30_000),
-        ))
-        .body(reqwest::Body::wrap_stream(stream));
-
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Sync live request failed: {error}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| format!("Could not read the Sync live response: {error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "AssemblyAI Sync live {status}: {}",
-            api_message(&text)
-        ));
+        if stopped || *stop_rx.borrow() {
+            break;
+        }
+        // The segment hit the audio cap; start a fresh request and carry on.
     }
-    if truncated.load(Ordering::SeqCst) {
-        return Err("The recording exceeded the Sync live limit; using batch".into());
-    }
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("AssemblyAI sent invalid JSON: {error}"))?;
-    let transcript = value
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if transcript.is_empty() {
+    let text = transcripts.join(" ").trim().to_string();
+    if text.is_empty() {
         Err("No speech was detected".into())
     } else {
-        Ok(transcript)
+        Ok(text)
     }
 }
-
 fn sync_config(config: &SttConfig, keyterms: &[String]) -> Result<String, String> {
     let mut value = serde_json::json!({
         "sample_rate": config.sample_rate,
@@ -251,7 +235,6 @@ fn sync_config(config: &SttConfig, keyterms: &[String]) -> Result<String, String
     }
     serde_json::to_string(&value).map_err(|error| error.to_string())
 }
-
 fn boundary() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -260,7 +243,6 @@ fn boundary() -> String {
     let counter = BOUNDARY_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("ray-{nanos:x}-{counter:x}")
 }
-
 fn api_message(text: &str) -> String {
     let trimmed = text.trim();
     serde_json::from_str::<Value>(trimmed)
@@ -279,17 +261,14 @@ fn api_message(text: &str) -> String {
         })
         .unwrap_or_else(|| trimmed.chars().take(300).collect())
 }
-
 // ---------------------------------------------------------------------------
 // Universal Streaming over WebSocket (alternative)
 // ---------------------------------------------------------------------------
-
 pub struct StreamSession {
     pub audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<String, String>>,
 }
-
 impl StreamSession {
     pub async fn finish(self, timeout: Duration) -> Result<String, String> {
         let _ = self.stop_tx.send(true);
@@ -299,13 +278,11 @@ impl StreamSession {
             Err(_) => Err("Streaming did not finish in time".into()),
         }
     }
-
     pub fn abort(self) {
         let _ = self.stop_tx.send(true);
         self.task.abort();
     }
 }
-
 pub fn spawn_stream(api_key: String, config: SttConfig, keyterms: Vec<String>) -> StreamSession {
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -319,7 +296,6 @@ pub fn spawn_stream(api_key: String, config: SttConfig, keyterms: Vec<String>) -
         task,
     }
 }
-
 async fn run_stream(
     api_key: &str,
     config: &SttConfig,
@@ -339,14 +315,12 @@ async fn run_stream(
     request
         .headers_mut()
         .insert("User-Agent", HeaderValue::from_static("Ray/0.1 (Windows)"));
-
     let connect_timeout = Duration::from_millis(config.connect_timeout_ms.max(1_000));
     let (mut socket, _) =
         tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(request))
             .await
             .map_err(|_| "AssemblyAI streaming connection timed out".to_string())?
             .map_err(|error| format!("AssemblyAI streaming connection failed: {error}"))?;
-
     // Wait for Begin so an auth/parameter error surfaces before we record.
     let begin_deadline = tokio::time::Instant::now() + connect_timeout;
     loop {
@@ -368,12 +342,10 @@ async fn run_stream(
             Err(_) => return Err("AssemblyAI did not acknowledge the stream in time".into()),
         }
     }
-
     let mut finals: Vec<String> = Vec::new();
     let mut partial = String::new();
     let mut stop_requested = false;
     let mut audio_closed = false;
-
     while !stop_requested {
         tokio::select! {
             changed = stop_rx.changed() => {
@@ -432,13 +404,11 @@ async fn run_stream(
             }
         }
     }
-
     while let Ok(bytes) = audio_rx.try_recv() {
         if !bytes.is_empty() {
             let _ = socket.send(Message::binary(bytes)).await;
         }
     }
-
     let _ = socket
         .send(Message::text(r#"{"type":"ForceEndpoint"}"#))
         .await;
@@ -470,7 +440,6 @@ async fn run_stream(
             Err(_) => break,
         }
     }
-
     let _ = socket.send(Message::text(r#"{"type":"Terminate"}"#)).await;
     let terminate_deadline =
         tokio::time::Instant::now() + Duration::from_millis(config.terminate_timeout_ms);
@@ -494,7 +463,6 @@ async fn run_stream(
         }
     }
     let _ = socket.close(None).await;
-
     let text = join_transcript(&finals, &partial);
     if text.is_empty() {
         Err("No speech was detected".into())
@@ -502,12 +470,10 @@ async fn run_stream(
         Ok(text)
     }
 }
-
 enum MessageEffect {
     None,
     Ended,
 }
-
 fn handle_text(
     text: &str,
     finals: &mut Vec<String>,
@@ -525,7 +491,6 @@ fn handle_text(
         _ => Ok(MessageEffect::None),
     }
 }
-
 fn absorb_turn(value: &Value, finals: &mut Vec<String>, partial: &mut String) {
     let transcript = value
         .get("transcript")
@@ -554,7 +519,6 @@ fn absorb_turn(value: &Value, finals: &mut Vec<String>, partial: &mut String) {
         *partial = transcript;
     }
 }
-
 fn join_transcript(finals: &[String], partial: &str) -> String {
     let mut parts: Vec<&str> = finals
         .iter()
@@ -567,7 +531,6 @@ fn join_transcript(finals: &[String], partial: &str) -> String {
     }
     parts.join(" ").trim().to_string()
 }
-
 fn stream_error(value: &Value) -> String {
     let code = value
         .get("error_code")
@@ -580,7 +543,6 @@ fn stream_error(value: &Value) -> String {
         .unwrap_or("unknown error");
     format!("AssemblyAI{code}: {message}")
 }
-
 fn stream_url(config: &SttConfig, keyterms: &[String]) -> Result<Url, String> {
     let mut url = Url::parse(WEBSOCKET_URL).map_err(|error| error.to_string())?;
     {
@@ -615,7 +577,6 @@ fn stream_url(config: &SttConfig, keyterms: &[String]) -> Result<Url, String> {
     }
     Ok(url)
 }
-
 pub fn clean_keyterms(terms: &[String], limit: usize) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -633,16 +594,13 @@ pub fn clean_keyterms(terms: &[String], limit: usize) -> Vec<String> {
     }
     out
 }
-
 // ---------------------------------------------------------------------------
 // Batch fallback
 // ---------------------------------------------------------------------------
-
 #[derive(serde::Deserialize)]
 struct UploadResponse {
     upload_url: String,
 }
-
 #[derive(serde::Deserialize)]
 struct TranscriptResponse {
     id: String,
@@ -650,7 +608,6 @@ struct TranscriptResponse {
     text: Option<String>,
     error: Option<String>,
 }
-
 /// Sync batch first (fast, single multipart request), then the older
 /// asynchronous v2 API if configured.
 pub async fn transcribe_wav(
@@ -674,7 +631,6 @@ pub async fn transcribe_wav(
         }
     }
 }
-
 async fn transcribe_sync_batch(
     http: &reqwest::Client,
     api_key: &str,
@@ -696,7 +652,6 @@ async fn transcribe_sync_batch(
     );
     body.extend_from_slice(&wav);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-
     let response = http
         .post(&config.batch.endpoint)
         .header("authorization", api_key)
@@ -731,7 +686,6 @@ async fn transcribe_sync_batch(
         .map(str::to_string)
         .ok_or_else(|| "AssemblyAI returned an empty transcript".into())
 }
-
 async fn transcribe_v2(
     http: &reqwest::Client,
     api_key: &str,
@@ -753,7 +707,6 @@ async fn transcribe_v2(
         .json::<UploadResponse>()
         .await
         .map_err(|error| format!("Read upload response: {error}"))?;
-
     let terms = clean_keyterms(keyterms, 1_000);
     let mut body = serde_json::json!({
         "audio_url": upload.upload_url,
@@ -764,7 +717,6 @@ async fn transcribe_v2(
     if !terms.is_empty() {
         body["keyterms_prompt"] = serde_json::json!(terms);
     }
-
     let created = http
         .post(format!("{V2_URL}/transcript"))
         .header("authorization", api_key)
@@ -778,10 +730,8 @@ async fn transcribe_v2(
         .json::<TranscriptResponse>()
         .await
         .map_err(|error| format!("Read transcript response: {error}"))?;
-
     poll_transcript(http, api_key, &created, &config.batch).await
 }
-
 async fn poll_transcript(
     http: &reqwest::Client,
     api_key: &str,
@@ -830,7 +780,6 @@ async fn poll_transcript(
             .map_err(|error| format!("Read poll response: {error}"))?;
     }
 }
-
 /// Wrap 16-bit mono samples in a minimal WAV container.
 pub fn wav_from_pcm16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     let data_len = (samples.len() * 2) as u32;
@@ -853,11 +802,9 @@ pub fn wav_from_pcm16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
     }
     wav
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn wav_header_is_well_formed() {
         let wav = wav_from_pcm16(&[1, -1, 0, 100], 16_000);
@@ -867,7 +814,6 @@ mod tests {
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 8);
         assert_eq!(wav.len(), 52);
     }
-
     #[test]
     fn joins_final_turns_and_partial() {
         let finals = vec!["Hello there.".to_string(), "This is Ray.".to_string()];
@@ -876,7 +822,6 @@ mod tests {
             "Hello there. This is Ray. And a partial"
         );
     }
-
     #[test]
     fn keyterms_are_trimmed_deduped_and_capped() {
         let terms = vec![

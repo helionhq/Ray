@@ -56,12 +56,6 @@
         "model": "openai/gpt-oss-120b",
         "api_key_secret": "groq",
         "extra_body": { "reasoning_effort": "low" }
-      },
-      {
-        "id": "vercel",
-        "base_url": "https://ai-gateway.vercel.sh/v1",
-        "model": "openai/gpt-4o-mini",
-        "api_key_secret": "vercel"
       }
     ]
   }

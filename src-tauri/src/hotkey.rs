@@ -1,10 +1,11 @@
 //! Global Right Alt hotkey via a low-level keyboard hook (WH_KEYBOARD_LL).
 //!
-//! Right Alt is a modifier, so the hook swallows its press and release and
-//! taps an unassigned key on release; that keeps Windows and the focused app
-//! from opening the menu bar or Start menu. If another key joins while Right
-//! Alt is held (AltGr, Alt+Tab), the recording is cancelled and a synthetic
-//! Right Alt down is replayed so the chord still reaches the app.
+//! Right Alt is a modifier, so the hook swallows its press and release; both
+//! edges are consumed, which keeps Windows and the focused app from opening
+//! the menu bar or Start menu. If another key joins while Right Alt is held
+//! (AltGr, Alt+Tab), the recording is cancelled and the joining key passes
+//! through. Nothing is ever injected from the hook: a slow callback makes
+//! Windows silently remove a low-level hook.
 //!
 //! Escape while recording cancels and is swallowed.
 
@@ -16,10 +17,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_ESCAPE, VK_RMENU,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RMENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
     KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
@@ -38,9 +36,9 @@ static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_CHORD: AtomicBool = AtomicBool::new(false);
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 
-/// Marks the synthetic keys Ray itself sends (the release mask and paste) so
-/// the hook ignores them. Other tools' injected keys are still handled, which
-/// also makes the hotkey testable with SendInput.
+/// Marks the synthetic keys Ray itself sends (Ctrl+V for paste) so the hook
+/// ignores them. Other tools' injected keys are still handled, which also
+/// makes the hotkey testable with SendInput.
 pub const RAY_INJECTED: usize = 0x5241_5901;
 
 /// Set from the pipeline so Escape is only consumed while recording.
@@ -108,14 +106,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             return LRESULT(1);
         }
         if up {
-            let chord = ALT_CHORD.swap(false, Ordering::SeqCst);
             ALT_DOWN.store(false, Ordering::SeqCst);
-            if chord {
-                // The synthetic Alt down was delivered, so the real release must
-                // reach the app too.
-                return CallNextHookEx(None, code, wparam, lparam);
-            }
-            tap_unassigned_key();
+            ALT_CHORD.store(false, Ordering::SeqCst);
+            // Swallow both edges. This keeps menus closed, and never injecting
+            // from inside the hook keeps Windows from removing it on a timeout.
             return LRESULT(1);
         }
         return CallNextHookEx(None, code, wparam, lparam);
@@ -125,7 +119,6 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // Another key joined the held modifier: this is a chord, not dictation.
         ALT_CHORD.store(true, Ordering::SeqCst);
         send(HotkeyEvent::Cancel);
-        replay_right_alt_down();
         return CallNextHookEx(None, code, wparam, lparam);
     }
 
@@ -141,36 +134,4 @@ fn send(event: HotkeyEvent) {
     if let Some(sender) = SENDER.get() {
         let _ = sender.send(event);
     }
-}
-
-unsafe fn key_event(vk: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
-    INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: VIRTUAL_KEY(vk),
-                wScan: 0,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: RAY_INJECTED,
-            },
-        },
-    }
-}
-
-/// VK 0xE8 is unassigned. Tapping it flushes any pending modifier state in
-/// the focused app without typing anything.
-unsafe fn tap_unassigned_key() {
-    let inputs = [
-        key_event(0xE8, KEYBD_EVENT_FLAGS(0)),
-        key_event(0xE8, KEYEVENTF_KEYUP),
-    ];
-    let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-}
-
-/// Replays the Right Alt press that the hook swallowed, so AltGr and Alt
-/// chords in the target app still see the modifier.
-unsafe fn replay_right_alt_down() {
-    let inputs = [key_event(VK_RMENU.0, KEYEVENTF_EXTENDEDKEY)];
-    let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
 }
