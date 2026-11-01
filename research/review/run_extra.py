@@ -81,7 +81,7 @@ def main() -> None:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=420,
+            timeout=720,
         )
         wall_ms = round((time.perf_counter() - started) * 1000)
         raw, provider, clean, stt_ms, cleanup_ms, note = parse(proc.stdout)

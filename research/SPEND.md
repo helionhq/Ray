@@ -24,3 +24,19 @@ Not counted above: AssemblyAI LLM Gateway tokens (a separate token bill). ~190 t
 requests at ~1.4k input / 250 output tokens on Gemma 4 31B ($0.14/$0.40 per M) ≈ **$0.06**.
 Production cost is ~$0.0003 per dictation.
 Deepgram TTS: ~12.7k characters generated (two full corpus passes) ≈ **$0.38** (not AssemblyAI).
+
+## Round 2 (hard corpus + guards + hedging)
+
+| run | mode | audio min | est. cost $ | note |
+|---|---|---:|---:|---|
+| hard_baseline | sync live | 4.46 | 0.0372 | first pass, 18 hard clips |
+| hard_probe | sync live | 0.73 | 0.0061 | revised restart/run-on/email/product clips |
+| hard_v5 | sync live | 4.50 | 0.0375 | prompt v5 + max_tokens 3000 |
+| hard_v6 | sync live | 4.50 | 0.0375 | fidelity guards |
+| hard_v7 | sync live | 0.43 | 0.0036 | chained-correction probe |
+| old_probe | sync live | 1.22 | 0.0102 | Grok/Groq + draft-reply probes |
+| **round-2 development subtotal** | | **15.84** | **0.1321** | |
+| round-2 final suite | sync live + sync batch | 32.71 | 0.2726 | old + hard final, warm repeats, fallback probe, adversarial extras, rollover |
+
+**Round 2 STT subtotal: ~48.6 audio-minutes, ~$0.405.** Round 1 STT was ~$0.44, so total
+AssemblyAI STT is **~$0.85** (~$0.11 more for LLM Gateway tokens), well under the $10 cap.

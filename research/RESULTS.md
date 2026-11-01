@@ -232,3 +232,177 @@ the gemma output into the HUD token-by-token so perceived latency ≈ TTFT (~1.3
   (`supabase.fromUsers.select(*.eq(id))` stays garbled because ASR dropped tokens). Code
   dictation remains the weakest case; consider a separate code-aware instruction if the app
   targets developers.
+
+---
+
+## 8. Round 2 — hard corpus, fidelity guards and a hedged tail
+
+### 8.1 The three manager findings
+
+**1. Word substitution, tone normalisation and invented causality.**
+
+Round 1 failed on all three, for example:
+
+| Before (round 1) | After (round 2) |
+|---|---|
+| "Yo, quick one." -> "Hey, quick one." | "Yo, quick one." stays "Yo, quick one." |
+| "The onboarding copy needs a pass. It's too wordy." -> "... needs a pass **because** it's too wordy." | "... needs a pass. It's too wordy." (no invented cause) |
+| "it's **kind of** slow ... I **sort of** like it" -> "it's slow ... I like it" | both hedges kept: "kind of slow ... sort of like it" |
+| "Goff reply" -> "Gough replied" (invented person) | "Goff reply" -> "Draft reply: ... Best, Arham." |
+| "Thursday at 3:30" -> "Thursday at 3:30 **p.m.**" | "Thursday at 3:30" stays 3:30 |
+
+The prompt now opens with an edit contract: the model may only delete true disfluency,
+fix grammar/punctuation, and apply the formatting rules. It may not replace, reorder, add
+or paraphrase words. The app also rejects a candidate answer that:
+
+- starts with a different greeting than the speaker ("Yo" -> "Hey");
+- contains a causal/linking connective absent from the transcript ("because", "since",
+  "therefore", "thus", "so that", "which means", "also", "however");
+- expands an informal form ("wanna" -> "want to");
+- invents a.m./p.m. or a time of day;
+- attributes speech to a name the transcript does not contain ("Goff reply" -> "Gough replied");
+- maps the ordinary phrase "ClickOne"/"QuickOne" to the product name "Qwen".
+
+The STT keyterm list also contained "Qwen", which made AssemblyAI hear "Hey, ClickOne" as
+"Hey Qwen" on the regression clip. Qwen was removed from the STT keyterm/known-name list
+(the prompt still recovers "Quen" -> "Qwen" when the speaker really says it), and the prompt
+now has an explicit "ClickOne is never Qwen" example. A no-reorder rule keeps pairs such as
+"Grok and Groq" in the speaker's order.
+
+A rejected candidate is skipped; the next provider is tried, and if every provider fails the
+raw transcript is pasted. The user's words are never lost.
+
+**2. Ordinal enumerations.**
+
+The rule is now explicit:
+
+- A list needs at least three items AND a structural cue.
+- Ordinal/step cues ("first, second, third", "step one/two", numbered items) -> **numbered**.
+- Announced unordered set ("three things: ...") or explicit "bullet point" -> **bullets**.
+- Two items, short casual messages and run-on shopping/errand lists stay **prose**.
+- Short messages (<60 words) stay prose unless the speaker explicitly dictated formatting or
+  used ordinal/step cues.
+
+Before, `enum-tasks` ("First ... Second ... Third") became bullets. It is now numbered.
+The hard monologue's First/Second/Third is numbered; the run-on grocery list stays prose.
+The regression corpus's `enum-tasks` ideal was updated to the new rule.
+
+**3. Harder realistic audio.**
+
+`research/corpus/hard_scripts.json` is a separate 18-clip corpus: 744 spoken words, 17 Aura-2
+voices, ~5.4 minutes of audio including a 161 s monologue. The mess is written into the
+spoken text so the TTS actually says it: stutters and word repeats, abandoned restarts,
+chained self-corrections and "scratch that", trailing off, "like"/"you know"/"I mean" used
+both as filler and as content, "kind of"/"sort of" hedges, a run-on grocery list, an email
+with greeting and sign-off, spoken "new paragraph"/"bullet point"/"period" commands,
+misheard names, numbers/times, product names and the 2.7-minute monologue. The original
+29-clip corpus remains the regression set.
+
+### 8.2 Model sweep
+
+| Model | Provider | Old auto | Hard auto | p50 old/hard | p95 old/hard | Outcome |
+|---|---|---:|---:|---:|---:|---|
+| **gemma-4-31b** | AAI Gateway | **98.8** (29) | **99.1** (18) | 857 / 781 ms | 1,866 / 1,193 ms | **primary** |
+| openai/gpt-oss-120b | Groq | 94.8 (29, round 1) | 96.4 (18) | 1,174 ms | 7,475 ms* | **fallback** |
+| openai/gpt-oss-20b | Groq | 94.1 (29, round 1) | 97.2 (17) | 846 ms | 6,857 ms* | not switched |
+| qwen/qwen3.8-27b | Groq | partial | 4/18 clips | ~400 ms | 10,900 ms | reject |
+| qwen3.5-4b-32k-fast | AAI Gateway | 95.5 (29) | 90.2 (18) | 1,033 ms | 98,257 ms | reject |
+| allam-2-7b, gpt-oss-safeguard-20b | Groq | not scored | not scored | — | — | not shortlisted |
+
+* p95 includes Groq free-tier 429 backoff, not model time. First-attempt times were ~0.7-1.2 s. Gemma p50/p95 are old/hard; the other rows are hard-corpus only.
+The old auto numbers for gpt-oss-120b/20b are the round-1 full-corpus scores; their hard
+numbers are the round-2 corpus. The 20b hard n is 17: on the first 2.7-minute monologue it
+spent the entire 1,500-token completion budget on reasoning and returned no text. Raising
+`max_tokens` to 3,000 fixed the failure mode, but Groq's daily token cap was exhausted before
+the re-run; the app now uses 3,000 for both providers.
+
+Available model access on 2026-11-01:
+
+- **Groq** now lists only `openai/gpt-oss-120b`, `openai/gpt-oss-20b`,
+  `openai/gpt-oss-safeguard-20b`, `qwen/qwen3.8-27b`, `allam-2-7b` and the Whisper models.
+  The kimi, llama-4, qwen3-32b and llama-3.3 entries the brief suggested are no longer in
+  this account's catalog.
+- **AssemblyAI LLM Gateway** lists dozens of models, but this account can only call
+  `gemma-4-31b` and `qwen3.5-4b-32k-fast`; everything else (gemini, claude, gpt-5, deepseek,
+  kimi, grok, glm, nemotron, minimax, muse) returns "Your account does not have access".
+
+Decision: keep gemma primary. gpt-oss-120b is the best fallback: it matched gemma on most
+hard clips, resolves chained corrections, and is ~1 s warm. gpt-oss-20b is marginally faster
+but kept a chained correction in the old set and has the reasoning-budget failure mode.
+qwen3.8-27b is fast but its 1,000 output-tokens/minute cap makes long dictations unusable.
+qwen3.5-4b-32k-fast scored lower and produced 98 s timeout tails.
+
+### 8.3 Hedging the latency tail
+
+`cleanup.rs` now races the primary against a lazily launched fallback. The primary starts
+immediately. If it has not produced a valid answer after `hedge_after_ms` (2,500 ms, chosen
+just below the measured cold p95 of 2,792 ms and well above the warm p95), the fallback is
+started in parallel. The first answer that passes the fidelity checks wins; the losing
+request is dropped, which cancels it. If the primary fails early, the fallback starts
+immediately instead of waiting for the hedge. A Groq 429 can only fail the fallback request;
+it never delays or cancels the primary.
+
+The per-provider hard timeout was lowered from 15 s to 6 s and now covers **both** sending
+and reading the response body. Previously only `send()` was timed, so a stalled body could
+outlive the timeout. The outer pipeline backstop is therefore 12 s, not 21 s. Unit tests with
+mock delays cover: fast primary (fallback never polled), slow primary (fast fallback wins),
+early primary error, invalid primary answer, primary returning after the hedge, and both
+providers failing.
+
+Measured cleanup latency (same 29-clip regression corpus):
+
+| Path | n | p50 | p95 | max | Notes |
+|---|---:|---:|---:|---:|---|
+| Round 1, cold | 29 | 1,776 ms | 2,792 ms | 7,796 ms | `app_final`; no pre-warm |
+| Round 2, warm | 29 | 857 ms | 1,866 ms | 2,130 ms | `app_v8_final`; gateway pre-warmed during recording |
+| Round 2 hard corpus, warm | 18 | 781 ms | 1,193 ms | 2,112 ms | `hard_v8_final` |
+| Medium transcript, 20 warm repeats | 20 | 1,813 ms | 2,497 ms | 2,669 ms | `latency_long` (`long-rambling`) |
+| Long 161 s transcript, 20 warm repeats | 20 | 2,904 ms | 3,574 ms | 4,049 ms | `latency_monologue`; hedge fires, but gemma usually still wins |
+
+The 2,500 ms hedge sits almost exactly on the medium-transcript p95 (2,497 ms). On the 161 s
+monologue most repeats cross it, but gemma still returns before the Groq fallback, so all 20
+repeats stayed on the primary; the tail is bounded at 4.0 s instead of the old 7.8 s / 15 s
+outliers. A forced-fallback run (`RAY_TEST_FORCE_FALLBACK=1`) returned the tone-preservation
+clip through Groq in 3.4 s cold, proving the fallback path itself is healthy.
+
+
+### 8.4 Final scores
+
+| Corpus | n | Auto | Judge overall | p50 cleanup | p95 cleanup | max |
+|---|---:|---:|---:|---:|---:|---:|
+| Regression, round 1 (v4 prompt) | 29 | 98.1 | 9.40 | 1,776 ms | 2,792 ms | 7,796 ms |
+| Regression, round 2 (v5 prompt) | 29 | 98.8 | 9.73 (n=11) | 857 ms | 1,866 ms | 2,130 ms |
+| Hard corpus, round 1 baseline | 18 | 79.7 | — | — | — | — |
+| Hard corpus, round 2 | 18 | 99.1 | 9.89 (n=18) | 781 ms | 1,193 ms | 2,112 ms |
+
+
+Judge note: round 1 used `openai/gpt-oss-120b` on Groq (9.40 overall). The round-2 judge is
+`qwen3.5-4b-32k-fast` on the AssemblyAI gateway because the Groq free tier hit its daily token
+cap during the sweep. It is an independent model, but the scores are not directly comparable
+to the round-1 judge; the deterministic auto scores and the full read-through are the primary
+evidence. One old-clip judge response (`false-start`) was truncated and excluded (n=11).
+
+The hard-set jump (79.7 -> 99.1) is the combined effect of the fidelity guards, the
+ordinal/list rule and the email/format-command handling. The regression set did not regress
+(98.1 -> 98.8); its only sub-95 clips are ASR-limited (`code-ish` 92, `false-start` 92,
+`self-correction-word` 94), not cleanup failures.
+
+
+### 8.5 Remaining weaknesses
+
+- ASR, not cleanup, is now the main error source. Unusual product pronunciations can come
+  back as "GPT-OSs", "Quen" or a different model name; the prompt recovers the common ones
+  from context, but not every case.
+- Code dictation is still weak: when ASR drops punctuation or tokens, the conservative
+  prompt will not invent code.
+- Chained corrections that also add a clause can leave a cue word ("actually") in place; the
+  hard set catches the common patterns, but the model is not a parser.
+- The fidelity guards are lexical and deliberately narrow. They stop the named regressions;
+  they cannot detect every synonym swap.
+- Groq's free tier is the binding constraint on the fallback: 8k TPM and ~200k TPD. The
+  hedge protects the primary path, but a fallback request can still 429 and add latency.
+- The 120 s Sync live cap means long dictations roll over to a second request; the overlap
+  join is tested by the 161 s monologue and the 215 s rollover clip, but boundary artifacts
+  remain possible.
+- Spoken formatting commands are supported for common cases; ambiguous uses (talking about
+  "the period at the end") can still be misread as commands.

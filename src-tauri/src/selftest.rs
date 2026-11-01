@@ -248,10 +248,34 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             )
             .await;
             println!(
-                "[selftest] timing cleanup_warm_ms={}",
-                warm_started.elapsed().as_millis()
+                "[selftest] timing cleanup_warm_ms={} provider={}",
+                warm_started.elapsed().as_millis(),
+                warm.provider.as_deref().unwrap_or("raw")
             );
-            let _ = warm;
+        }
+        if let Ok(value) = std::env::var("RAY_TEST_CLEANUP_REPEATS") {
+            // Repeated warm cleanups on one transcript: used to measure p50/p95
+            // of the hedged path without paying for STT every time.
+            if let Ok(repeats) = value.parse::<usize>() {
+                for index in 0..repeats {
+                    let started = Instant::now();
+                    let repeated = cleanup::cleanup(
+                        &http,
+                        &config.cleanup,
+                        config::EMBEDDED_PROMPT,
+                        &raw,
+                        &dictionary,
+                        &config.known_names,
+                        &app_name,
+                    )
+                    .await;
+                    println!(
+                        "[selftest] timing cleanup_repeat_{index}_ms={} provider={}",
+                        started.elapsed().as_millis(),
+                        repeated.provider.as_deref().unwrap_or("raw")
+                    );
+                }
+            }
         }
         if let Some(note) = result.note {
             println!("\n[selftest] note: {note}");

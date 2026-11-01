@@ -48,12 +48,24 @@ def score_one(script: dict, out: str, transcript: str, names: list[str]) -> dict
         fmt_ok = flags["numbered"] >= 2
     elif fmt == "paragraphs":
         fmt_ok = flags["paragraphs"] >= 2
+    elif fmt == "email":
+        # Greeting on its own line, blank line, body, blank line, sign-off line.
+        fmt_ok = flags["paragraphs"] >= 2 and bool(
+            re.search(r"(?m)^(thanks|best|regards|cheers),$", out.strip(), re.I)
+        )
+    # Round-2 scripts may pin required phrases and ban known bad substitutions.
+    require_missing = [
+        value for value in script.get("require", []) if value.lower() not in out.lower()
+    ]
+    forbid_hits = [value for value in script.get("forbid", []) if value.lower() in out.lower()]
     filler_hits = len(FILLERS.findall(out))
     cue_hits = len(CORRECTION_CUES.findall(out))
     ratio_vs_transcript = round(len(out.split()) / max(1, len(transcript.split())), 2)
     checks = {
         "missing_names": missing,
         "wrong_case_names": wrong_case,
+        "require_missing": require_missing,
+        "forbid_hits": forbid_hits,
         "filler_hits": filler_hits,
         "correction_cues": cue_hits,
         "format_ok": fmt_ok,
@@ -65,7 +77,9 @@ def score_one(script: dict, out: str, transcript: str, names: list[str]) -> dict
     }
     penalties = 0
     penalties += 12 * len(missing) + 4 * len(wrong_case)
-    penalties += 6 * filler_hits + 5 * cue_hits
+    if not script.get("ignore_filler_penalty"):
+        penalties += 6 * filler_hits + 5 * cue_hits
+    penalties += 10 * len(require_missing) + 15 * len(forbid_hits)
     penalties += 0 if fmt_ok else 18
     if script["category"] in ("no-answer", "no-execute"):
         penalties += 0 if 0.65 <= ratio_vs_transcript <= 1.25 else 30
@@ -78,11 +92,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tags", required=True)
     ap.add_argument("--source", default="../out/stt/sync_raw.json")
+    ap.add_argument("--corpus", default=None, help="corpus JSON (default: scripts.json)")
     args = ap.parse_args()
-    data = corpus()
+    data = (
+        json.loads(Path(args.corpus).read_text(encoding="utf-8"))
+        if args.corpus
+        else corpus()
+    )
+    stt_file = Path(args.source).name
     scripts = {s["id"]: s for s in data["scripts"]}
     names = data["dictionary"] + data["builtin_names"]
-    stt = json.loads((OUT / "stt" / Path(args.source).name).read_text(encoding="utf-8"))
+    stt = json.loads((OUT / "stt" / stt_file).read_text(encoding="utf-8"))
 
     report = {}
     for tag in args.tags.split(","):
@@ -94,7 +114,7 @@ def main() -> None:
         scores, lat = [], []
         rows = []
         for sid, r in results.items():
-            if not r.get("ok"):
+            if not r.get("ok") or sid not in scripts:
                 continue
             s = score_one(scripts[sid], r["text"], (stt.get(sid) or {}).get("text") or "", names)
             s["id"] = sid
@@ -113,7 +133,10 @@ def main() -> None:
         bad = [r["id"] for r in rows if r["auto_score"] < 80]
         print(f"{tag:<28} n={len(scores)} mean={report[tag]['mean_auto_score']} avg_ms={report[tag]['mean_total_ms']} p95_ms={report[tag]['p95_total_ms']} low={bad}")
 
-    (OUT / "scores.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    scores_path = OUT / "scores.json"
+    merged = json.loads(scores_path.read_text(encoding="utf-8")) if scores_path.exists() else {}
+    merged.update(report)
+    scores_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

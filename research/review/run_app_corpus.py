@@ -65,6 +65,7 @@ RAW_RE = re.compile(
 STT_MS_RE = re.compile(r"\[selftest\] timing stop_to_transcript_ms=(\d+)")
 CLEAN_MS_RE = re.compile(r"\[selftest\] timing cleanup_ms=(\d+)")
 NOTE_RE = re.compile(r"\[selftest\] note: (.*)")
+REPEAT_RE = re.compile(r"\[selftest\] timing cleanup_repeat_(\d+)_ms=(\d+) provider=(\S+)")
 
 
 def parse(stdout: str) -> tuple[str, str, str, int | None, int | None, str | None]:
@@ -90,14 +91,22 @@ def parse(stdout: str) -> tuple[str, str, str, int | None, int | None, str | Non
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
+    ap.add_argument(
+        "--corpus",
+        default=str(CORPUS),
+        help="corpus JSON (default: the regression corpus; pass hard_scripts.json for round 2)",
+    )
     ap.add_argument("--ids", help="comma-separated script ids")
     ap.add_argument("--batch", action="store_true", help="use --selftest (batch) instead of live")
     ap.add_argument("--dictionary", default="Arham,Helion,Ray")
     ap.add_argument("--app", default="Notepad")
     ap.add_argument("--force-fallback", action="store_true")
+    ap.add_argument("--warm", action="store_true", help="pre-warm the cleanup connection")
+    ap.add_argument("--repeat-cleanup", action="store_true")
+    ap.add_argument("--cleanup-repeats", type=int, help="run N extra warm cleanups on each clip")
     args = ap.parse_args()
 
-    data = json.loads(CORPUS.read_text(encoding="utf-8"))
+    data = json.loads(Path(args.corpus).read_text(encoding="utf-8"))
     scripts = data["scripts"]
     if args.ids:
         wanted = set(args.ids.split(","))
@@ -109,6 +118,12 @@ def main() -> None:
     env["RAY_TEST_APP_NAME"] = args.app
     if args.force_fallback:
         env["RAY_TEST_FORCE_FALLBACK"] = "1"
+    if args.warm:
+        env["RAY_TEST_WARM"] = "1"
+    if args.repeat_cleanup:
+        env["RAY_TEST_REPEAT_CLEANUP"] = "1"
+    if args.cleanup_repeats:
+        env["RAY_TEST_CLEANUP_REPEATS"] = str(args.cleanup_repeats)
 
     (OUT / "stt").mkdir(parents=True, exist_ok=True)
     (OUT / "llm").mkdir(parents=True, exist_ok=True)
@@ -134,7 +149,7 @@ def main() -> None:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=240,
+            timeout=600,
         )
         wall_ms = round((time.perf_counter() - started) * 1000)
         raw, provider, clean, stt_ms, cleanup_ms, note = parse(proc.stdout)
@@ -158,6 +173,10 @@ def main() -> None:
             "wall_ms": wall_ms,
             "ttft_ms": None,
             "note": note,
+            "cleanup_repeats": [
+                {"ms": int(match.group(2)), "provider": match.group(3)}
+                for match in REPEAT_RE.finditer(proc.stdout)
+            ],
             "error": None if ok else (proc.stderr.strip().splitlines() or ["cleanup failed"])[-1],
         }
         print(

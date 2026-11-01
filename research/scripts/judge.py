@@ -46,7 +46,10 @@ No markdown fences."""
 
 def call(model: str, system: str, user: str) -> dict:
     payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-               "temperature": 0, "max_tokens": 700, "reasoning_effort": "low"}
+               "temperature": 0, "max_tokens": 700}
+    # gpt-oss accepts reasoning_effort; most gateway models reject it.
+    if model.startswith("openai/gpt-oss"):
+        payload["reasoning_effort"] = "low"
     req = urllib.request.Request(BASE + "/chat/completions", data=json.dumps(payload).encode(),
                                  headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json",
                                           "User-Agent": "RayDictationResearch/1.0"}, method="POST")
@@ -80,13 +83,18 @@ def main() -> None:
     ap.add_argument("--judge", default="openai/gpt-oss-120b")
     ap.add_argument("--provider", default="groq", choices=PROVIDERS)
     ap.add_argument("--source", default="sync_raw")
+    ap.add_argument("--corpus", default=None, help="corpus JSON (default: scripts.json)")
     ap.add_argument("--ids")
     ap.add_argument("--sleep", type=float, default=0)
     args = ap.parse_args()
     global BASE, KEY
     BASE, keyname = PROVIDERS[args.provider]
     KEY = ENV[keyname]
-    data = corpus()
+    data = (
+        json.loads(Path(args.corpus).read_text(encoding="utf-8"))
+        if args.corpus
+        else corpus()
+    )
     scripts = {s["id"]: s for s in data["scripts"]}
     stt = json.loads((OUT / "stt" / f"{args.source}.json").read_text(encoding="utf-8"))
 
@@ -132,7 +140,10 @@ def main() -> None:
         print(f"{tag:<52} n={len(rows)} overall={summary[tag]['mean_overall']} "
               f"fid={summary[tag]['mean_fidelity']} names={summary[tag]['mean_names']} "
               f"fmt={summary[tag]['mean_formatting']} safe={summary[tag]['mean_instruction_safety']}")
-    (OUT / "judge_results.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    path = OUT / "judge_results.json"
+    merged = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    merged.update(summary)
+    path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

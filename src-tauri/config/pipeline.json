@@ -1,16 +1,43 @@
 {
   "known_names": [
-    "Arham", "Helion", "Ray", "Claude", "ChatGPT", "GPT-5", "Grok", "Groq", "Gemini",
-    "Anthropic", "OpenAI", "Vercel", "Tauri", "Supabase", "Linear", "Notion",
-    "Kubernetes", "PostgreSQL", "Next.js", "shadcn", "Tailwind", "TypeScript",
-    "GitHub", "Slack", "Deepgram", "AssemblyAI", "Typeless", "Rust", "pnpm"
+    "Arham",
+    "Helion",
+    "Ray",
+    "Claude",
+    "ChatGPT",
+    "GPT-5",
+    "Gemma",
+    "gpt-oss",
+    "Grok",
+    "Groq",
+    "Gemini",
+    "Anthropic",
+    "OpenAI",
+    "Vercel",
+    "Tauri",
+    "Supabase",
+    "Linear",
+    "Notion",
+    "Kubernetes",
+    "PostgreSQL",
+    "Next.js",
+    "shadcn",
+    "Tailwind",
+    "TypeScript",
+    "GitHub",
+    "Slack",
+    "Deepgram",
+    "AssemblyAI",
+    "Typeless",
+    "Rust",
+    "pnpm"
   ],
   "stt": {
     "provider": "assemblyai",
     "streaming": true,
     "mode": "sync_live",
     "speech_model": "universal-3-6-pro",
-    "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
+    "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Gemma, gpt-oss, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
     "language_codes": ["en"],
     "sample_rate": 16000,
     "encoding": "pcm_s16le",
@@ -31,7 +58,10 @@
       "endpoint": "https://sync.assemblyai.com/v1/transcribe",
       "model": "universal-3-5-pro",
       "v2_fallback": true,
-      "speech_models": ["universal-3-5-pro", "universal-2"],
+      "speech_models": [
+        "universal-3-5-pro",
+        "universal-2"
+      ],
       "poll_interval_ms": 700,
       "timeout_ms": 45000
     }
@@ -39,10 +69,14 @@
   "cleanup": {
     "enabled": true,
     "temperature": 0.0,
-    "max_tokens": 1500,
-    "timeout_ms": 15000,
+    "max_tokens": 3000,
+    "timeout_ms": 6000,
+    "hedge_after_ms": 2500,
     "retries": 2,
-    "backoff_ms": [300, 900],
+    "backoff_ms": [
+      300,
+      900
+    ],
     "providers": [
       {
         "id": "assemblyai",
@@ -55,7 +89,9 @@
         "base_url": "https://api.groq.com/openai/v1",
         "model": "openai/gpt-oss-120b",
         "api_key_secret": "groq",
-        "extra_body": { "reasoning_effort": "low" }
+        "extra_body": {
+          "reasoning_effort": "low"
+        }
       }
     ]
   }

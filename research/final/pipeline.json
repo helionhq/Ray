@@ -1,7 +1,7 @@
 {
   "schema": "ray.dictation.pipeline.v1",
   "generated": "2026-11-01",
-  "recommendation": "AssemblyAI Sync live STT (Universal-3.5 Pro) + our own LLM cleanup pass (Gemma 4 31B on AssemblyAI LLM Gateway, Groq gpt-oss-120b fallback)",
+  "recommendation": "AssemblyAI Sync live STT (Universal-3.5 Pro) + our own LLM cleanup pass (Gemma 4 31B on AssemblyAI LLM Gateway, Groq gpt-oss-120b fallback), hedged after 2.5 s so the slow primary tail is bounded",
   "audio_capture": {
     "format": "pcm_s16le",
     "sample_rate_hz": 16000,
@@ -29,13 +29,15 @@
       "config": {
         "sample_rate": 16000,
         "channels": 1,
-        "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
+        "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Gemma, gpt-oss, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
         "keyterms_prompt": [
           "Arham",
           "Helion",
           "Ray",
           "Claude",
           "ChatGPT",
+          "Gemma",
+          "gpt-oss",
           "Grok",
           "Groq",
           "Gemini",
@@ -113,9 +115,12 @@
       },
       "user_message_template": "<transcript>\n{{TRANSCRIPT}}\n</transcript>",
       "temperature": 0,
-      "max_tokens": 1500,
+      "max_tokens": 3000,
+      "max_tokens_note": "3000 leaves room for gpt-oss reasoning tokens plus the answer; 1500 was consumed entirely by reasoning on the 2-minute monologue.",
       "stream": true,
-      "timeout_ms": 15000
+      "timeout_ms": 6000,
+      "hedge_after_ms": 2500,
+      "hedging": "Start the fallback in parallel if the primary has not produced a valid answer after hedge_after_ms (or has already failed). First valid answer wins; the loser is cancelled. Chosen from the measured primary p95 (~2.6-2.8 s cold); warm calls are usually under 0.8 s."
     },
     "primary": {
       "provider": "assemblyai_llm_gateway",
@@ -160,6 +165,23 @@
       "behavior": "insert the raw STT transcript",
       "note": "Always better than dropping the dictation; raw text is punctuated and readable."
     },
+    "model_sweep_2026-11-01": {
+      "groq_catalog_observed": [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-safeguard-20b",
+        "qwen/qwen3.8-27b",
+        "allam-2-7b",
+        "whisper-large-v3",
+        "whisper-large-v3-turbo"
+      ],
+      "aai_gateway_accessible": [
+        "gemma-4-31b",
+        "qwen3.5-4b-32k-fast"
+      ],
+      "aai_gateway_listed_but_not_accessible": "gemini, claude, gpt-5, deepseek, kimi, grok, glm, nemotron, minimax and muse return 'Your account does not have access to this LLM Gateway model'",
+      "outcome": "gemma-4-31b stays primary for quality. openai/gpt-oss-120b stays fallback: it matched gemma on the hard corpus, resolves chained corrections, and is ~1 s warm. gpt-oss-20b is faster but kept a chained correction in the old set and once spent the whole 1500-token budget on reasoning; max_tokens is now 3000. qwen3.8-27b is fast but its 1000 output-tokens/minute cap makes it unusable for long dictations. qwen3.5-4b-32k-fast scored lower and produced 98 s timeout tails."
+    },
     "retry_policy": {
       "retries": 2,
       "backoff_ms": [
@@ -173,7 +195,8 @@
         503,
         504
       ],
-      "then": "switch to fallback model once, then raw transcript"
+      "then": "switch to fallback model once, then raw transcript",
+      "context": "The primary is hedged rather than retried on the tail: the fallback starts at hedge_after_ms and the first valid answer wins. A Groq 429 can only fail the fallback request; it never delays or cancels the primary."
     }
   },
   "pipeline": {
@@ -194,5 +217,19 @@
       "llm_gemma_usd": 0.3,
       "note": "STT at $0.45-0.50/hr including keyterms; ~4.2 h audio"
     }
+  },
+  "round2_measurements": {
+    "cleanup_hedge_after_ms": 2500,
+    "cleanup_timeout_ms": 6000,
+    "regression_cold_p50_ms": 1776,
+    "regression_cold_p95_ms": 2792,
+    "regression_cold_max_ms": 7796,
+    "regression_warm_p50_ms": 855,
+    "regression_warm_p95_ms": 1866,
+    "regression_warm_max_ms": 2130,
+    "hard_warm_p50_ms": 782,
+    "hard_warm_p95_ms": 1193,
+    "hard_warm_max_ms": 2112,
+    "note": "Round-1 baseline is the cold app_final run; round-2 warm runs pre-warm the gateway during recording, as the app does."
   }
 }

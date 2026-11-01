@@ -21,6 +21,8 @@ pub fn default_known_names() -> Vec<String> {
         "Claude",
         "ChatGPT",
         "GPT-5",
+        "Gemma",
+        "gpt-oss",
         "Grok",
         "Groq",
         "Gemini",
@@ -53,8 +55,9 @@ pub fn default_known_names() -> Vec<String> {
 pub fn default_stt_prompt() -> String {
     "A work dictation from a software founder, PM or engineer: messages, emails, meeting \
      notes, technical instructions and casual replies. Vocabulary includes AI and developer \
-     tools (Claude, ChatGPT, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, \
-     Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, \
+     tools (Claude, ChatGPT, Gemma, gpt-oss, Grok, Groq, Anthropic, OpenAI, Vercel, \
+     Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company \
+     Helion, teammates' names, \
      and the product Ray. Speech may contain filler words, false starts and self-corrections; \
      transcribe faithfully."
         .into()
@@ -177,10 +180,25 @@ pub struct CleanupConfig {
     pub enabled: bool,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// Hard limit for one provider request (including reading the body).
+    #[serde(default = "default_cleanup_timeout_ms")]
     pub timeout_ms: u64,
+    /// Fire the fallback in parallel when the primary has not answered by then.
+    /// Chosen from the measured p95 primary latency; a warm call is usually 5x
+    /// faster, so this only touches the tail.
+    #[serde(default = "default_hedge_after_ms")]
+    pub hedge_after_ms: u64,
     pub retries: u32,
     pub backoff_ms: Vec<u64>,
     pub providers: Vec<CleanupProvider>,
+}
+
+pub fn default_cleanup_timeout_ms() -> u64 {
+    6_000
+}
+
+pub fn default_hedge_after_ms() -> u64 {
+    2_500
 }
 
 impl Default for CleanupConfig {
@@ -188,8 +206,9 @@ impl Default for CleanupConfig {
         Self {
             enabled: true,
             temperature: 0.0,
-            max_tokens: 1_500,
-            timeout_ms: 15_000,
+            max_tokens: 3_000,
+            timeout_ms: default_cleanup_timeout_ms(),
+            hedge_after_ms: default_hedge_after_ms(),
             retries: 2,
             backoff_ms: vec![300, 900],
             providers: vec![
@@ -277,7 +296,23 @@ mod tests {
         assert!(config.cleanup.providers.iter().all(|p| p.id != "vercel"));
         assert!(config.known_names.iter().any(|name| name == "Helion"));
         assert!(config.known_names.iter().any(|name| name == "GPT-5"));
-        assert_eq!(config.cleanup.max_tokens, 1_500);
+        assert_eq!(config.cleanup.max_tokens, 3_000);
+        assert_eq!(config.cleanup.timeout_ms, 6_000);
+        assert_eq!(config.cleanup.hedge_after_ms, 2_500);
+        assert!(config.known_names.iter().any(|name| name == "gpt-oss"));
         assert!(!EMBEDDED_PROMPT.trim().is_empty());
+    }
+
+    #[test]
+    fn older_cleanup_overrides_get_the_hedge_defaults() {
+        // A user's app-data pipeline.json written before hedging existed must
+        // still load, with sensible timeout defaults rather than zero.
+        let cleanup: CleanupConfig = serde_json::from_str(
+            r#"{"enabled":true,"temperature":0,"max_tokens":1500,"retries":2,
+                "backoff_ms":[300,900],"providers":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(cleanup.timeout_ms, 6_000);
+        assert_eq!(cleanup.hedge_after_ms, 2_500);
     }
 }

@@ -152,11 +152,11 @@
       "voice": "aura-2-zeus-en",
       "speed": 0.95,
       "spoken": "Hi Sarah, um, thanks for the quick turnaround on the proposal. I've reviewed the, uh, the pricing section and I think we're, we're aligned on everything except the, um, the onboarding timeline. Would you be open to a call on Thursday to, uh, to walk through it? Best, Arham.",
-      "ideal": "Hi Sarah, thanks for the quick turnaround on the proposal. I've reviewed the pricing section and I think we're aligned on everything except the onboarding timeline. Would you be open to a call on Thursday to walk through it? Best, Arham.",
-      "expected_format": "prose",
+      "ideal": "Hi Sarah,\n\nThanks for the quick turnaround on the proposal. I've reviewed the pricing section and I think we're aligned on everything except the onboarding timeline. Would you be open to a call on Thursday to walk through it?\n\nBest,\nArham",
+      "expected_format": "email",
       "checks": [
         "filler removed",
-        "email structure preserved",
+        "email greeting and sign-off on their own lines",
         "Arham exact"
       ]
     },
@@ -222,10 +222,10 @@
       "voice": "aura-2-vesta-en",
       "speed": 1.0,
       "spoken": "Okay, three things for tomorrow. First, um, update the onboarding copy in Notion. Second, send the, uh, the API keys to Arham. And third, review the pull request for the, uh, the Supabase migration.",
-      "ideal": "Three things for tomorrow:\n- Update the onboarding copy in Notion.\n- Send the API keys to Arham.\n- Review the pull request for the Supabase migration.",
-      "expected_format": "bullets",
+      "ideal": "Okay, three things for tomorrow:\n1. Update the onboarding copy in Notion.\n2. Send the API keys to Arham.\n3. Review the pull request for the Supabase migration.",
+      "expected_format": "numbered",
       "checks": [
-        "bulleted list",
+        "numbered list (ordinal cues)",
         "3 items",
         "Notion/Arham/Supabase exact"
       ]
@@ -378,10 +378,10 @@
       "voice": "aura-2-zeus-en",
       "speed": 1.0,
       "spoken": "Hi team, um, just a quick follow-up on the, uh, the Q4 planning doc. I've added the, the headcount asks and, um, the revised timeline. Please review by, uh, end of day Wednesday and leave comments directly in Notion. Thanks, Arham.",
-      "ideal": "Hi team, just a quick follow-up on the Q4 planning doc. I've added the headcount asks and the revised timeline. Please review by end of day Wednesday and leave comments directly in Notion. Thanks, Arham.",
-      "expected_format": "prose",
+      "ideal": "Hi team,\n\nJust a quick follow-up on the Q4 planning doc. I've added the headcount asks and the revised timeline. Please review by end of day Wednesday and leave comments directly in Notion.\n\nThanks,\nArham",
+      "expected_format": "email",
       "checks": [
-        "email format kept",
+        "email greeting and sign-off on their own lines",
         "Notion exact",
         "no bullets"
       ]
@@ -434,7 +434,7 @@
       "voice": "aura-2-zeus-en",
       "speed": 1.0,
       "spoken": "Draft reply: thanks for the update. When can we expect the, uh, the revised contract? Best, Arham.",
-      "ideal": "Draft reply: thanks for the update. When can we expect the revised contract? Best, Arham.",
+      "ideal": "Draft reply: Thanks for the update. When can we expect the revised contract? Best, Arham.",
       "expected_format": "prose",
       "checks": [
         "does not answer when the contract arrives",
