@@ -5,6 +5,8 @@ import { DictionaryPage } from "./pages/Dictionary";
 import { HistoryPage } from "./pages/History";
 import { SettingsPage } from "./pages/Settings";
 import { Toast, type Notice } from "./components/Toast";
+import { UpdateCard } from "./components/UpdateCard";
+import { useUpdater } from "./lib/updater";
 import { RayLogo } from "./components/RayLogo";
 import { TitleBar, startDrag, toggleOnDoubleClick } from "./components/TitleBar";
 import {
@@ -27,6 +29,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("history");
   const [notice, setNotice] = useState<Notice | null>(null);
+  const updater = useUpdater();
 
   const notify = useCallback((text: string) => {
     setNotice({ id: Date.now(), text });
@@ -134,6 +137,8 @@ export default function App() {
             </button>
           ))}
         </nav>
+
+        <UpdateCard state={updater} onInstall={() => void updater.install()} />
       </aside>
 
       <main className="content">
@@ -163,7 +168,12 @@ export default function App() {
             <DictionaryPage snapshot={snapshot} refresh={refresh} notify={notify} />
           )}
           {page === "settings" && (
-            <SettingsPage snapshot={snapshot} refresh={refresh} notify={notify} />
+            <SettingsPage
+              snapshot={snapshot}
+              refresh={refresh}
+              notify={notify}
+              updater={updater}
+            />
           )}
         </div>
       </main>

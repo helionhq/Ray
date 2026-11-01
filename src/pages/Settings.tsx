@@ -4,6 +4,11 @@ import { api } from "../lib/bridge";
 import { applyTheme } from "../lib/theme";
 import { hotkeyLabel } from "../lib/format";
 import {
+  updatesSupported,
+  type UpdateCheck,
+  type Updater,
+} from "../lib/updater";
+import {
   ArrowRightIcon,
   CheckIcon,
   ChevronIcon,
@@ -15,6 +20,7 @@ interface Props {
   snapshot: Snapshot;
   refresh: () => Promise<void>;
   notify: (message: string) => void;
+  updater: Updater;
 }
 
 type Drafts = Record<Provider, string>;
@@ -34,14 +40,67 @@ function modelName(model: string): string {
   return model.replace(/\s*\([^)]*\)\s*$/, "");
 }
 
-export function SettingsPage({ snapshot, refresh, notify }: Props) {
+export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   const [drafts, setDrafts] = useState<Drafts>(emptyDrafts);
   const [reveals, setReveals] = useState<Reveals>(hidden);
   const [replacing, setReplacing] = useState<ProviderFlags>(unflagged);
   const [connected, setConnected] = useState<ProviderFlags>(unflagged);
   const [busy, setBusy] = useState<string | null>(null);
+  const [checked, setChecked] = useState<UpdateCheck | null>(null);
 
   const saved = snapshot.keys;
+  const canCheck = updatesSupported();
+  const checking = updater.checking;
+  const updateBusy = updater.phase !== "idle";
+
+  let updateHelp = "Local dictation for Windows.";
+  if (!canCheck) {
+    updateHelp = "Update checks run in the installed app.";
+  } else if (updater.error) {
+    updateHelp = "The update could not be installed. Try again.";
+  } else if (updater.phase === "downloading") {
+    updateHelp = `Downloading Ray ${updater.version}…`;
+  } else if (updater.phase === "installing") {
+    updateHelp = "Installing. Ray will restart when it is done.";
+  } else if (updater.version) {
+    updateHelp = `Ray ${updater.version} is ready to install.`;
+  } else if (checking) {
+    updateHelp = "Looking for a new version…";
+  } else if (checked?.status === "current") {
+    updateHelp = "Ray is up to date.";
+  } else if (checked?.status === "error") {
+    updateHelp = "Couldn't check for updates. Try again.";
+  }
+
+  let updateLabel = "Install update";
+  if (updater.error) {
+    updateLabel = "Retry";
+  } else if (updater.phase === "downloading") {
+    updateLabel =
+      updater.progress === null
+        ? "Downloading…"
+        : `${Math.round(updater.progress * 100)}%`;
+  } else if (updater.phase === "installing") {
+    updateLabel = "Installing…";
+  }
+
+  async function checkForUpdates() {
+    setChecked(null);
+    try {
+      const result = await updater.checkNow();
+      setChecked(result);
+      if (result.status === "current") {
+        notify("Ray is up to date");
+      } else if (result.status === "available") {
+        notify(`Ray ${result.version} is available`);
+      } else if (result.status === "error") {
+        notify("Couldn't check for updates");
+      }
+    } catch (error) {
+      setChecked({ status: "error", message: String(error) });
+      notify("Couldn't check for updates");
+    }
+  }
 
   async function saveKey(provider: Provider) {
     const value = drafts[provider].trim();
@@ -520,23 +579,29 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
         <div className="row">
           <div className="row-copy">
             <div className="label">Ray {snapshot.version}</div>
-            <div className="help">Local dictation for Windows.</div>
+            <div className="help" aria-live="polite">
+              {updateHelp}
+            </div>
           </div>
-          <button
-            type="button"
-            className="btn"
-            onClick={async () => {
-              try {
-                await api.reloadConfig();
-                await refresh();
-                notify("Configuration reloaded");
-              } catch (error) {
-                notify(String(error));
-              }
-            }}
-          >
-            Reload config
-          </button>
+          {updater.version ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => void updater.install()}
+              disabled={updateBusy}
+            >
+              {updateLabel}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void checkForUpdates()}
+              disabled={!canCheck || checking}
+            >
+              {checking ? "Checking…" : "Check for updates"}
+            </button>
+          )}
         </div>
         <dl className="facts">
           <div>
@@ -557,6 +622,22 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
           </div>
         </dl>
         <div className="about-actions">
+          <button
+            type="button"
+            className="btn btn-ghost"
+            title="Reload pipeline.json and cleanup.md overrides"
+            onClick={async () => {
+              try {
+                await api.reloadConfig();
+                await refresh();
+                notify("Configuration reloaded");
+              } catch (error) {
+                notify(String(error));
+              }
+            }}
+          >
+            Reload config
+          </button>
           <button
             type="button"
             className="btn btn-ghost"

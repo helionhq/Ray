@@ -324,6 +324,80 @@ nav {
   font-feature-settings: "tnum";
 }
 
+.sidebar-foot {
+  margin-top: auto;
+  padding-top: 12px;
+}
+
+.update-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--lift);
+}
+
+.update-card-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.update-card-title {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 550;
+  letter-spacing: -0.005em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-card-version {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
+
+.update-card.has-error .update-card-title {
+  color: var(--live);
+}
+
+.update-progress {
+  height: 2px;
+  overflow: hidden;
+  border-radius: 1px;
+  background: var(--line);
+}
+
+.update-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ink);
+  transition: width 160ms var(--ease-out);
+}
+
+.update-card .update-card-btn {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+/* The label turns into live progress, so keep it legible while disabled. */
+.update-card .update-card-btn:disabled {
+  opacity: 1;
+}
+
+.update-card-btn svg {
+  flex: none;
+}
+
 /* ----------------------------------------------------------------- content */
 
 .content {
@@ -1467,6 +1541,29 @@ kbd {
 
   .nav-item span {
     display: none;
+  }
+
+  .sidebar-foot {
+    width: 40px;
+  }
+
+  .update-card {
+    padding: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .update-card-copy,
+  .update-progress,
+  .update-card-btn-label {
+    display: none;
+  }
+
+  .update-card .update-card-btn {
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border-radius: 10px;
   }
 
   .page {

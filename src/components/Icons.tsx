@@ -92,6 +92,14 @@ export const ReturnIcon = (props: IconProps) => (
   </Icon>
 );
 
+export const UpdateIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M12 4v10" />
+    <path d="m7.5 9.5 4.5 4.5 4.5-4.5" />
+    <path d="M5 19h14" />
+  </Icon>
+);
+
 export const CheckIcon = (props: IconProps) => (
   <Icon {...props}>
     <path d="M5 12.5l4.5 4.5L19 7.5" />

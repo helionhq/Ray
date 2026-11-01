@@ -30,6 +30,12 @@ pnpm tauri build --no-bundle   # executable only
 
 The Rust side can be checked independently with `cargo check --manifest-path src-tauri/Cargo.toml`; run unit tests with `cargo test --manifest-path src-tauri/Cargo.toml --lib`.
 
+## Releases
+
+Every merge into `main` publishes a signed Windows release and bumps the patch
+version; installed apps pick it up automatically. See [RELEASING.md](RELEASING.md)
+for the pipeline, manual releases, and the signing key.
+
 ## Keys
 
 Enter keys in **Settings → Transcription / Cleanup**. They are stored in **Windows Credential Manager** under service `ray`, and are never written to the repo or baked into the binary.
@@ -48,7 +54,7 @@ Everything lives in two files:
 - `src-tauri/prompts/cleanup.md` — the cleanup system prompt. Supports `{{DICTIONARY}}`, `{{KNOWN_NAMES}}`, `{{APP_NAME}}`, and `{{TRANSCRIPT}}`.
 - `src-tauri/config/pipeline.json` — STT mode/model/endpoints, cleanup provider order, models, temperature, retries, timeouts, and the built-in known-names list.
 
-Rebuild after editing them, or override at runtime without a rebuild by placing `cleanup.md` and/or `pipeline.json` in `%APPDATA%\com.helion.ray\` and pressing **Settings → Reload config**. Runtime overrides use the same schema as the checked-in files.
+Rebuild after editing them, or override at runtime without a rebuild by placing `cleanup.md` and/or `pipeline.json` in `%APPDATA%\com.helion.ray\` and pressing **Settings → About → Reload config**. Runtime overrides use the same schema as the checked-in files.
 
 To use a different STT protocol, set `stt.mode` to `sync_live` (default) or `websocket`. To add an LLM provider, add an entry to `cleanup.providers` with an OpenAI-compatible `base_url`, `model`, and one of the `api_key_secret` values (`assemblyai`, `groq`, `vercel`).
 
