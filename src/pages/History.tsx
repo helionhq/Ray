@@ -75,7 +75,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
     const needle = query.trim().toLowerCase();
     if (!needle) return snapshot.history;
     return snapshot.history.filter((entry) => {
-      const haystack = `${entry.text} ${entry.raw ?? ""} ${entry.app ?? ""}`.toLowerCase();
+      const haystack = `${entry.text} ${entry.raw ?? ""}`.toLowerCase();
       return haystack.includes(needle);
     });
   }, [snapshot.history, query]);
@@ -214,7 +214,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
           ref={search}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search dictations, apps, or words"
+          placeholder="Search dictations"
           aria-label="Search dictations"
           spellCheck={false}
         />
@@ -245,7 +245,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
           <p>{query ? "Nothing matches that search." : "No dictations yet."}</p>
           <span>
             {query
-              ? "Try a different word or the app name."
+              ? "Try a different word."
               : "Press Right Alt, say what you mean, then press it again."}
           </span>
         </div>
@@ -285,11 +285,6 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
                         </div>
                       )}
                       <div className="entry-meta">
-                        <span className="app-chip">
-                          <i aria-hidden="true" />
-                          {entry.app ?? "Unknown"}
-                        </span>
-                        <span className="meta-sep" />
                         <span className="mono">
                           {duration(entry.duration_ms)}
                         </span>

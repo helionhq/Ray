@@ -645,22 +645,6 @@ kbd {
   font-size: 12px;
 }
 
-.app-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--ink-2);
-}
-
-.app-chip i {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  border-radius: 3px;
-  background: var(--line-2);
-  box-shadow: inset 0 0 0 1px var(--line);
-}
-
 .meta-sep {
   width: 2px;
   height: 2px;
