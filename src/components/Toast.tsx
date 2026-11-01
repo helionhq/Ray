@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { CheckIcon } from "./Icons";
 
 export interface Notice {
   id: number;
@@ -18,7 +19,8 @@ export function Toast({ notice }: { notice: Notice | null }) {
       let clearTimer: number | undefined;
       const timer = window.setTimeout(() => {
         setVisible(false);
-        clearTimer = window.setTimeout(() => setText(""), 240);
+        // Leave the exit transition (160ms) time to finish before unmounting.
+        clearTimer = window.setTimeout(() => setText(""), 160);
       }, 3800);
       return () => {
         cancelAnimationFrame(frame);
@@ -27,14 +29,15 @@ export function Toast({ notice }: { notice: Notice | null }) {
       };
     }
     setVisible(false);
-    const timer = window.setTimeout(() => setText(""), 240);
+    const timer = window.setTimeout(() => setText(""), 160);
     return () => window.clearTimeout(timer);
   }, [notice]);
 
   if (!text) return null;
   return (
     <div className={`toast${visible ? " is-visible" : ""}`} role="status">
-      {text}
+      <CheckIcon size={14} />
+      <span>{text}</span>
     </div>
   );
 }

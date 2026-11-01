@@ -91,6 +91,7 @@ pub fn run() {
             commands::clear_secret,
             commands::test_secret,
             commands::save_settings,
+            commands::set_title_bar_dark,
             commands::add_dictionary,
             commands::remove_dictionary,
             commands::delete_history,

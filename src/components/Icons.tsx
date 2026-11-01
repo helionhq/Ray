@@ -7,10 +7,10 @@ function Icon({ size = 16, children, ...props }: IconProps) {
     <svg
       width={size}
       height={size}
-      viewBox="0 0 16 16"
+      viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.4"
+      strokeWidth="1.6"
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
@@ -23,117 +23,114 @@ function Icon({ size = 16, children, ...props }: IconProps) {
 
 export const HistoryIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M2.2 8a5.8 5.8 0 1 0 1.7-4.1" />
-    <path d="M2.2 2.6v3.2h3.2" />
-    <path d="M8 5.1V8l2 1.2" />
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 7.5V12l3 2" />
   </Icon>
 );
 
 export const DictionaryIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M3 2.8h7.2a2 2 0 0 1 2 2v8.4H5a2 2 0 0 1-2-2V2.8Z" />
-    <path d="M5 13.2a2 2 0 0 1 0-4h7.2" />
-    <path d="M6 5h3.5" />
+    <path d="M5 19V5.5A1.5 1.5 0 0 1 6.5 4H19v13H6.5A1.5 1.5 0 0 0 5 18.5 1.5 1.5 0 0 0 6.5 20H19" />
   </Icon>
 );
 
 export const SettingsIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M2.4 4.5h11.2M2.4 11.5h11.2" />
-    <circle cx="6" cy="4.5" r="1.6" fill="var(--surface)" />
-    <circle cx="10.4" cy="11.5" r="1.6" fill="var(--surface)" />
+    <path d="M4 7h9M17 7h3M4 17h3M11 17h9" />
+    <circle cx="15" cy="7" r="2" />
+    <circle cx="9" cy="17" r="2" />
   </Icon>
 );
 
 export const SearchIcon = (props: IconProps) => (
   <Icon {...props}>
-    <circle cx="7" cy="7" r="4.4" />
-    <path d="m10.4 10.4 3 3" />
+    <circle cx="11" cy="11" r="6.5" />
+    <path d="m20 20-4.2-4.2" />
   </Icon>
 );
 
 export const CopyIcon = (props: IconProps) => (
   <Icon {...props}>
-    <rect x="5.2" y="5.2" width="7.6" height="7.6" rx="1.6" />
-    <path d="M10.8 5.2V4a1.6 1.6 0 0 0-1.6-1.6H4A1.6 1.6 0 0 0 2.4 4v5.2A1.6 1.6 0 0 0 4 10.8h1.2" />
+    <rect x="8.5" y="8.5" width="11" height="11" rx="2.5" />
+    <path d="M15.5 8.5V6A1.5 1.5 0 0 0 14 4.5H6A1.5 1.5 0 0 0 4.5 6v8A1.5 1.5 0 0 0 6 15.5h2.5" />
   </Icon>
 );
 
 export const TrashIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M2.8 4.3h10.4M6.2 4.3V3a1 1 0 0 1 1-1h1.6a1 1 0 0 1 1 1v1.3" />
-    <path d="M4.3 4.3l.6 8.1a1.3 1.3 0 0 0 1.3 1.2h3.6a1.3 1.3 0 0 0 1.3-1.2l.6-8.1" />
-    <path d="M6.7 7v3.6M9.3 7v3.6" />
+    <path d="M5 7h14M10 11v5.5M14 11v5.5M6.5 7l.8 11.2A1.5 1.5 0 0 0 8.8 19.5h6.4a1.5 1.5 0 0 0 1.5-1.3L17.5 7M9.5 7V5.5A1 1 0 0 1 10.5 4.5h3a1 1 0 0 1 1 1V7" />
   </Icon>
 );
 
 export const XIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="m4 4 8 8M12 4l-8 8" />
+    <path d="M6 6l12 12M18 6 6 18" />
   </Icon>
 );
 
 export const PlusIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M8 3.2v9.6M3.2 8h9.6" />
+    <path d="M12 5v14M5 12h14" />
   </Icon>
 );
 
 export const ChevronIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="m5.5 6.5 2.5 2.5 2.5-2.5" />
+    <path d="m6 9 6 6 6-6" />
+  </Icon>
+);
+
+export const ArrowRightIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M5 12h14M13 6l6 6-6 6" />
+  </Icon>
+);
+
+export const ReturnIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M20 5v7a3 3 0 0 1-3 3H5M9 11l-4 4 4 4" />
   </Icon>
 );
 
 export const CheckIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="m3.2 8.4 3 3 6.6-6.8" />
+    <path d="M5 12.5l4.5 4.5L19 7.5" />
+  </Icon>
+);
+
+export const AlertIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <circle cx="12" cy="12" r="8.5" />
+    <path d="M12 7.5v5M12 16.2h.01" />
   </Icon>
 );
 
 export const EyeIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M1.6 8s2.3-4 6.4-4 6.4 4 6.4 4-2.3 4-6.4 4-6.4-4-6.4-4Z" />
-    <circle cx="8" cy="8" r="1.7" />
+    <path d="M2.5 12S5.8 6.5 12 6.5 21.5 12 21.5 12 18.2 17.5 12 17.5 2.5 12 2.5 12Z" />
+    <circle cx="12" cy="12" r="2.6" />
   </Icon>
 );
 
 export const EyeOffIcon = (props: IconProps) => (
   <Icon {...props}>
-    <path d="M2.4 2.4l11.2 11.2" />
-    <path d="M6.2 4.3A6.7 6.7 0 0 1 8 4c4.1 0 6.4 4 6.4 4a11 11 0 0 1-2.4 2.8" />
-    <path d="M4.4 5.3A11 11 0 0 0 1.6 8s2.3 4 6.4 4c.9 0 1.7-.2 2.4-.5" />
-    <path d="M6.8 7a1.7 1.7 0 0 0 2.3 2.3" />
+    <path d="M3.5 3.5l17 17" />
+    <path d="M9.4 6.9A8.9 8.9 0 0 1 12 6.5c6.2 0 9.5 5.5 9.5 5.5a15 15 0 0 1-3.6 3.9" />
+    <path d="M6.4 8.2A15 15 0 0 0 2.5 12S5.8 17.5 12 17.5c1.4 0 2.6-.3 3.7-.7" />
+    <path d="M10.2 10.2a2.6 2.6 0 0 0 3.6 3.6" />
   </Icon>
 );
 
 export const MicIcon = (props: IconProps) => (
   <Icon {...props}>
-    <rect x="5.6" y="1.8" width="4.8" height="7.6" rx="2.4" />
-    <path d="M3.4 7.4a4.6 4.6 0 0 0 9.2 0M8 12v2.2" />
+    <rect x="9" y="2" width="6" height="11" rx="3" />
+    <path d="M5 10a7 7 0 0 0 14 0M12 17v3.5" />
   </Icon>
 );
 
 export const KeyboardIcon = (props: IconProps) => (
   <Icon {...props}>
-    <rect x="1.6" y="4" width="12.8" height="8" rx="1.8" />
-    <path d="M4 6.6h.01M6.4 6.6h.01M8.8 6.6h.01M11.2 6.6h.01M4 9.6h8" />
+    <rect x="2.5" y="6" width="19" height="12" rx="2.5" />
+    <path d="M6 10h.01M9.3 10h.01M12.6 10h.01M15.9 10h.01M19 10h.01M6 13.6h.01M9.3 13.6h.01M12.6 13.6h.01M15.9 13.6h.01M19 13.6h.01M7.5 16.3h9" />
   </Icon>
-);
-
-export const RayMark = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    fill="none"
-    aria-hidden="true"
-  >
-    <rect width="24" height="24" rx="6.5" fill="currentColor" />
-    <g fill="var(--surface)">
-      <rect x="6" y="8" width="2" height="8" rx="1" />
-      <rect x="10" y="6" width="2" height="12" rx="1" />
-      <rect x="14" y="9" width="2" height="6" rx="1" />
-    </g>
-  </svg>
 );

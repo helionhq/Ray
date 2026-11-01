@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos, ShowWindow, GA_ROOT, GA_ROOTOWNER,
     GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TRANSPARENT,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
@@ -56,6 +56,8 @@ extern "system" {
 
 const DWMWA_NCRENDERING_POLICY: u32 = 2;
 const DWMNCRP_DISABLED: i32 = 1;
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+const DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY: u32 = 19;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWCP_DONOTROUND: i32 = 1;
 const DWMWA_BORDER_COLOR: u32 = 34;
@@ -85,6 +87,51 @@ fn remove_dwm_frame(hwnd: HWND) {
             &DWMWA_COLOR_NONE as *const u32 as *const c_void,
             std::mem::size_of::<u32>() as u32,
         );
+    }
+}
+
+/// Themes the main window's non-client area without touching WebView2.
+///
+/// Tauri's `Window::set_theme` must not be used for this: on Windows, wry
+/// implements it through the webview's `PreferredColorScheme`, and the
+/// WebView2 profile is shared by every webview in the process — it would also
+/// repaint the floating bar. DWM's immersive dark-mode attribute only affects
+/// the title bar of this HWND.
+pub fn set_title_bar_dark(hwnd: HWND, dark: bool) -> Result<(), String> {
+    unsafe {
+        let value: i32 = if dark { 1 } else { 0 };
+        let mut result = DwmSetWindowAttribute(
+            hwnd.0,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &value as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // Windows 10 before 20H1 used attribute 19.
+        if result != 0 {
+            result = DwmSetWindowAttribute(
+                hwnd.0,
+                DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY,
+                &value as *const i32 as *const c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+        // DWM may only repaint the non-client area after a frame change.
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not set the window title bar theme (HRESULT {result:#x})"
+            ))
+        }
     }
 }
 

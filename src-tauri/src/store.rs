@@ -26,6 +26,9 @@ pub struct Settings {
     pub cleanup_enabled: bool,
     pub streaming_enabled: bool,
     pub keep_raw: bool,
+    /// "system", "light", or "dark". Old documents without this field load
+    /// with the default because the struct is `#[serde(default)]`.
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -36,7 +39,17 @@ impl Default for Settings {
             cleanup_enabled: true,
             streaming_enabled: true,
             keep_raw: true,
+            theme: "system".into(),
         }
+    }
+}
+
+/// Unknown or malformed values fall back to following the OS.
+fn normalize_theme(theme: &str) -> String {
+    match theme.trim().to_ascii_lowercase().as_str() {
+        "light" => "light".into(),
+        "dark" => "dark".into(),
+        _ => "system".into(),
     }
 }
 
@@ -96,6 +109,7 @@ impl Store {
             !word.is_empty() && seen.insert(word.to_lowercase())
         });
         data.dictionary.truncate(MAX_DICTIONARY);
+        data.settings.theme = normalize_theme(&data.settings.theme);
     }
 
     fn persist(&self, data: &StoreData) -> Result<(), String> {
@@ -148,6 +162,7 @@ impl Store {
             cleanup_enabled: settings.cleanup_enabled,
             streaming_enabled: settings.streaming_enabled,
             keep_raw: settings.keep_raw,
+            theme: normalize_theme(&settings.theme),
         };
         self.persist(&candidate)?;
         *data = candidate;
@@ -287,6 +302,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         Store::load(&dir)
+    }
+
+    #[test]
+    fn old_settings_documents_default_the_theme_to_system() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"keep_raw":false,"streaming_enabled":false}"#).unwrap();
+        assert_eq!(settings.theme, "system");
+        assert!(!settings.keep_raw);
+        assert!(!settings.streaming_enabled);
+    }
+
+    #[test]
+    fn theme_is_normalized_when_saved() {
+        let store = temp_store();
+        let saved = store
+            .update_settings(Settings {
+                theme: " Dark ".into(),
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(saved.theme, "dark");
+        assert_eq!(store.settings().theme, "dark");
+
+        let saved = store
+            .update_settings(Settings {
+                theme: "solarized".into(),
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(saved.theme, "system");
+    }
+
+    #[test]
+    fn a_hand_edited_unknown_theme_loads_as_system() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), r#"{"settings":{"theme":"solarized"}}"#).unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.settings().theme, "system");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

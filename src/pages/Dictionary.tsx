@@ -1,7 +1,7 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { Snapshot } from "../lib/bridge";
 import { api } from "../lib/bridge";
-import { PlusIcon, XIcon } from "../components/Icons";
+import { ReturnIcon, XIcon } from "../components/Icons";
 
 interface Props {
   snapshot: Snapshot;
@@ -12,8 +12,15 @@ interface Props {
 export function DictionaryPage({ snapshot, refresh, notify }: Props) {
   const [term, setTerm] = useState("");
   const [busy, setBusy] = useState(false);
+  const [justAdded, setJustAdded] = useState<string | null>(null);
   const input = useRef<HTMLInputElement>(null);
   const words = snapshot.dictionary;
+
+  useEffect(() => {
+    if (!justAdded) return;
+    const timer = window.setTimeout(() => setJustAdded(null), 2400);
+    return () => window.clearTimeout(timer);
+  }, [justAdded]);
 
   async function add(event: FormEvent) {
     event.preventDefault();
@@ -23,6 +30,7 @@ export function DictionaryPage({ snapshot, refresh, notify }: Props) {
     try {
       await api.addDictionary(value);
       setTerm("");
+      setJustAdded(value);
       await refresh();
       input.current?.focus();
     } catch (error) {
@@ -50,61 +58,61 @@ export function DictionaryPage({ snapshot, refresh, notify }: Props) {
             Names, products, and jargon Ray should always spell your way.
           </p>
         </div>
-        <span className="count">{words.length}</span>
       </header>
 
       <form className="dictionary-add" onSubmit={(event) => void add(event)}>
         <input
           ref={input}
-          className="input"
           value={term}
           onChange={(event) => setTerm(event.target.value)}
-          placeholder="Add a word or name, e.g. Helion HQ"
+          placeholder="Add a name, product, or term — e.g. Helion HQ"
           aria-label="Add a dictionary term"
           spellCheck={false}
           autoComplete="off"
           maxLength={80}
         />
-        <button className="btn btn-primary" type="submit" disabled={!term.trim() || busy}>
-          <PlusIcon size={13} />
+        <button
+          type="submit"
+          className="btn-primary"
+          disabled={!term.trim() || busy}
+        >
           Add
+          <kbd>
+            <ReturnIcon size={11} />
+          </kbd>
         </button>
       </form>
+
+      <div className="list-head">
+        {words.length} {words.length === 1 ? "term" : "terms"}
+      </div>
 
       {words.length === 0 ? (
         <div className="empty empty-compact">
           <p>No custom words yet.</p>
-          <span>
-            Add the names you say most. They go to the transcriber as keyterms
-            and to the cleanup model as the preferred spelling.
-          </span>
+          <span>Add the names you say most.</span>
         </div>
       ) : (
-        <ul className="word-list">
+        <div className="chips">
           {words.map((word) => (
-            <li key={word} className="word-row">
-              <span>{word}</span>
+            <span
+              key={word}
+              className={`chip${justAdded === word ? " is-new" : ""}`}
+            >
+              <span className="chip-label">{word}</span>
               <button
-                className="icon-button"
+                type="button"
+                className="x"
                 onClick={() => void remove(word)}
                 aria-label={`Remove ${word}`}
                 title="Remove"
               >
-                <XIcon size={13} />
+                <XIcon size={11} />
               </button>
-            </li>
+            </span>
           ))}
-        </ul>
+        </div>
       )}
-
-      <div className="note-block">
-        <p className="note-title">How Ray uses these</p>
-        <p>
-          Every term is sent to AssemblyAI as a keyterm and inserted into the
-          cleanup prompt, so names keep their exact spelling and capitalization.
-          Changes apply to the next dictation.
-        </p>
-      </div>
     </>
   );
 }

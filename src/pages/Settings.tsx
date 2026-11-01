@@ -1,13 +1,15 @@
-import { useState } from "react";
-import type { Provider, Settings, Snapshot } from "../lib/bridge";
+import { Fragment, useState } from "react";
+import type { Provider, Settings, Snapshot, Theme } from "../lib/bridge";
 import { api } from "../lib/bridge";
+import { applyTheme } from "../lib/theme";
+import { hotkeyLabel } from "../lib/format";
 import {
+  ArrowRightIcon,
+  CheckIcon,
   ChevronIcon,
   EyeIcon,
   EyeOffIcon,
-  KeyboardIcon,
 } from "../components/Icons";
-import { hotkeyLabel } from "../lib/format";
 
 interface Props {
   snapshot: Snapshot;
@@ -17,13 +19,26 @@ interface Props {
 
 type Drafts = Record<Provider, string>;
 type Reveals = Record<Provider, boolean>;
+type ProviderFlags = Record<Provider, boolean>;
 
 const emptyDrafts: Drafts = { assemblyai: "", groq: "", vercel: "" };
 const hidden: Reveals = { assemblyai: false, groq: false, vercel: false };
+const unflagged: ProviderFlags = {
+  assemblyai: false,
+  groq: false,
+  vercel: false,
+};
+
+/** "gemma-4-31b (assemblyai)" reads as "gemma-4-31b" in the chain. */
+function modelName(model: string): string {
+  return model.replace(/\s*\([^)]*\)\s*$/, "");
+}
 
 export function SettingsPage({ snapshot, refresh, notify }: Props) {
   const [drafts, setDrafts] = useState<Drafts>(emptyDrafts);
   const [reveals, setReveals] = useState<Reveals>(hidden);
+  const [replacing, setReplacing] = useState<ProviderFlags>(unflagged);
+  const [connected, setConnected] = useState<ProviderFlags>(unflagged);
   const [busy, setBusy] = useState<string | null>(null);
 
   const saved = snapshot.keys;
@@ -35,6 +50,8 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
     try {
       await api.saveSecret(provider, value);
       setDrafts((current) => ({ ...current, [provider]: "" }));
+      setReplacing((current) => ({ ...current, [provider]: false }));
+      setConnected((current) => ({ ...current, [provider]: false }));
       await refresh();
       notify("Key saved in Windows Credential Manager");
     } catch (error) {
@@ -50,11 +67,14 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
       if (drafts[provider].trim()) {
         await api.saveSecret(provider, drafts[provider].trim());
         setDrafts((current) => ({ ...current, [provider]: "" }));
+        setReplacing((current) => ({ ...current, [provider]: false }));
       }
       const message = await api.testSecret(provider);
+      setConnected((current) => ({ ...current, [provider]: true }));
       notify(message);
       await refresh();
     } catch (error) {
+      setConnected((current) => ({ ...current, [provider]: false }));
       notify(String(error));
     } finally {
       setBusy(null);
@@ -65,6 +85,9 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
     setBusy(`remove-${provider}`);
     try {
       await api.clearSecret(provider);
+      setConnected((current) => ({ ...current, [provider]: false }));
+      setReplacing((current) => ({ ...current, [provider]: false }));
+      setDrafts((current) => ({ ...current, [provider]: "" }));
       await refresh();
       notify("Key removed");
     } catch (error) {
@@ -106,7 +129,27 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
     }
   }
 
-  function keyEditor(
+  async function setTheme(theme: Theme) {
+    if (theme === snapshot.settings.theme || busy !== null) return;
+    applyTheme(theme);
+    setBusy("theme");
+    try {
+      await api.saveSettings({
+        ...snapshot.settings,
+        launch_at_login: snapshot.launch_at_login,
+        theme,
+      });
+      await refresh();
+    } catch (error) {
+      applyTheme(snapshot.settings.theme);
+      notify(String(error));
+      await refresh();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  function keyRow(
     provider: Provider,
     label: string,
     help: string,
@@ -114,77 +157,135 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
   ) {
     const isSaved = saved[provider];
     const isBusy = busy?.endsWith(provider) ?? false;
+    const isReplacing = replacing[provider];
+    const editing = !isSaved || isReplacing;
+
     return (
-      <div className="key-block" key={provider}>
-        <div className="key-head">
-          <div>
-            <div className="setting-label">{label}</div>
-            <div className="setting-help">{help}</div>
+      <Fragment key={provider}>
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">
+              {label}
+              {connected[provider] && (
+                <span className="ok">
+                  <CheckIcon size={13} />
+                  Connected
+                </span>
+              )}
+            </div>
+            <div className="help">{help}</div>
           </div>
-          <span className="key-state">{isSaved ? "Saved" : "Not set"}</span>
-        </div>
-        <div className="key-field">
-          <div className="key-wrap">
-            <input
-              className="input"
-              type={reveals[provider] ? "text" : "password"}
-              value={drafts[provider]}
-              onChange={(event) =>
-                setDrafts((current) => ({
-                  ...current,
-                  [provider]: event.target.value,
-                }))
-              }
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && drafts[provider].trim() && !isBusy) {
-                  event.preventDefault();
-                  void saveKey(provider);
-                }
-              }}
-              placeholder={isSaved ? "••••••••••••••••  saved" : placeholder}
-              aria-label={`${label} API key`}
-              spellCheck={false}
-              autoComplete="off"
-            />
+          <div className="key">
+            <span className={`badge${isSaved ? " is-saved" : ""}`}>
+              {isSaved ? "Saved" : "Not set"}
+            </span>
             <button
-              className="reveal"
-              onClick={() =>
-                setReveals((current) => ({
-                  ...current,
-                  [provider]: !current[provider],
-                }))
-              }
-              aria-label={reveals[provider] ? "Hide key" : "Show key"}
               type="button"
+              className="btn"
+              onClick={() => void testKey(provider)}
+              disabled={isBusy || (!isSaved && !drafts[provider].trim())}
             >
-              {reveals[provider] ? <EyeOffIcon size={14} /> : <EyeIcon size={14} />}
+              {busy === `test-${provider}` ? "Testing…" : "Test"}
             </button>
+            {isSaved && !isReplacing && (
+              <button
+                type="button"
+                className="btn"
+                onClick={() =>
+                  setReplacing((current) => ({ ...current, [provider]: true }))
+                }
+                disabled={isBusy}
+              >
+                Replace
+              </button>
+            )}
+            {isSaved && !isReplacing && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => void removeKey(provider)}
+                disabled={isBusy}
+              >
+                Remove
+              </button>
+            )}
           </div>
-          <button
-            className="btn"
-            onClick={() => void saveKey(provider)}
-            disabled={!drafts[provider].trim() || isBusy}
-          >
-            Save
-          </button>
-          <button
-            className="btn btn-ghost"
-            onClick={() => void testKey(provider)}
-            disabled={isBusy || (!drafts[provider].trim() && !isSaved)}
-          >
-            {busy === `test-${provider}` ? "Testing…" : "Test"}
-          </button>
-          {isSaved && (
-            <button
-              className="btn btn-ghost"
-              onClick={() => void removeKey(provider)}
-              disabled={isBusy}
-            >
-              Remove
-            </button>
-          )}
         </div>
-      </div>
+        {editing && (
+          <div className="key-editor" key={`${provider}-editor`}>
+            <div className="key-wrap">
+              <input
+                className="input"
+                type={reveals[provider] ? "text" : "password"}
+                value={drafts[provider]}
+                onChange={(event) =>
+                  setDrafts((current) => ({
+                    ...current,
+                    [provider]: event.target.value,
+                  }))
+                }
+                onKeyDown={(event) => {
+                  if (
+                    event.key === "Enter" &&
+                    drafts[provider].trim() &&
+                    !isBusy
+                  ) {
+                    event.preventDefault();
+                    void saveKey(provider);
+                  }
+                }}
+                placeholder={
+                  isSaved ? "Paste a new key" : placeholder
+                }
+                aria-label={`${label} API key`}
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <button
+                type="button"
+                className="reveal"
+                onClick={() =>
+                  setReveals((current) => ({
+                    ...current,
+                    [provider]: !current[provider],
+                  }))
+                }
+                aria-label={reveals[provider] ? "Hide key" : "Show key"}
+              >
+                {reveals[provider] ? (
+                  <EyeOffIcon size={14} />
+                ) : (
+                  <EyeIcon size={14} />
+                )}
+              </button>
+            </div>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void saveKey(provider)}
+              disabled={!drafts[provider].trim() || isBusy}
+            >
+              Save
+            </button>
+            {isReplacing && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => {
+                  setReplacing((current) => ({
+                    ...current,
+                    [provider]: false,
+                  }));
+                  setDrafts((current) => ({ ...current, [provider]: "" }));
+                }}
+                disabled={isBusy}
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        )}
+      </Fragment>
     );
   }
 
@@ -199,37 +300,27 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
         <div>
           <h1>Settings</h1>
           <p className="sub">
-            Keys stay in Windows Credential Manager. Nothing here leaves this PC
-            except the audio and text sent to the services you choose.
+            Keys stay in Windows Credential Manager. Only audio and text go to
+            the services below.
           </p>
         </div>
       </header>
 
-      <section className="card section">
-        <div className="section-head">
-          <div>
-            <div className="section-title">Transcription</div>
-            <div className="section-desc">
-              AssemblyAI turns your voice into text.
-            </div>
-          </div>
-          <span className="section-badge">{snapshot.config.speech_model}</span>
-        </div>
-        {keyEditor(
+      <div className="group-label">Transcription</div>
+      <div className="card">
+        {keyRow(
           "assemblyai",
-          "AssemblyAI API key",
-          "Used for streaming speech-to-text and the batch fallback.",
+          "AssemblyAI",
+          "Streaming speech-to-text, with batch upload as a fallback.",
           "Paste your AssemblyAI key",
         )}
-        <div className="setting-row">
-          <div>
-            <div className="setting-label">Stream while I speak</div>
-            <div className="setting-help">
-              Transcribes during recording so stopping only waits for the last
-              few words. Falls back to an upload automatically.
-            </div>
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Stream while I speak</div>
+            <div className="help">Stopping only waits for the last few words.</div>
           </div>
           <button
+            type="button"
             role="switch"
             aria-checked={snapshot.settings.streaming_enabled}
             aria-label="Stream while speaking"
@@ -243,19 +334,20 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             }
           />
         </div>
-      </section>
+      </div>
 
-      <section className="card section">
-        <div className="section-head">
-          <div>
-            <div className="section-title">Cleanup</div>
-            <div className="section-desc">
-              Removes fillers, fixes punctuation, and applies your dictionary.
-              The primary model runs on the AssemblyAI LLM Gateway with the key
-              above.
+      <div className="group-label">Cleanup</div>
+      <div className="card">
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Clean up transcripts</div>
+            <div className="help">
+              Removes fillers and stutters, fixes punctuation, applies your
+              dictionary.
             </div>
           </div>
           <button
+            type="button"
             role="switch"
             aria-checked={snapshot.settings.cleanup_enabled}
             aria-label="Clean up transcripts"
@@ -269,59 +361,48 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             }
           />
         </div>
-        {keyEditor(
+        {keyRow(
           "groq",
-          "Groq API key",
-          "First fallback; the fastest cleanup path when the gateway is busy.",
+          "Groq",
+          "Fallback when the gateway is slow or busy.",
           "Paste your Groq key",
         )}
-        <div className="setting-row setting-row-stack">
-          <div className="setting-help">
-            Model chain: {snapshot.config.cleanup_models.join("  →  ")}
-          </div>
-          <div className="setting-help">
-            If every provider fails, Ray pastes the raw transcript rather than
-            losing your words.
+        <div className="row sub-row">
+          <div className="chain">
+            {snapshot.config.cleanup_models.map((model, index) => (
+              <Fragment key={model}>
+                {index > 0 && <ArrowRightIcon size={12} />}
+                <span
+                  className={`badge${index === 0 ? " primary" : ""}`}
+                  title={model}
+                >
+                  {modelName(model)}
+                </span>
+              </Fragment>
+            ))}
+            {snapshot.config.cleanup_models.length > 0 && (
+              <ArrowRightIcon size={12} />
+            )}
+            <span className="badge">raw transcript</span>
           </div>
         </div>
-      </section>
+      </div>
 
-      <section className="card section">
-        <div className="section-head">
-          <div>
-            <div className="section-title">General</div>
-            <div className="section-desc">Startup, input, and history.</div>
+      <div className="group-label">General</div>
+      <div className="card">
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Dictation shortcut</div>
+            <div className="help">Press once to start, again to paste. Esc cancels.</div>
           </div>
+          <kbd>{hotkeyLabel()}</kbd>
         </div>
 
-        <div className="setting-row">
-          <div>
-            <div className="setting-label">Launch at login</div>
-            <div className="setting-help">Keep Ray ready in the tray.</div>
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Microphone</div>
           </div>
-          <button
-            role="switch"
-            aria-checked={snapshot.launch_at_login}
-            aria-label="Launch at login"
-            className="switch"
-            disabled={busy !== null}
-            onClick={() =>
-              void update(
-                { launch_at_login: !snapshot.launch_at_login },
-                "autostart",
-              )
-            }
-          />
-        </div>
-
-        <div className="setting-row">
-          <div>
-            <div className="setting-label">Microphone</div>
-            <div className="setting-help">
-              Applies to the next recording.
-            </div>
-          </div>
-          <div className="select-wrap">
+          <div className="select">
             <select
               value={selectedDevice ?? ""}
               disabled={busy === "mic"}
@@ -346,18 +427,38 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
                 </option>
               ))}
             </select>
-            <ChevronIcon size={13} />
+            <ChevronIcon size={12} />
           </div>
         </div>
 
-        <div className="setting-row">
-          <div>
-            <div className="setting-label">Keep original transcripts</div>
-            <div className="setting-help">
-              Saves the uncleaned transcript alongside each history entry.
-            </div>
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Launch at login</div>
+            <div className="help">Keep Ray ready in the tray.</div>
           </div>
           <button
+            type="button"
+            role="switch"
+            aria-checked={snapshot.launch_at_login}
+            aria-label="Launch at login"
+            className="switch"
+            disabled={busy !== null}
+            onClick={() =>
+              void update(
+                { launch_at_login: !snapshot.launch_at_login },
+                "autostart",
+              )
+            }
+          />
+        </div>
+
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Keep original transcripts</div>
+            <div className="help">Save the uncleaned text next to each dictation.</div>
+          </div>
+          <button
+            type="button"
             role="switch"
             aria-checked={snapshot.settings.keep_raw}
             aria-label="Keep original transcripts"
@@ -369,13 +470,37 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
           />
         </div>
 
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Appearance</div>
+          </div>
+          <div className="segmented" role="group" aria-label="Appearance">
+            {(["system", "light", "dark"] as const).map((theme) => (
+              <button
+                key={theme}
+                type="button"
+                aria-pressed={snapshot.settings.theme === theme}
+                disabled={busy === "theme"}
+                onClick={() => void setTheme(theme)}
+              >
+                {theme === "system"
+                  ? "System"
+                  : theme === "light"
+                    ? "Light"
+                    : "Dark"}
+              </button>
+            ))}
+          </div>
+        </div>
+
         {snapshot.hotkey_error && (
-          <div className="setting-row">
-            <div>
-              <div className="setting-label">Keyboard shortcut unavailable</div>
-              <div className="setting-help">{snapshot.hotkey_error}</div>
+          <div className="row">
+            <div className="row-copy">
+              <div className="label">Keyboard shortcut unavailable</div>
+              <div className="help">{snapshot.hotkey_error}</div>
             </div>
             <button
+              type="button"
               className="btn"
               onClick={() => void retryHotkey()}
               disabled={busy !== null}
@@ -384,27 +509,30 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             </button>
           </div>
         )}
+      </div>
 
-        <div className="setting-row">
-          <div>
-            <div className="setting-label">Dictation shortcut</div>
-            <div className="setting-help">
-              Press once to record, again to stop. Escape cancels.
-            </div>
+      <div className="group-label">About</div>
+      <div className="card">
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Ray {snapshot.version}</div>
+            <div className="help">Local dictation for Windows.</div>
           </div>
-          <span className="hotkey-inline">
-            <KeyboardIcon size={13} />
-            <kbd className="keycap">{hotkeyLabel()}</kbd>
-          </span>
-        </div>
-      </section>
-
-      <section className="card section">
-        <div className="section-head">
-          <div>
-            <div className="section-title">About</div>
-            <div className="section-desc">Ray {snapshot.version}</div>
-          </div>
+          <button
+            type="button"
+            className="btn"
+            onClick={async () => {
+              try {
+                await api.reloadConfig();
+                await refresh();
+                notify("Configuration reloaded");
+              } catch (error) {
+                notify(String(error));
+              }
+            }}
+          >
+            Reload config
+          </button>
         </div>
         <dl className="facts">
           <div>
@@ -426,24 +554,14 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
         </dl>
         <div className="about-actions">
           <button
+            type="button"
             className="btn btn-ghost"
-            onClick={async () => {
-              try {
-                await api.reloadConfig();
-                await refresh();
-                notify("Configuration reloaded");
-              } catch (error) {
-                notify(String(error));
-              }
-            }}
+            onClick={() => void api.quit()}
           >
-            Reload config
-          </button>
-          <button className="btn btn-ghost" onClick={() => void api.quit()}>
             Quit Ray
           </button>
         </div>
-      </section>
+      </div>
     </>
   );
 }

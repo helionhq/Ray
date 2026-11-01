@@ -1,15 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { api, onEvent, type Snapshot } from "./lib/bridge";
-import { hotkeyLabel } from "./lib/format";
+import { applyTheme } from "./lib/theme";
 import { DictionaryPage } from "./pages/Dictionary";
 import { HistoryPage } from "./pages/History";
 import { SettingsPage } from "./pages/Settings";
 import { Toast, type Notice } from "./components/Toast";
+import { RayLogo } from "./components/RayLogo";
 import {
+  AlertIcon,
   DictionaryIcon,
   HistoryIcon,
-  KeyboardIcon,
-  RayMark,
   SettingsIcon,
 } from "./components/Icons";
 
@@ -69,10 +69,17 @@ export default function App() {
     };
   }, [refresh, notify]);
 
+  // Apply the store's theme before the snapshot paints, so a chosen theme
+  // never flickers on a state refresh.
+  const theme = snapshot?.settings.theme;
+  useLayoutEffect(() => {
+    if (theme) applyTheme(theme);
+  }, [theme]);
+
   if (error) {
     return (
       <div className="boot">
-        <RayMark size={22} />
+        <RayLogo />
         <p>Ray could not load its local state.</p>
         <span>{error}</span>
         <button className="btn" onClick={() => void refresh()}>
@@ -85,77 +92,70 @@ export default function App() {
   if (!snapshot) {
     return (
       <div className="boot">
-        <RayMark size={22} />
+        <RayLogo />
         <span className="boot-wait">Loading Ray…</span>
       </div>
     );
   }
 
+  const missingKey = !snapshot.keys.assemblyai;
+  const hotkeyIssue = Boolean(snapshot.hotkey_error);
+  const showBanner = missingKey || hotkeyIssue;
+
   return (
     <div className="app">
       <aside className="sidebar">
         <div className="brand">
-          <span className="mark">
-            <RayMark size={19} />
-          </span>
-          <span>Ray</span>
+          <RayLogo />
         </div>
 
         <nav aria-label="Sections">
           {pages.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
+              type="button"
               className={`nav-item${page === id ? " is-active" : ""}`}
               onClick={() => setPage(id)}
               aria-current={page === id ? "page" : undefined}
             >
               <Icon size={15} />
               <span>{label}</span>
+              {id === "dictionary" && (
+                <span className="count mono">{snapshot.dictionary.length}</span>
+              )}
             </button>
           ))}
         </nav>
-
-        <div className="sidebar-foot">
-          <div className="hotkey-row">
-            <KeyboardIcon size={13} />
-            <kbd className="keycap">{hotkeyLabel()}</kbd>
-            <span>to dictate</span>
-          </div>
-          {!snapshot.keys.assemblyai && (
-            <button className="sidebar-note" onClick={() => setPage("settings")}>
-              Add an AssemblyAI key to start.
-            </button>
-          )}
-          {snapshot.hotkey_error && (
-            <button className="sidebar-note" onClick={() => setPage("settings")}>
-              Keyboard shortcut unavailable. Fix it in Settings.
-            </button>
-          )}
-        </div>
       </aside>
 
       <main className="content">
+        {showBanner && (
+          <div className="banner" role="status">
+            <AlertIcon size={14} className="banner-icon" />
+            <span className="banner-text">
+              {missingKey && "Add an AssemblyAI key to start dictating."}
+              {missingKey && hotkeyIssue && <span className="banner-sep" />}
+              {hotkeyIssue && "The Right Alt shortcut is unavailable."}
+            </span>
+            <button
+              type="button"
+              className="banner-action"
+              onClick={() => setPage("settings")}
+            >
+              Settings
+            </button>
+          </div>
+        )}
+
         <div className="page">
           {page === "history" && (
-            <HistoryPage
-              snapshot={snapshot}
-              refresh={refresh}
-              notify={notify}
-            />
+            <HistoryPage snapshot={snapshot} refresh={refresh} notify={notify} />
           )}
           {page === "dictionary" && (
-            <DictionaryPage
-              snapshot={snapshot}
-              refresh={refresh}
-              notify={notify}
-            />
+            <DictionaryPage snapshot={snapshot} refresh={refresh} notify={notify} />
           )}
           {page === "settings" && (
-            <SettingsPage
-              snapshot={snapshot}
-              refresh={refresh}
-              notify={notify}
-            />
+            <SettingsPage snapshot={snapshot} refresh={refresh} notify={notify} />
           )}
         </div>
       </main>

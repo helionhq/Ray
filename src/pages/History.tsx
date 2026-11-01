@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { HistoryEntry, Snapshot } from "../lib/bridge";
 import { api } from "../lib/bridge";
-import { dayKey, dayLabel, duration, isoOf, timeOf } from "../lib/format";
+import { diffTranscript } from "../lib/diff";
+import {
+  dayKey,
+  dayLabel,
+  duration,
+  isoOf,
+  timeOf,
+  wordCount,
+} from "../lib/format";
 import {
   CopyIcon,
   MicIcon,
@@ -18,6 +26,22 @@ interface Props {
 
 /** Above this, the six-line clamp is likely hiding part of the cleaned text. */
 const LONG_ENTRY_CHARS = 420;
+const numberFormat = new Intl.NumberFormat();
+
+function RawTranscript({ raw, cleaned }: { raw: string; cleaned: string }) {
+  const pieces = useMemo(() => diffTranscript(raw, cleaned), [raw, cleaned]);
+  return (
+    <>
+      {pieces.map((piece, index) =>
+        piece.removed ? (
+          <s key={index}>{piece.text}</s>
+        ) : (
+          <span key={index}>{piece.text}</span>
+        ),
+      )}
+    </>
+  );
+}
 
 export function HistoryPage({ snapshot, refresh, notify }: Props) {
   const [query, setQuery] = useState("");
@@ -74,6 +98,27 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
     return out;
   }, [filtered]);
 
+  const stats = useMemo(() => {
+    const today = dayKey(Date.now());
+    let todayCount = 0;
+    let words = 0;
+    let spokenMs = 0;
+    for (const entry of snapshot.history) {
+      if (dayKey(entry.created_at) !== today) continue;
+      todayCount++;
+      words += wordCount(entry.text);
+      spokenMs += Math.max(0, entry.duration_ms);
+    }
+    // ≈ max(0, words at 40 wpm − minutes actually spent speaking).
+    const savedMinutes = Math.max(0, words / 40 - spokenMs / 60_000);
+    return {
+      total: snapshot.history.length,
+      todayCount,
+      words,
+      savedMinutes: Math.round(savedMinutes),
+    };
+  }, [snapshot.history]);
+
   function toggleRaw(id: string) {
     setExpanded((current) => {
       const next = new Set(current);
@@ -126,21 +171,16 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
     }
   }
 
-  const total = snapshot.history.length;
-
   return (
     <>
       <header className="page-head">
         <div>
           <h1>History</h1>
-          <p className="sub">
-            {total === 0
-              ? "Every dictation lands here, cleaned and ready to reuse."
-              : `${total} ${total === 1 ? "dictation" : "dictations"} saved locally on this PC.`}
-          </p>
+          <p className="sub">Every dictation, cleaned and saved on this PC.</p>
         </div>
-        {total > 0 && (
+        {stats.total > 0 && (
           <button
+            type="button"
             className={`btn btn-ghost${armedClear ? " is-armed" : ""}`}
             onClick={() => void clearAll()}
           >
@@ -149,33 +189,53 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
         )}
       </header>
 
-      <div className="toolbar">
-        <div className="search">
-          <SearchIcon size={14} />
-          <input
-            ref={search}
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search dictations"
-            aria-label="Search dictations"
-            spellCheck={false}
-          />
-          {query && (
-            <button
-              className="search-clear"
-              onClick={() => setQuery("")}
-              aria-label="Clear search"
-            >
-              <XIcon size={12} />
-            </button>
-          )}
+      <div className="stats">
+        <div className="stat">
+          <b>{numberFormat.format(stats.total)}</b>
+          <span>total dictations</span>
         </div>
-        <span className="toolbar-count">
-          {query
-            ? `${filtered.length} ${filtered.length === 1 ? "result" : "results"}`
-            : ""}
-        </span>
+        <div className="stat">
+          <b>{numberFormat.format(stats.todayCount)}</b>
+          <span>today</span>
+        </div>
+        <div className="stat">
+          <b>{numberFormat.format(stats.words)}</b>
+          <span>words today</span>
+        </div>
+        <div className="stat">
+          <b>≈ {numberFormat.format(stats.savedMinutes)} min</b>
+          <span>typing saved today</span>
+        </div>
       </div>
+
+      <div className="search">
+        <SearchIcon size={15} />
+        <input
+          ref={search}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search dictations, apps, or words"
+          aria-label="Search dictations"
+          spellCheck={false}
+        />
+        {query ? (
+          <button
+            type="button"
+            className="search-clear"
+            onClick={() => setQuery("")}
+            aria-label="Clear search"
+          >
+            <XIcon size={12} />
+          </button>
+        ) : (
+          <kbd>Ctrl F</kbd>
+        )}
+      </div>
+      <span className="sr-only" role="status">
+        {query
+          ? `${filtered.length} ${filtered.length === 1 ? "result" : "results"}`
+          : ""}
+      </span>
 
       {groups.length === 0 ? (
         <div className="empty">
@@ -195,53 +255,88 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
             <section key={group.key} className="day-group">
               <h2 className="day-label">{group.label}</h2>
               {group.items.map((entry) => {
-                const showRaw = expanded.has(entry.id) && entry.raw;
+                const showRaw = expanded.has(entry.id) && Boolean(entry.raw);
                 const showFull = expandedText.has(entry.id);
                 const longText = entry.text.length > LONG_ENTRY_CHARS;
                 return (
                   <article key={entry.id} className="entry">
-                    <div className="entry-rail">
-                      <time className="entry-time" dateTime={isoOf(entry.created_at)}>
-                        {timeOf(entry.created_at)}
-                      </time>
-                      <span className="entry-app">{entry.app ?? "Unknown"}</span>
-                      <span className="entry-duration">{duration(entry.duration_ms)}</span>
-                    </div>
+                    <time
+                      className="entry-time"
+                      dateTime={isoOf(entry.created_at)}
+                    >
+                      {timeOf(entry.created_at)}
+                    </time>
                     <div className="entry-body">
-                      <p className={`entry-text${showFull ? " is-expanded" : ""}`}>
+                      <p
+                        className={`entry-text${
+                          longText && !showFull ? " is-clamped" : ""
+                        }${showFull ? " is-expanded" : ""}`}
+                      >
                         {entry.text}
                       </p>
-                      {showRaw && (
+                      {showRaw && entry.raw && (
                         <div className="entry-raw">
-                          <span className="entry-raw-label">Original transcript</span>
-                          <p>{entry.raw}</p>
+                          <span className="entry-raw-label">
+                            Original transcript
+                          </span>
+                          <p className="entry-raw-text">
+                            <RawTranscript raw={entry.raw} cleaned={entry.text} />
+                          </p>
                         </div>
                       )}
-                      <div className="entry-actions">
-                        <button onClick={() => void copy(entry)}>
-                          <CopyIcon size={13} />
-                          Copy
-                        </button>
-                        {longText && (
+                      <div className="entry-meta">
+                        <span className="app-chip">
+                          <i aria-hidden="true" />
+                          {entry.app ?? "Unknown"}
+                        </span>
+                        <span className="meta-sep" />
+                        <span className="mono">
+                          {duration(entry.duration_ms)}
+                        </span>
+                        <span className="meta-sep" />
+                        <span>{wordCount(entry.text)} words</span>
+
+                        <div className="actions">
                           <button
-                            onClick={() => toggleText(entry.id)}
-                            aria-expanded={showFull}
+                            type="button"
+                            className="icon-btn"
+                            onClick={() => void copy(entry)}
                           >
-                            {showFull ? "Show less" : "Show more"}
+                            <CopyIcon size={13} />
+                            Copy
                           </button>
-                        )}
-                        {entry.raw && (
-                          <button onClick={() => toggleRaw(entry.id)}>
-                            {expanded.has(entry.id) ? "Hide original" : "Original"}
+                          {longText && (
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              onClick={() => toggleText(entry.id)}
+                              aria-expanded={showFull}
+                            >
+                              {showFull ? "Show less" : "Show more"}
+                            </button>
+                          )}
+                          {entry.raw && (
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              onClick={() => toggleRaw(entry.id)}
+                              aria-expanded={showRaw}
+                            >
+                              {expanded.has(entry.id)
+                                ? "Hide original"
+                                : "Original"}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="icon-btn danger"
+                            onClick={() => void remove(entry)}
+                            aria-label="Delete entry"
+                            title="Delete"
+                          >
+                            <TrashIcon size={13} />
                           </button>
-                        )}
-                        <button
-                          className="entry-delete"
-                          onClick={() => void remove(entry)}
-                        >
-                          <TrashIcon size={13} />
-                          Delete
-                        </button>
+                        </div>
                       </div>
                     </div>
                   </article>

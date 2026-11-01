@@ -16,12 +16,15 @@ export interface InputDevice {
   is_default: boolean;
 }
 
+export type Theme = "system" | "light" | "dark";
+
 export interface Settings {
   launch_at_login: boolean;
   input_device: string | null;
   cleanup_enabled: boolean;
   streaming_enabled: boolean;
   keep_raw: boolean;
+  theme: Theme;
 }
 
 export interface KeyStatus {
@@ -52,31 +55,49 @@ export interface Snapshot {
 
 export type Provider = "assemblyai" | "groq" | "vercel";
 
+/** True only inside a Tauri webview; plain-browser previews have no IPC. */
+export function hasTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+/**
+ * Plain-browser previews (bar.html / index.html opened directly) must not
+ * throw from @tauri-apps/api's callback plumbing. Resolve as a no-op instead;
+ * the real app always has the internals object before any of this runs.
+ */
+function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (!hasTauri()) return Promise.resolve(undefined as T);
+  return invoke<T>(command, args);
+}
+
 export const api = {
-  snapshot: () => invoke<Snapshot>("get_snapshot"),
+  snapshot: () => call<Snapshot>("get_snapshot"),
   saveSecret: (provider: Provider, value: string) =>
-    invoke<void>("save_secret", { provider, value }),
-  clearSecret: (provider: Provider) => invoke<void>("clear_secret", { provider }),
-  testSecret: (provider: Provider) => invoke<string>("test_secret", { provider }),
+    call<void>("save_secret", { provider, value }),
+  clearSecret: (provider: Provider) => call<void>("clear_secret", { provider }),
+  testSecret: (provider: Provider) => call<string>("test_secret", { provider }),
   saveSettings: (settings: Settings) =>
-    invoke<Settings>("save_settings", { settings }),
-  addDictionary: (term: string) => invoke<string[]>("add_dictionary", { term }),
-  removeDictionary: (term: string) => invoke<string[]>("remove_dictionary", { term }),
-  deleteHistory: (id: string) => invoke<void>("delete_history", { id }),
-  clearHistory: () => invoke<void>("clear_history"),
-  copyText: (text: string) => invoke<void>("copy_text", { text }),
-  startDictation: () => invoke<void>("start_dictation"),
-  stopDictation: () => invoke<void>("stop_dictation"),
-  cancelDictation: () => invoke<void>("cancel_dictation"),
-  openMain: () => invoke<void>("open_main"),
-  reloadConfig: () => invoke<void>("reload_config"),
-  retryHotkey: () => invoke<string | null>("retry_hotkey"),
-  quit: () => invoke<void>("quit"),
+    call<Settings>("save_settings", { settings }),
+  setTitleBarDark: (dark: boolean) =>
+    call<void>("set_title_bar_dark", { dark }),
+  addDictionary: (term: string) => call<string[]>("add_dictionary", { term }),
+  removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
+  deleteHistory: (id: string) => call<void>("delete_history", { id }),
+  clearHistory: () => call<void>("clear_history"),
+  copyText: (text: string) => call<void>("copy_text", { text }),
+  startDictation: () => call<void>("start_dictation"),
+  stopDictation: () => call<void>("stop_dictation"),
+  cancelDictation: () => call<void>("cancel_dictation"),
+  openMain: () => call<void>("open_main"),
+  reloadConfig: () => call<void>("reload_config"),
+  retryHotkey: () => call<string | null>("retry_hotkey"),
+  quit: () => call<void>("quit"),
 };
 
 export function onEvent<T>(
   name: string,
   handler: (payload: T) => void,
 ): Promise<UnlistenFn> {
+  if (!hasTauri()) return Promise.resolve(() => {});
   return listen<T>(name, (event) => handler(event.payload));
 }

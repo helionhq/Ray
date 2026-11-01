@@ -196,6 +196,19 @@ pub fn save_settings(settings: Settings, store: State<'_, Arc<Store>>) -> Result
     store.update_settings(settings)
 }
 
+/// Themes only the main window's title bar via DWM. Never routes through the
+/// webview theme, which is shared with the floating bar.
+#[tauri::command]
+pub fn set_title_bar_dark(dark: bool, app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Ray's main window is not open".to_string())?;
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| format!("Could not find the main window handle: {error}"))?;
+    windows_util::set_title_bar_dark(hwnd, dark)
+}
+
 #[tauri::command]
 pub fn add_dictionary(term: String, store: State<'_, Arc<Store>>) -> Result<Vec<String>, String> {
     store.add_dictionary(&term)
