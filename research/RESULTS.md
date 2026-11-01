@@ -225,7 +225,8 @@ the gemma output into the HUD token-by-token so perceived latency ≈ TTFT (~1.3
 - **LLM auth:** `Authorization: Bearer <ASSEMBLYAI_API_KEY>` at
   `https://llm-gateway.assemblyai.com/v1/chat/completions`; model id `gemma-4-31b`.
 - **Prompt:** fill `{{DICTIONARY}}`, `{{KNOWN_NAMES}}`, `{{APP_NAME}}`; wrap the transcript
-  as `<transcript>…</transcript>`. Keep `temperature: 0`, `max_tokens: 1200`.
+  as `<transcript>…</transcript>`. Keep `temperature: 0`, `max_tokens: 1500` (the value used by
+  `llm_eval.py` for the scored runs).
 - Sanitise stray U+FFFD / em-dash characters from the transcript before insertion.
 - The cleanup prompt is deliberately conservative: it does not fix every code dictation
   (`supabase.fromUsers.select(*.eq(id))` stays garbled because ASR dropped tokens). Code

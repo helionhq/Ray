@@ -20,6 +20,7 @@ pub fn default_known_names() -> Vec<String> {
         "Ray",
         "Claude",
         "ChatGPT",
+        "GPT-5",
         "Grok",
         "Groq",
         "Gemini",
@@ -187,7 +188,7 @@ impl Default for CleanupConfig {
         Self {
             enabled: true,
             temperature: 0.0,
-            max_tokens: 1_200,
+            max_tokens: 1_500,
             timeout_ms: 15_000,
             retries: 2,
             backoff_ms: vec![300, 900],
@@ -275,6 +276,8 @@ mod tests {
         assert_eq!(config.cleanup.providers.len(), 2);
         assert!(config.cleanup.providers.iter().all(|p| p.id != "vercel"));
         assert!(config.known_names.iter().any(|name| name == "Helion"));
+        assert!(config.known_names.iter().any(|name| name == "GPT-5"));
+        assert_eq!(config.cleanup.max_tokens, 1_500);
         assert!(!EMBEDDED_PROMPT.trim().is_empty());
     }
 }
