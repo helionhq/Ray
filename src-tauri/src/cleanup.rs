@@ -557,7 +557,9 @@ enum CueHalf {
 }
 
 /// Words, lowercased, with surrounding punctuation stripped. Interior
-/// punctuation stays: "3:30," -> "3:30" and "p.m." -> "p.m".
+/// punctuation stays: "3:30," -> "3:30" and "p.m." -> "p.m". A range whose
+/// two endpoints each carry their own marker ("9am-5pm", "9:30am–5pm") is
+/// split into its two times, since each marker belongs to its own endpoint.
 fn time_tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|word| {
@@ -565,7 +567,21 @@ fn time_tokens(text: &str) -> Vec<String> {
                 .to_lowercase()
         })
         .filter(|word| !word.is_empty())
+        .flat_map(|word| match split_marked_endpoints(&word) {
+            Some((start, end)) => vec![start.to_string(), end.to_string()],
+            None => vec![word],
+        })
         .collect()
+}
+
+/// "9am-5pm" -> ("9am", "5pm") when both sides are clock times with an
+/// explicit meridiem. "9-5pm" stays whole: its marker covers the range.
+fn split_marked_endpoints(word: &str) -> Option<(&str, &str)> {
+    let (start, end) = ['-', '\u{2013}']
+        .into_iter()
+        .find_map(|separator| word.split_once(separator))?;
+    let marked = |text: &str| matches!(parse_time(text), Some((_, Some(_))));
+    (marked(start) && marked(end)).then_some((start, end))
 }
 
 /// "3", "3:30", "11" -> a clock time. Hours outside 1..=12 are not times;
@@ -1175,6 +1191,45 @@ mod tests {
         assert!(is_plausible(
             "Call at 3 p.m. and the review is 10-11 a.m.",
             "call at 3pm and the review is 10-11 am"
+        ));
+    }
+
+    #[test]
+    fn accepts_a_range_with_a_marker_on_each_endpoint() {
+        assert!(is_plausible(
+            "Office hours are 9am-5pm.",
+            "office hours are 9am-5pm"
+        ));
+        assert!(is_plausible(
+            "Office hours are 9am–5pm.",
+            "office hours are 9am to 5pm"
+        ));
+        assert!(is_plausible(
+            "Office hours are 9:30am-5:15pm.",
+            "office hours are 9:30 am to 5:15 pm"
+        ));
+        assert!(is_plausible(
+            "Office hours are 9am to 5pm.",
+            "office hours are 9am-5pm"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_range_that_drops_or_adds_an_endpoint_marker() {
+        // Dropping the start's marker turns 9 a.m. into the range's p.m.
+        assert!(!is_plausible(
+            "Office hours are 9-5pm.",
+            "office hours are 9am-5pm"
+        ));
+        // Adding a marker to an endpoint the speaker left bare.
+        assert!(!is_plausible(
+            "Office hours are 9am-5pm.",
+            "office hours are 9-5pm"
+        ));
+        // Each marker is checked against its own endpoint.
+        assert!(!is_plausible(
+            "Office hours are 9pm-5am.",
+            "office hours are 9am-5pm"
         ));
     }
 
