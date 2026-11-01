@@ -9,8 +9,12 @@ Releases are automatic. Every merge into `main` runs two jobs:
    installer on `windows-latest`, and checks that the installer exists, is
    non-empty, has the version in its filename, and that all four version
    files agree.
-2. **Publish** — the only job with write access. It commits those four
-   version files as `github-actions[bot]` with `[skip release]` in the
+2. **Publish** — the only job with write access. Before committing, it
+   verifies that the downloaded version files differ from the build's starting
+   commit only in their version declarations (`scripts/verify-bump.mjs`) and
+   installs dependencies with `--ignore-scripts`, so an altered build artifact
+   cannot smuggle in other changes or lifecycle scripts. It then commits those
+   four version files as `github-actions[bot]` with `[skip release]` in the
    message, signs the installer with `--app-version` so the signature's
    trusted comment carries the release version (`requireSignedVersion`),
    writes `latest.json`, pushes the bump to `main`, and creates the GitHub

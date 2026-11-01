@@ -149,8 +149,17 @@ jobs:
           name: release
           path: .
 
+      # The artifact crossed a trust boundary: the build job is credential-free
+      # but its scripts could have been tampered with. Check that the download
+      # changes only the version declarations before committing anything.
+      - name: Verify the downloaded bump
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: node scripts/verify-bump.mjs "$VERSION"
+
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # Commit here but do not push: the bump must not land on main unless the
       # build, the signature, and latest.json all succeed.
@@ -172,11 +181,11 @@ jobs:
       - name: Sign the installer
         shell: bash
         env:
+          VERSION: ${{ needs.build.outputs.version }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          VERSION="${{ needs.build.outputs.version }}"
           shopt -s nullglob
           installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
           if [ "${#installers[@]}" -ne 1 ]; then
