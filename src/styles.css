@@ -169,11 +169,69 @@ dt {
 /* ------------------------------------------------------------------ shell */
 
 .app {
+  --titlebar-h: 36px;
+  position: relative;
   display: grid;
   grid-template-columns: 216px minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
   background: var(--bg);
+}
+
+/* Undecorated window: the caption is drawn here, in the app's palette. */
+.titlebar {
+  position: absolute;
+  top: 0;
+  left: 216px;
+  right: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: flex-end;
+  height: var(--titlebar-h);
+  background: var(--bg);
+  user-select: none;
+}
+
+.window-controls {
+  display: flex;
+  height: 100%;
+}
+
+.window-control {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink-2);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.window-control svg {
+  display: block;
+  shape-rendering: crispEdges;
+}
+
+.window-control:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.window-control:active {
+  background: var(--press, var(--hover));
+}
+
+.window-control.is-close:hover,
+.window-control.is-close:active {
+  background: #c42b1c;
+  color: #fff;
+}
+
+.window-control.is-close:active {
+  background: #b22a1b;
 }
 
 .sidebar {
@@ -269,7 +327,8 @@ nav {
 /* ----------------------------------------------------------------- content */
 
 .content {
-  height: 100vh;
+  height: calc(100vh - var(--titlebar-h));
+  margin-top: var(--titlebar-h);
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -292,7 +351,8 @@ nav {
   width: 680px;
   max-width: calc(100% - 48px);
   margin: 0 auto;
-  padding: 44px 0 80px;
+  /* 44px from the window top, less the caption strip above the scroller. */
+  padding: calc(44px - var(--titlebar-h)) 0 80px;
 }
 
 .banner {

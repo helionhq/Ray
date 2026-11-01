@@ -6,6 +6,7 @@ import { HistoryPage } from "./pages/History";
 import { SettingsPage } from "./pages/Settings";
 import { Toast, type Notice } from "./components/Toast";
 import { RayLogo } from "./components/RayLogo";
+import { TitleBar, startDrag, toggleOnDoubleClick } from "./components/TitleBar";
 import {
   AlertIcon,
   DictionaryIcon,
@@ -104,8 +105,13 @@ export default function App() {
 
   return (
     <div className="app">
+      <TitleBar />
       <aside className="sidebar">
-        <div className="brand">
+        <div
+          className="brand"
+          onMouseDown={startDrag}
+          onDoubleClick={toggleOnDoubleClick}
+        >
           <RayLogo />
         </div>
 

@@ -78,8 +78,6 @@ export const api = {
   testSecret: (provider: Provider) => call<string>("test_secret", { provider }),
   saveSettings: (settings: Settings) =>
     call<Settings>("save_settings", { settings }),
-  setTitleBarDark: (dark: boolean) =>
-    call<void>("set_title_bar_dark", { dark }),
   addDictionary: (term: string) => call<string[]>("add_dictionary", { term }),
   removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
   deleteHistory: (id: string) => call<void>("delete_history", { id }),
