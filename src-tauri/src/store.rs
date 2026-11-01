@@ -83,7 +83,7 @@ impl Store {
     }
 
     fn normalize(&self) {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         data.history
             .sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
         data.history.truncate(MAX_HISTORY);
@@ -108,19 +108,19 @@ impl Store {
     }
 
     pub fn snapshot(&self) -> StoreData {
-        self.data.lock().unwrap().clone()
+        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     pub fn settings(&self) -> Settings {
-        self.data.lock().unwrap().settings.clone()
+        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).settings.clone()
     }
 
     pub fn dictionary(&self) -> Vec<String> {
-        self.data.lock().unwrap().dictionary.clone()
+        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).dictionary.clone()
     }
 
     pub fn update_settings(&self, settings: Settings) -> Result<Settings, String> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         data.settings = Settings {
             launch_at_login: settings.launch_at_login,
             input_device: settings
@@ -136,20 +136,20 @@ impl Store {
     }
 
     pub fn add_history(&self, entry: HistoryEntry) -> Result<(), String> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         data.history.insert(0, entry);
         data.history.truncate(MAX_HISTORY);
         self.persist(&data)
     }
 
     pub fn delete_history(&self, id: &str) -> Result<(), String> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         data.history.retain(|entry| entry.id != id);
         self.persist(&data)
     }
 
     pub fn clear_history(&self) -> Result<(), String> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         data.history.clear();
         self.persist(&data)
     }
@@ -163,7 +163,7 @@ impl Store {
             return Err("Keep dictionary terms under 80 characters".into());
         }
         {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if !data
                 .dictionary
                 .iter()
@@ -181,7 +181,7 @@ impl Store {
 
     pub fn remove_dictionary(&self, term: &str) -> Result<Vec<String>, String> {
         {
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             data.dictionary
                 .retain(|word| !word.eq_ignore_ascii_case(term));
             self.persist(&data)?;
@@ -193,7 +193,7 @@ impl Store {
     pub fn keyterms(&self, limit: usize) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut terms = Vec::new();
-        for term in self.data.lock().unwrap().dictionary.iter() {
+        for term in self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).dictionary.iter() {
             let term = term.trim();
             if term.is_empty() || term.chars().count() > 50 {
                 continue;
