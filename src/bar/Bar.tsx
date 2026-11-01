@@ -8,6 +8,9 @@ interface BarState {
   message?: string;
 }
 
+/** Hex's shortest processing look before done clears the field. */
+const PROCESSING_MIN_MS = 200;
+
 /** Hex's synthetic voice: phrases of syllables with breaths between. */
 function demoLevel(time: number) {
   const phrase = Math.floor(time / 2.4);
@@ -27,15 +30,49 @@ export function Bar() {
     const element = canvas.current;
     if (!element) return;
     const scope = new DotScope(element);
+
+    let phase: BarPhase = "hidden";
+    let processingAt = 0;
+    let doneTimer: number | null = null;
+    const clearDone = () => {
+      if (doneTimer !== null) {
+        window.clearTimeout(doneTimer);
+        doneTimer = null;
+      }
+    };
+
+    // Hex holds the processing look for at least 200 ms, even when the
+    // transcript comes back instantly, so done's wipe reads as a finish.
+    const apply = (next: BarPhase) => {
+      clearDone();
+      if (next === "done" && phase === "processing") {
+        const wait = Math.max(
+          0,
+          PROCESSING_MIN_MS - (performance.now() - processingAt),
+        );
+        if (wait > 0) {
+          doneTimer = window.setTimeout(() => {
+            doneTimer = null;
+            phase = "done";
+            scope.setPhase("done");
+          }, wait);
+          return;
+        }
+      }
+      if (next === "processing") processingAt = performance.now();
+      phase = next;
+      scope.setPhase(next);
+    };
+
     void invoke<BarState>("get_bar_state")
       .then((state) => {
-        if (state?.phase) scope.setPhase(state.phase);
+        if (state?.phase) apply(state.phase);
       })
       .catch(() => {});
 
     const unlisteners = [
       onEvent<BarState>("bar-state", (state) => {
-        if (state?.phase) scope.setPhase(state.phase);
+        if (state?.phase) apply(state.phase);
       }),
       onEvent<number>("bar-level", (level) => scope.setLevel(level)),
     ];
@@ -56,6 +93,7 @@ export function Bar() {
     }
 
     return () => {
+      clearDone();
       scope.destroy();
       for (const unlisten of unlisteners) void unlisten.then((fn) => fn());
     };

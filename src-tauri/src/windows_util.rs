@@ -1,7 +1,10 @@
 //! Windows shell integration: the non-activating click-through floating bar,
 //! foreground app detection, and launch-at-login.
 
+use std::ffi::c_void;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH, RECT};
@@ -15,13 +18,72 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
     HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 const APP_NAME: &str = "Ray";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// The bar window's logical height (matches `tauri.conf.json`). Hex's HUD
+/// window is 304 × 80 pt; the plate sits in the middle.
+const BAR_WINDOW_HEIGHT: f32 = 80.0;
+/// Hex's gap from the bottom edge of the work area to the HUD window, pt.
+const BAR_BOTTOM_OFFSET: f32 = 24.0;
+/// Hex hides the HUD once Dot scope has faded out: 0.3 s spring, settling
+/// under 0.2 % opacity. Leave the window up until that has played.
+const BAR_HIDE_DELAY: Duration = Duration::from_millis(420);
+
+/// Bumped on every show/hide so a delayed hide from an earlier phase never
+/// takes down a bar that has been shown again since.
+static BAR_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+// The DWM attributes for an undecorated, transparent window. `dwmapi` is
+// linked directly so the bar does not need another `windows` crate feature.
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *mut c_void,
+        attribute: u32,
+        value: *const c_void,
+        size: u32,
+    ) -> i32;
+}
+
+const DWMWA_NCRENDERING_POLICY: u32 = 2;
+const DWMNCRP_DISABLED: i32 = 1;
+const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+const DWMWCP_DONOTROUND: i32 = 1;
+const DWMWA_BORDER_COLOR: u32 = 34;
+const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+
+/// Turns off the parts of the window frame DWM still draws around a
+/// transparent window: its shadow, border, and rounded corners.
+fn remove_dwm_frame(hwnd: HWND) {
+    unsafe {
+        let hwnd = hwnd.0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &DWMNCRP_DISABLED as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // Windows 11 only; Windows 10 returns an error, which is fine.
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &DWMWCP_DONOTROUND as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &DWMWA_COLOR_NONE as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Foreground {
@@ -50,6 +112,7 @@ pub fn style_bar(hwnd: HWND) -> Result<(), String> {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         )
         .map_err(|error| format!("Could not style the bar window: {error}"))?;
+        remove_dwm_frame(hwnd);
     }
     Ok(())
 }
@@ -57,6 +120,7 @@ pub fn style_bar(hwnd: HWND) -> Result<(), String> {
 /// Places the bar at the bottom-center of the work area of the monitor that
 /// holds the foreground window, then shows it without activating it.
 pub fn show_bar(hwnd: HWND, width: i32, height: i32) -> Result<(), String> {
+    BAR_GENERATION.fetch_add(1, Ordering::SeqCst);
     let (x, y) = bottom_center(width, height).unwrap_or((0, 0));
     unsafe {
         SetWindowPos(
@@ -74,14 +138,24 @@ pub fn show_bar(hwnd: HWND, width: i32, height: i32) -> Result<(), String> {
     Ok(())
 }
 
+/// Keeps the window up long enough for the bar to play its 0.3 s fade, then
+/// hides it — unless a new show has happened in the meantime.
 pub fn hide_bar(hwnd: HWND) {
-    unsafe {
-        let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
-    }
+    let generation = BAR_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        std::thread::sleep(BAR_HIDE_DELAY);
+        if BAR_GENERATION.load(Ordering::SeqCst) == generation {
+            unsafe {
+                let _ = ShowWindow(HWND(raw as *mut c_void), SW_HIDE);
+            }
+        }
+    });
 }
 
 /// Bottom-center of the foreground monitor's work area (taskbar excluded),
-/// leaving a 10 px gap above it.
+/// leaving Hex's 24 pt gap above it. The gap is kept in points, so it scales
+/// with the window: the window is 80 logical px tall at every DPI.
 fn bottom_center(width: i32, height: i32) -> Option<(i32, i32)> {
     unsafe {
         let monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
@@ -100,7 +174,9 @@ fn bottom_center(width: i32, height: i32) -> Option<(i32, i32)> {
         } = info.rcWork;
         let width_available = right - left;
         let x = left + (width_available - width).max(0) / 2;
-        let y = bottom - height - 10;
+        let scale = height as f32 / BAR_WINDOW_HEIGHT;
+        let gap = (BAR_BOTTOM_OFFSET * scale).round() as i32;
+        let y = bottom - height - gap;
         Some((x, y))
     }
 }

@@ -6,7 +6,7 @@
  *
  * The simulation runs at a fixed 240 Hz so any refresh rate draws the same
  * picture. Coordinates are Hex's native points (a 112 × 26 plate, 43 × 9 dots
- * at 2.6 pt pitch); the canvas scales them up as one piece.
+ * at 2.6 pt pitch); the canvas draws them one-to-one in CSS pixels.
  */
 
 const PLATE_H = 26;
@@ -30,7 +30,14 @@ const HISTORY = 512;
 const STEP = 1 / 240;
 const SUB = 3;
 const SAMPLES = (COLUMNS - 1) * SUB + 1;
-const DRAW_SCALE = 44 / PLATE_H;
+/** Hex: done shows for a third of its 0.3 s wipe, then collapses. */
+const COMPLETED_VISIBLE = 0.1;
+/** Hex: a failure holds its still look for 0.6 s before fading out. */
+const FAILED_VISIBLE = 0.6;
+/** Hex's opacity-only fade when Reduce Motion is on. */
+const REDUCED_FADE = 0.16;
+/** The plate is drawn at Hex's native size: 112 × 26 pt. */
+const DRAW_SCALE = 1;
 
 const SPEEDS = [0.8, 1.25, 1.85, 2.6];
 const BASE = [0.55, 0.42, 0.3, 0.2];
@@ -78,6 +85,10 @@ function roundedBox(x: number, y: number, halfW: number, halfH: number, radius: 
   );
 }
 
+/**
+ * SwiftUI's duration + bounce spring, solved in closed form as Hex does
+ * (`src/spring.rs`), so the trajectory does not depend on frame pacing.
+ */
 class Spring {
   value: number;
   velocity = 0;
@@ -92,12 +103,42 @@ class Spring {
   }
 
   stepTo(target: number, duration: number, bounce: number, dt: number) {
+    if (dt <= 0 || !Number.isFinite(dt)) return;
     const omega = (2 * Math.PI) / Math.max(duration, 0.01);
-    const zeta = clamp(1 - bounce, 0.12, 1);
-    const acceleration =
-      -omega * omega * (this.value - target) - 2 * zeta * omega * this.velocity;
-    this.velocity += acceleration * dt;
-    this.value += this.velocity * dt;
+    const zeta = bounce >= 0 ? Math.max(0, 1 - bounce) : 1 / Math.max(0.01, 1 + bounce);
+    const x0 = this.value - target;
+    const v0 = this.velocity;
+
+    if (zeta < 1 - 1e-4) {
+      const decay = zeta * omega;
+      const omegaD = omega * Math.sqrt(1 - zeta * zeta);
+      const exp = Math.exp(-decay * dt);
+      const sin = Math.sin(omegaD * dt);
+      const cos = Math.cos(omegaD * dt);
+      const sinOverD = sin / omegaD;
+      this.value = target + exp * (x0 * (cos + decay * sinOverD) + v0 * sinOverD);
+      this.velocity =
+        exp * (-x0 * omega * omega * sinOverD + v0 * (cos - decay * sinOverD));
+    } else if (zeta > 1 + 1e-4) {
+      const root = Math.sqrt(zeta * zeta - 1);
+      const rootSum = zeta + root;
+      const slowRoot = -omega / rootSum;
+      const fastRoot = -omega * rootSum;
+      const denom = slowRoot - fastRoot;
+      const slowExp = Math.exp(slowRoot * dt);
+      const fastExp = Math.exp(fastRoot * dt);
+      const p00 = (-fastRoot * slowExp + slowRoot * fastExp) / denom;
+      const p01 = (slowExp - fastExp) / denom;
+      const p10 = (slowRoot * fastRoot * (fastExp - slowExp)) / denom;
+      const p11 = (slowRoot * slowExp - fastRoot * fastExp) / denom;
+      this.value = target + p00 * x0 + p01 * v0;
+      this.velocity = p10 * x0 + p11 * v0;
+    } else {
+      const exp = Math.exp(-omega * dt);
+      const c = v0 + omega * x0;
+      this.value = target + (x0 + c * dt) * exp;
+      this.velocity = (v0 - omega * c * dt) * exp;
+    }
   }
 }
 
@@ -226,8 +267,8 @@ export class DotScope {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private dpr = 1;
-  private widthPx = 360;
-  private heightPx = 120;
+  private widthPx = 304;
+  private heightPx = 80;
 
   private phase: BarPhase = "hidden";
   private elapsed = 0;
@@ -278,6 +319,8 @@ export class DotScope {
   private dark = false;
   private reduceMotion = false;
   private media: MediaQueryList;
+  private motion: MediaQueryList;
+  private observer: ResizeObserver;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -285,11 +328,17 @@ export class DotScope {
     if (!context) throw new Error("Canvas is unavailable");
     this.ctx = context;
     this.media = window.matchMedia("(prefers-color-scheme: dark)");
+    this.motion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const forced = new URLSearchParams(window.location.search).get("theme");
     this.dark = forced ? forced === "dark" : this.media.matches;
-    this.reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    this.reduceMotion = this.motion.matches;
     this.media.addEventListener("change", this.onTheme);
+    this.motion.addEventListener("change", this.onMotion);
     window.addEventListener("resize", this.resize);
+    // CSS/DPI can settle after the canvas first mounts (and a hidden window
+    // can report a different content box); keep the backing store in step.
+    this.observer = new ResizeObserver(this.resize);
+    this.observer.observe(canvas);
     this.resize();
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.frame);
@@ -298,7 +347,9 @@ export class DotScope {
   destroy() {
     cancelAnimationFrame(this.raf);
     this.media.removeEventListener("change", this.onTheme);
+    this.motion.removeEventListener("change", this.onMotion);
     window.removeEventListener("resize", this.resize);
+    this.observer.disconnect();
   }
 
   setLevel(level: number) {
@@ -482,12 +533,13 @@ export class DotScope {
     const shown = visible ? 1 : 0;
 
     if (this.reduceMotion) {
+      // Hex stills the shape and keeps only a short opacity fade.
       this.width.jump(targetWidth);
-      this.scale.jump(visible ? 1 : 0.9);
-      this.softness.jump(visible ? 0 : 3);
-      this.opacity.stepTo(shown, 0.2, 0, h);
-      this.cool.stepTo(targetCool, 0.2, 0, h);
-      this.fail.stepTo(targetFail, 0.2, 0, h);
+      this.scale.jump(1);
+      this.softness.jump(0);
+      this.opacity.stepTo(shown, REDUCED_FADE, 0, h);
+      this.cool.stepTo(targetCool, REDUCED_FADE, 0, h);
+      this.fail.stepTo(targetFail, REDUCED_FADE, 0, h);
     } else {
       this.width.stepTo(targetWidth, TRANSITION, BOUNCE, h);
       this.opacity.stepTo(shown, TRANSITION, 0, h);
@@ -497,8 +549,12 @@ export class DotScope {
       this.fail.stepTo(targetFail, TRANSITION, 0, h);
     }
 
-    // Done shows its wipe, then collapses into the hide.
-    if (this.phase === "done" && this.elapsed > 0.2 && !this.frozen) {
+    // Done shows its wipe, then collapses into the hide; a failure holds
+    // its still look for 0.6 s first. Both then fade over the transition.
+    if (this.phase === "done" && this.elapsed >= COMPLETED_VISIBLE && !this.frozen) {
+      this.visible = false;
+    }
+    if (this.phase === "error" && this.elapsed >= FAILED_VISIBLE && !this.frozen) {
       this.visible = false;
     }
 
@@ -575,8 +631,12 @@ export class DotScope {
       }
     }
 
-    const headKeep = Math.exp(-hb / (PHOSPHOR_HEAD * 1));
-    const tailKeep = Math.exp(-hb / (PHOSPHOR_TAIL * 1));
+    // Hex's done scan decays the phosphor head and tail as the field clears.
+    const done = this.phase === "done";
+    const decay = done ? 1 - 0.6 * smoothstep(0, 0.12, this.elapsed) : 1;
+    const tailFade = done ? 1 - smoothstep(0, 0.15, this.elapsed) : 1;
+    const headKeep = Math.exp(-hb / (PHOSPHOR_HEAD * decay));
+    const tailKeep = Math.exp(-hb / (PHOSPHOR_TAIL * decay));
     const dx = 1 / SUB;
     for (let i = 0; i < COLUMNS; i += 1) {
       const s0 = Math.max(0, (i - 3) * SUB);
@@ -610,7 +670,11 @@ export class DotScope {
           const core = onBeam * value;
           this.head[k][n] = Math.max(this.head[k][n] * headKeep, core);
           this.tail[k][n] = Math.max(this.tail[k][n] * tailKeep, core);
-          const light = Math.max(instant, this.head[k][n], 0.55 * this.tail[k][n]);
+          const light = Math.max(
+            instant,
+            this.head[k][n],
+            0.55 * tailFade * this.tail[k][n],
+          );
           lit[k] = light;
           now += instant;
           total += light;
@@ -628,13 +692,21 @@ export class DotScope {
     this.settled = false;
   };
 
+  private onMotion = () => {
+    this.reduceMotion = this.motion.matches;
+    this.settled = false;
+  };
+
   private resize = () => {
     const rect = this.canvas.getBoundingClientRect();
     this.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-    this.widthPx = rect.width || 360;
-    this.heightPx = rect.height || 120;
-    this.canvas.width = Math.round(this.widthPx * this.dpr);
-    this.canvas.height = Math.round(this.heightPx * this.dpr);
+    // A hidden window can report a zero content box; keep the last good one.
+    if (rect.width > 0) this.widthPx = rect.width;
+    if (rect.height > 0) this.heightPx = rect.height;
+    const width = Math.round(this.widthPx * this.dpr);
+    const height = Math.round(this.heightPx * this.dpr);
+    if (this.canvas.width !== width) this.canvas.width = width;
+    if (this.canvas.height !== height) this.canvas.height = height;
     this.settled = false;
   };
 
@@ -648,7 +720,7 @@ export class DotScope {
         this.step(STEP);
       }
       this.draw();
-      if (!this.visible && this.opacity.value < 0.005 && this.phase !== "recording") {
+      if (!this.visible && this.opacity.value < 0.002 && this.phase !== "recording") {
         this.settled = true;
       }
     }
@@ -680,20 +752,23 @@ export class DotScope {
     ctx.globalAlpha = opacity;
     ctx.translate(w / 2, h / 2);
 
-    // Plate with a soft drop shadow.
+    // Plate with Hex's drop shadow: a soft falloff 3 pt below the plate,
+    // matching rune_hud.wgsl's `0.5 - 0.5 * tanh(distance / 6.5)` field
+    // (a ~5.2 pt Gaussian, i.e. canvas blur ~10.4).
     ctx.beginPath();
     ctx.roundRect(-halfW, -halfH, halfW * 2, halfH * 2, radius);
     ctx.save();
-    ctx.shadowColor = dark ? "rgba(0,0,0,0.5)" : "rgba(15,18,30,0.18)";
-    ctx.shadowBlur = 22;
-    ctx.shadowOffsetY = 5;
+    ctx.shadowColor = dark ? "rgba(0,0,0,0.5)" : "rgba(20,24,40,0.2)";
+    ctx.shadowBlur = 10.4;
+    ctx.shadowOffsetY = 3;
     ctx.fillStyle = `rgba(${Math.round(colors.plate[0] * 255)},${Math.round(
       colors.plate[1] * 255,
     )},${Math.round(colors.plate[2] * 255)},${colors.plate[3]})`;
     ctx.fill();
     ctx.restore();
 
-    ctx.lineWidth = 1;
+    // Hex's rim is `abs(distance) - 0.3`: a 0.6 pt line.
+    ctx.lineWidth = 0.6;
     ctx.strokeStyle = `rgba(${Math.round(colors.rim[0] * 255)},${Math.round(
       colors.rim[1] * 255,
     )},${Math.round(colors.rim[2] * 255)},${colors.rim[3]})`;
@@ -715,20 +790,19 @@ export class DotScope {
       const reach = (34 + 20 * glow) * scale;
       const middle = mix3(colors.base, colors.core, 0.5);
       const strength = (dark ? 0.19 : 0.3) * 0.55 * Math.min(1, glow);
+      // Hex mixes the colour from the voice toward the plate's base and
+      // fades the glow linearly to the reach.
       const gradient = ctx.createRadialGradient(0, 0, 0, 0, 0, reach);
-      gradient.addColorStop(
-        0,
-        `rgba(${Math.round(middle[0] * 255)},${Math.round(middle[1] * 255)},${Math.round(
-          middle[2] * 255,
-        )},${strength})`,
-      );
-      gradient.addColorStop(
-        0.55,
-        `rgba(${Math.round(colors.base[0] * 255)},${Math.round(
-          colors.base[1] * 255,
-        )},${Math.round(colors.base[2] * 255)},${strength * 0.35})`,
-      );
-      gradient.addColorStop(1, "rgba(0,0,0,0)");
+      for (let stop = 0; stop <= 5; stop += 1) {
+        const t = stop / 5;
+        const color = mix3(middle, colors.base, t);
+        gradient.addColorStop(
+          t,
+          `rgba(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(
+            color[2] * 255,
+          )},${strength * (1 - t)})`,
+        );
+      }
       ctx.fillStyle = gradient;
       ctx.fillRect(-halfW, -halfH, halfW * 2, halfH * 2);
     }
