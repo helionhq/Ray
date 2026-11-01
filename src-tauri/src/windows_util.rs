@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{PCWSTR, PWSTR};
@@ -237,28 +237,52 @@ pub fn foreground_hwnd() -> Option<isize> {
 /// (no delayed rendering) belongs to the system and survives the owner, but
 /// the process keeps using the handle for every write and restore.
 /// Stored as `isize` because raw window handles are not `Send`/`Sync`; the
-/// value is never dereferenced across threads.
-static CLIPBOARD_OWNER: OnceLock<Option<isize>> = OnceLock::new();
+/// value is never dereferenced across threads. Only a successfully created
+/// window is cached: a failed or timed-out setup returns `None` and leaves the
+/// slot empty so a later call can try again.
+static CLIPBOARD_OWNER: OnceLock<isize> = OnceLock::new();
+/// Serialises window creation so concurrent first calls cannot each spawn an
+/// owner thread and leave an orphaned window behind.
+static CLIPBOARD_OWNER_SETUP: Mutex<()> = Mutex::new(());
 
 pub fn clipboard_owner() -> Option<isize> {
-    *CLIPBOARD_OWNER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let spawned = std::thread::Builder::new()
-            .name("ray-clipboard-owner".into())
-            .spawn(move || {
-                let hwnd = unsafe { create_clipboard_window() };
-                let _ = tx.send(hwnd.map(|hwnd| hwnd.0 as isize));
-                if hwnd.is_some() {
-                    unsafe { clipboard_message_loop() };
-                }
-            });
-        if spawned.is_err() {
-            return None;
-        }
-        // The window is small and cheap; if setup somehow stalls, fail the
-        // clipboard write rather than hanging the pipeline.
-        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
-    })
+    if let Some(owner) = CLIPBOARD_OWNER.get() {
+        return Some(*owner);
+    }
+    let _setup = CLIPBOARD_OWNER_SETUP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Another thread may have created the window while this one waited.
+    if let Some(owner) = CLIPBOARD_OWNER.get() {
+        return Some(*owner);
+    }
+    let owner = create_clipboard_owner()?;
+    let _ = CLIPBOARD_OWNER.set(owner);
+    Some(owner)
+}
+
+/// Starts the owner thread and waits for its window handle. Returns `None`
+/// without caching anything when the thread cannot be spawned, the window
+/// cannot be created, or setup stalls.
+fn create_clipboard_owner() -> Option<isize> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ray-clipboard-owner".into())
+        .spawn(move || {
+            let hwnd = unsafe { create_clipboard_window() };
+            let delivered = tx.send(hwnd.map(|hwnd| hwnd.0 as isize)).is_ok();
+            // Pump messages so the window lives for the rest of the process.
+            // If the caller already gave up and dropped its receiver, let the
+            // window die with this thread rather than pump an owner no one
+            // knows about.
+            if delivered && hwnd.is_some() {
+                unsafe { clipboard_message_loop() };
+            }
+        })
+        .ok()?;
+    // The window is small and cheap; if setup somehow stalls, fail the
+    // clipboard write rather than hanging the pipeline.
+    rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
 }
 
 unsafe fn create_clipboard_window() -> Option<HWND> {
