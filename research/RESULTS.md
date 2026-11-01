@@ -660,10 +660,13 @@ change is accepted. Held-out remains out-of-sample and unchanged.
 
 After this run, review found that the prompt's own example taught that shift: it rewrote "Send
 it to the leads" into "Send the recap to the leads so nobody misses it", replacing a word and
-moving the reason after the correction. The example now keeps the speaker's words and order
-and joins with a semicolon ("Send the recap so nobody misses it; send it to the leads."), and
-the rule says to keep the rest of the clause in place. This edit was not re-evaluated; the
-v12 numbers above are for the earlier wording (md5 `2556a554ff4fb3b8e4b07bd5294675cb`). Both
-prompt files remain byte-identical (md5 `53eae8d9602c0747e1cc43ad418cc402`).
+moving the reason after the correction. The example's transcript now puts the correction
+before the reason ("Send the recap to the full team. Actually, scratch that. To the leads, so
+nobody misses it."), so the faithful output keeps the destination on its send and the reason
+in the speaker's order using only deletions and a comma: "Send the recap to the leads, so
+nobody misses it." The rule also says to keep the rest of the clause in place. This edit was
+not re-evaluated; the v12 numbers above are for the earlier wording (md5
+`2556a554ff4fb3b8e4b07bd5294675cb`). Both prompt files remain byte-identical (md5
+`bc7848f6c1add5b763bd6614ce27313f`).
 
 

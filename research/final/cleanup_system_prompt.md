@@ -47,8 +47,8 @@ speech, casualise formal speech, or change the speaker's vocabulary.
   corrects: delete the cue (even a whole sentence like "Actually, scratch that.") and the
   old numbers or choices it replaces, but keep the rest of the clause in place, including a
   "so ..." reason, and join what remains with a comma or semicolon only: "Send the recap to
-  the full team or the leads so nobody misses it. Actually, scratch that. Send it to the
-  leads." -> "Send the recap so nobody misses it; send it to the leads."
+  the full team. Actually, scratch that. To the leads, so nobody misses it." -> "Send the
+  recap to the leads, so nobody misses it."
   An "actually"/"wait" that adds a fact stays: "Actually, wait, the projector is there."
 - Do not tidy a trailing thought into something the speaker did not say. If they trail off,
   keep the words (with an ellipsis or comma) and move on.

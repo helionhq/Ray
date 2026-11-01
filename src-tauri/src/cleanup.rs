@@ -556,20 +556,30 @@ enum CueHalf {
     Twelve,
 }
 
+const RANGE_DASHES: [char; 2] = ['-', '\u{2013}'];
+
 /// Words, lowercased, with surrounding punctuation stripped. Interior
-/// punctuation stays: "3:30," -> "3:30" and "p.m." -> "p.m". A range whose
-/// two endpoints each carry their own marker ("9am-5pm", "9:30am–5pm") is
-/// split into its two times, since each marker belongs to its own endpoint.
+/// punctuation stays: "3:30," -> "3:30" and "p.m." -> "p.m". Range separators
+/// normalise to "to": a standalone dash ("10 – 11 am") becomes "to", and a
+/// range whose two endpoints each carry their own marker ("9am-5pm") becomes
+/// "9am", "to", "5pm" so it reads like "9am to 5pm".
 fn time_tokens(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|word| {
-            word.trim_matches(|character: char| !character.is_alphanumeric())
-                .to_lowercase()
-        })
-        .filter(|word| !word.is_empty())
-        .flat_map(|word| match split_marked_endpoints(&word) {
-            Some((start, end)) => vec![start.to_string(), end.to_string()],
-            None => vec![word],
+        .flat_map(|word| {
+            let trimmed = word
+                .trim_matches(|character: char| !character.is_alphanumeric())
+                .to_lowercase();
+            if trimmed.is_empty() {
+                return if word.contains(RANGE_DASHES) {
+                    vec!["to".to_string()]
+                } else {
+                    Vec::new()
+                };
+            }
+            match split_marked_endpoints(&trimmed) {
+                Some((start, end)) => vec![start.to_string(), "to".to_string(), end.to_string()],
+                None => vec![trimmed],
+            }
         })
         .collect()
 }
@@ -577,9 +587,7 @@ fn time_tokens(text: &str) -> Vec<String> {
 /// "9am-5pm" -> ("9am", "5pm") when both sides are clock times with an
 /// explicit meridiem. "9-5pm" stays whole: its marker covers the range.
 fn split_marked_endpoints(word: &str) -> Option<(&str, &str)> {
-    let (start, end) = ['-', '\u{2013}']
-        .into_iter()
-        .find_map(|separator| word.split_once(separator))?;
+    let (start, end) = word.split_once(RANGE_DASHES)?;
     let marked = |text: &str| matches!(parse_time(text), Some((_, Some(_))));
     (marked(start) && marked(end)).then_some((start, end))
 }
@@ -643,19 +651,22 @@ fn meridiem_word(text: &str) -> Option<Meridiem> {
     }
 }
 
-/// What a meridiem marker is attached to. A range carries one marker for both
-/// endpoints, so it cannot be checked against a single clock time.
+/// A meridiem marker together with what it is attached to.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MeridiemAnchor {
-    Time(ClockTime),
-    Range(ClockTime, ClockTime),
+enum Marker {
+    /// "3:30 p.m."
+    Time(ClockTime, Meridiem),
+    /// "10-11 a.m.": one marker covers both endpoints, so it cannot be checked
+    /// against a single clock time.
+    Range(ClockTime, ClockTime, Meridiem),
+    /// "9am-5pm": each endpoint has its own marker. The endpoints are checked
+    /// together so they cannot be traded with another range's.
+    MarkedRange(ClockTime, Meridiem, ClockTime, Meridiem),
 }
 
 /// Split "10-11", "10–11" or "9:30-10:15" into its two clock times.
 fn split_range(text: &str) -> Option<(ClockTime, ClockTime)> {
-    ['-', '\u{2013}']
-        .into_iter()
-        .find_map(|separator| text.split_once(separator))
+    text.split_once(RANGE_DASHES)
         .and_then(|(start, end)| Some((parse_clock(start)?, parse_clock(end)?)))
 }
 
@@ -706,18 +717,35 @@ fn time_at(tokens: &[String], index: usize) -> Option<(ClockTime, Meridiem, usiz
     Some((clock, meridiem, 2))
 }
 
-/// Every meridiem marker in the cleaned output, paired with the time or range
-/// it belongs to. Each one has to be verified separately.
-fn meridiem_markers(cleaned: &str) -> Vec<(MeridiemAnchor, Meridiem)> {
-    let tokens = time_tokens(cleaned);
+/// A range whose endpoints each carry a marker, at `index`: "9am to 5pm",
+/// "9 am to 5 pm" (and "9am-5pm", which the tokenizer already rewrote).
+fn marked_range_at(tokens: &[String], index: usize) -> Option<(Marker, usize)> {
+    let (start, start_meridiem, start_len) = time_at(tokens, index)?;
+    let separator = index + start_len;
+    if tokens.get(separator)? != "to" {
+        return None;
+    }
+    let (end, end_meridiem, end_len) = time_at(tokens, separator + 1)?;
+    Some((
+        Marker::MarkedRange(start, start_meridiem, end, end_meridiem),
+        start_len + 1 + end_len,
+    ))
+}
+
+/// Every meridiem marker in the text, paired with the time or range it
+/// belongs to. Each one has to be verified separately.
+fn meridiem_markers(tokens: &[String]) -> Vec<Marker> {
     let mut found = Vec::new();
     let mut index = 0;
     while index < tokens.len() {
-        if let Some((start, end, meridiem, consumed)) = range_at(&tokens, index) {
-            found.push((MeridiemAnchor::Range(start, end), meridiem));
+        if let Some((marker, consumed)) = marked_range_at(tokens, index) {
+            found.push(marker);
             index += consumed;
-        } else if let Some((clock, meridiem, consumed)) = time_at(&tokens, index) {
-            found.push((MeridiemAnchor::Time(clock), meridiem));
+        } else if let Some((start, end, meridiem, consumed)) = range_at(tokens, index) {
+            found.push(Marker::Range(start, end, meridiem));
+            index += consumed;
+        } else if let Some((clock, meridiem, consumed)) = time_at(tokens, index) {
+            found.push(Marker::Time(clock, meridiem));
             index += consumed;
         } else {
             index += 1;
@@ -800,48 +828,27 @@ fn transcript_supports(tokens: &[String], clock: ClockTime, meridiem: Meridiem) 
     })
 }
 
-/// Does the transcript attach this exact half of day to this same range?
-/// "10-11 am", "10–11am" and "10 to 11 AM" all normalise to the same anchor.
-fn transcript_supports_range(
-    tokens: &[String],
-    start: ClockTime,
-    end: ClockTime,
-    meridiem: Meridiem,
-) -> bool {
-    let mut index = 0;
-    while index < tokens.len() {
-        if let Some((spoken_start, spoken_end, said, consumed)) = range_at(tokens, index) {
-            if spoken_start == start && spoken_end == end && said == meridiem {
-                return true;
-            }
-            index += consumed;
-        } else {
-            index += 1;
-        }
-    }
-    false
-}
-
 /// The model must not invent a time of day. "Thursday at 3:30" became "3:30
 /// p.m." in round 2; only allow a marker when the transcript attaches that
 /// meridiem, or a matching time-of-day cue, to the same time. A marker on a
-/// range ("10-11 a.m.") needs the same range with the same half of day, since
-/// another meridiem elsewhere in the transcript does not belong to it.
+/// range ("10-11 a.m.", "9am-5pm") needs the same range with the same markers,
+/// since another meridiem elsewhere in the transcript does not belong to it.
+/// Separators are normalised by the tokenizer, so "10-11 am", "10–11am" and
+/// "10 to 11 AM" are the same range.
 fn adds_meridiem(cleaned: &str, transcript: &str) -> bool {
     if !has_meridiem(cleaned) {
         return false;
     }
-    let added = meridiem_markers(cleaned);
+    let added = meridiem_markers(&time_tokens(cleaned));
     if added.is_empty() {
         // A marker we cannot attach to a clock time or range is not trustworthy.
         return true;
     }
     let transcript = time_tokens(transcript);
-    added.iter().any(|(anchor, meridiem)| match anchor {
-        MeridiemAnchor::Time(clock) => !transcript_supports(&transcript, *clock, *meridiem),
-        MeridiemAnchor::Range(start, end) => {
-            !transcript_supports_range(&transcript, *start, *end, *meridiem)
-        }
+    let spoken = meridiem_markers(&transcript);
+    added.iter().any(|marker| match marker {
+        Marker::Time(clock, meridiem) => !transcript_supports(&transcript, *clock, *meridiem),
+        Marker::Range(..) | Marker::MarkedRange(..) => !spoken.contains(marker),
     })
 }
 
@@ -1211,6 +1218,37 @@ mod tests {
         assert!(is_plausible(
             "Office hours are 9am to 5pm.",
             "office hours are 9am-5pm"
+        ));
+        assert!(is_plausible(
+            "Office hours are 9 a.m. – 5 p.m.",
+            "office hours are 9am-5pm"
+        ));
+        // A single marked time inside a spoken range is still supported.
+        assert!(is_plausible(
+            "Doors open at 9am.",
+            "office hours are 9am-5pm"
+        ));
+    }
+
+    #[test]
+    fn rejects_endpoints_exchanged_between_two_ranges() {
+        // Every time is said with its marker, but in a different range.
+        assert!(!is_plausible(
+            "Desk A is 9am-6pm and desk B is 2pm-1pm.",
+            "desk a is 9am-1pm and desk b is 2pm-6pm"
+        ));
+        assert!(!is_plausible(
+            "Desk A is 9am to 6pm and desk B is 2pm to 1pm.",
+            "desk a is 9am to 1pm and desk b is 2pm to 6pm"
+        ));
+        assert!(is_plausible(
+            "Desk A is 9am-1pm and desk B is 2pm-6pm.",
+            "desk a is 9am to 1pm and desk b is 2pm to 6pm"
+        ));
+        // The same holds for single-marker ranges.
+        assert!(!is_plausible(
+            "The review is 10-12 a.m. and standup is 11-2 p.m.",
+            "the review is 10-11 am and standup is 12-2 pm"
         ));
     }
 
