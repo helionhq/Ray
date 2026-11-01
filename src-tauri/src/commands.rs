@@ -8,6 +8,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::audio::{self, InputDevice};
+use crate::hotkey;
 use crate::pipeline::{ConfigSummary, Dictation};
 use crate::secrets;
 use crate::store::{self, HistoryEntry, Settings, Store};
@@ -29,6 +30,8 @@ pub struct Snapshot {
     pub devices: Vec<InputDevice>,
     pub config: ConfigSummary,
     pub launch_at_login: bool,
+    /// `None` when the Right Alt hook is healthy.
+    pub hotkey_error: Option<String>,
     pub version: String,
 }
 
@@ -50,6 +53,7 @@ pub async fn get_snapshot(
         devices: audio::list_input_devices().unwrap_or_default(),
         config: dictation.config_summary(),
         launch_at_login: windows_util::launch_at_login(),
+        hotkey_error: hotkey::status(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
@@ -270,6 +274,12 @@ pub fn reload_config(app: AppHandle, dictation: State<'_, Arc<Dictation>>) -> Re
         .map_err(|error| format!("Could not find the app data folder: {error}"))?;
     dictation.reload_config(&dir);
     Ok(())
+}
+
+#[tauri::command]
+pub fn retry_hotkey() -> Result<Option<String>, String> {
+    hotkey::reinstall()?;
+    Ok(hotkey::status())
 }
 
 #[tauri::command]

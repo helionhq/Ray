@@ -45,7 +45,14 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 while let Some(event) = hotkey_rx.recv().await {
                     match event {
-                        hotkey::HotkeyEvent::Toggle => dictation.toggle().await,
+                        hotkey::HotkeyEvent::Toggle(at) => {
+                            // A press made while the previous dictation was
+                            // still being transcribed must not start recording
+                            // again once that finishes.
+                            if !dictation.should_ignore_toggle(at) {
+                                dictation.toggle().await;
+                            }
+                        }
                         hotkey::HotkeyEvent::Cancel => dictation.cancel().await,
                     }
                 }
@@ -96,6 +103,7 @@ pub fn run() {
             commands::cancel_dictation,
             commands::open_main,
             commands::reload_config,
+            commands::retry_hotkey,
             commands::quit,
         ])
         .build(tauri::generate_context!())
@@ -103,13 +111,15 @@ pub fn run() {
         .run(|_app, event| {
             if matches!(event, RunEvent::Exit) {
                 hotkey::uninstall();
+                // Put the user's clipboard back before the process goes away.
+                paste::flush_pending_restore();
             }
         });
 }
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Ray", true, None::<&str>)?;
-    let dictate = MenuItem::with_id(app, "dictate", "Start dictation", true, None::<&str>)?;
+    let dictate = MenuItem::with_id(app, "dictate", "Start or stop dictation", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Ray", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &dictate, &quit])?;
 
