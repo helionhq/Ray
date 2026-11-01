@@ -50,7 +50,6 @@ pub struct Dictation {
     transition: tokio::sync::Mutex<()>,
     recording: Arc<AtomicBool>,
     processing: AtomicBool,
-    bar_styled: AtomicBool,
     bar_payload: std::sync::Mutex<serde_json::Value>,
 }
 
@@ -70,7 +69,6 @@ impl Dictation {
             transition: tokio::sync::Mutex::new(()),
             recording: Arc::new(AtomicBool::new(false)),
             processing: AtomicBool::new(false),
-            bar_styled: AtomicBool::new(false),
             bar_payload: std::sync::Mutex::new(json!({ "phase": "hidden" })),
         })
     }
@@ -466,14 +464,11 @@ impl Dictation {
             return;
         };
         if let Ok(hwnd) = window.hwnd() {
-            if !self.bar_styled.swap(true, Ordering::SeqCst) {
-                if let Err(error) = windows_util::style_bar(hwnd) {
-                    eprintln!("[ray] {error}");
-                }
+            // Tauri's show() rewrites the extended styles, so show the window
+            // through Win32 only and re-apply the bar styles every time.
+            if let Err(error) = windows_util::style_bar(hwnd) {
+                eprintln!("[ray] {error}");
             }
-            // Tell Tauri the window is visible so it keeps the WebView painting;
-            // WS_EX_NOACTIVATE means this never takes focus.
-            let _ = window.show();
             let size = window
                 .outer_size()
                 .unwrap_or(tauri::PhysicalSize::new(360, 120));
@@ -490,12 +485,7 @@ impl Dictation {
         self.emit_bar(json!({ "phase": "hidden" }));
         if let Some(window) = self.app.get_webview_window("bar") {
             if let Ok(hwnd) = window.hwnd() {
-                // Tauri's visibility bookkeeping can lag behind the raw
-                // ShowWindow(SW_SHOWNOACTIVATE) above, so hide with Win32 too.
                 windows_util::hide_bar(hwnd);
-            }
-            if let Err(error) = window.hide() {
-                eprintln!("[ray] could not hide the bar: {error}");
             }
         }
     }

@@ -52,6 +52,9 @@ pub fn run() {
                 let _ = bar.set_ignore_cursor_events(true);
                 let _ = bar.set_skip_taskbar(true);
                 let _ = bar.set_always_on_top(true);
+                if let Ok(hwnd) = bar.hwnd() {
+                    let _ = windows_util::style_bar(hwnd);
+                }
             }
 
             // Launched by the Run key: stay in the tray until asked for.
