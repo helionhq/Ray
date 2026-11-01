@@ -32,13 +32,22 @@ export default function App() {
   }, []);
 
   const refresh = useCallback(async () => {
-    try {
-      const next = await api.snapshot();
-      setSnapshot(next);
-      setError(null);
-    } catch (caught) {
-      setError(String(caught));
+    // On a cold start the webview can mount a beat before Tauri's setup has
+    // registered the app state. Retry briefly instead of showing a hard
+    // "could not load" screen.
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        const next = await api.snapshot();
+        setSnapshot(next);
+        setError(null);
+        return;
+      } catch (caught) {
+        lastError = caught;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
     }
+    setError(String(lastError));
   }, []);
 
   useEffect(() => {
@@ -115,6 +124,11 @@ export default function App() {
           {!snapshot.keys.assemblyai && (
             <button className="sidebar-note" onClick={() => setPage("settings")}>
               Add an AssemblyAI key to start.
+            </button>
+          )}
+          {snapshot.hotkey_error && (
+            <button className="sidebar-note" onClick={() => setPage("settings")}>
+              Keyboard shortcut unavailable. Fix it in Settings.
             </button>
           )}
         </div>

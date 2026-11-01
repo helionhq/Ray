@@ -411,6 +411,12 @@ h1 {
   -webkit-line-clamp: 6;
 }
 
+.entry-text.is-expanded {
+  display: block;
+  overflow: visible;
+  -webkit-line-clamp: unset;
+}
+
 .entry-raw {
   margin-top: 10px;
   padding: 10px 12px;

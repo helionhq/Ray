@@ -54,8 +54,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "publisher": "Helion",
+    "copyright": "Copyright © 2026 Helion",
     "shortDescription": "Fast, clean dictation",
-    "longDescription": "Hold Right Alt, speak, press again. Ray transcribes and cleans your speech, then pastes it wherever you are typing.",
+    "longDescription": "Press Right Alt, speak, press it again. Ray transcribes and cleans your speech, then pastes it wherever you are typing.",
     "windows": {
       "nsis": {
         "installMode": "currentUser"

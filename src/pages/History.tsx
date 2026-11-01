@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { HistoryEntry, Snapshot } from "../lib/bridge";
 import { api } from "../lib/bridge";
-import { dayKey, dayLabel, duration, timeOf } from "../lib/format";
+import { dayKey, dayLabel, duration, isoOf, timeOf } from "../lib/format";
 import {
   CopyIcon,
   MicIcon,
@@ -16,9 +16,13 @@ interface Props {
   notify: (message: string) => void;
 }
 
+/** Above this, the six-line clamp is likely hiding part of the cleaned text. */
+const LONG_ENTRY_CHARS = 420;
+
 export function HistoryPage({ snapshot, refresh, notify }: Props) {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [expandedText, setExpandedText] = useState<Set<string>>(new Set());
   const [armedClear, setArmedClear] = useState(false);
   const search = useRef<HTMLInputElement>(null);
 
@@ -72,6 +76,15 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
 
   function toggleRaw(id: string) {
     setExpanded((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleText(id: string) {
+    setExpandedText((current) => {
       const next = new Set(current);
       if (next.has(id)) next.delete(id);
       else next.add(id);
@@ -183,17 +196,21 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
               <h2 className="day-label">{group.label}</h2>
               {group.items.map((entry) => {
                 const showRaw = expanded.has(entry.id) && entry.raw;
+                const showFull = expandedText.has(entry.id);
+                const longText = entry.text.length > LONG_ENTRY_CHARS;
                 return (
                   <article key={entry.id} className="entry">
                     <div className="entry-rail">
-                      <time className="entry-time" dateTime={new Date(entry.created_at).toISOString()}>
+                      <time className="entry-time" dateTime={isoOf(entry.created_at)}>
                         {timeOf(entry.created_at)}
                       </time>
                       <span className="entry-app">{entry.app ?? "Unknown"}</span>
                       <span className="entry-duration">{duration(entry.duration_ms)}</span>
                     </div>
                     <div className="entry-body">
-                      <p className="entry-text">{entry.text}</p>
+                      <p className={`entry-text${showFull ? " is-expanded" : ""}`}>
+                        {entry.text}
+                      </p>
                       {showRaw && (
                         <div className="entry-raw">
                           <span className="entry-raw-label">Original transcript</span>
@@ -205,6 +222,14 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
                           <CopyIcon size={13} />
                           Copy
                         </button>
+                        {longText && (
+                          <button
+                            onClick={() => toggleText(entry.id)}
+                            aria-expanded={showFull}
+                          >
+                            {showFull ? "Show less" : "Show more"}
+                          </button>
+                        )}
                         {entry.raw && (
                           <button onClick={() => toggleRaw(entry.id)}>
                             {expanded.has(entry.id) ? "Hide original" : "Original"}

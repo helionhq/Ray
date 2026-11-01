@@ -46,6 +46,7 @@ export interface Snapshot {
   devices: InputDevice[];
   config: ConfigSummary;
   launch_at_login: boolean;
+  hotkey_error: string | null;
   version: string;
 }
 
@@ -69,6 +70,7 @@ export const api = {
   cancelDictation: () => invoke<void>("cancel_dictation"),
   openMain: () => invoke<void>("open_main"),
   reloadConfig: () => invoke<void>("reload_config"),
+  retryHotkey: () => invoke<string | null>("retry_hotkey"),
   quit: () => invoke<void>("quit"),
 };
 

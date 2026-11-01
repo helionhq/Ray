@@ -15,17 +15,31 @@ const dateFormat = new Intl.DateTimeFormat(undefined, {
   year: "numeric",
 });
 
+/** Keep a corrupt timestamp in local state from taking the whole view down. */
+function safeDate(timestamp: number): Date | null {
+  if (!Number.isFinite(timestamp)) return null;
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function isoOf(timestamp: number): string | undefined {
+  return safeDate(timestamp)?.toISOString();
+}
+
 export function timeOf(timestamp: number): string {
-  return timeFormat.format(new Date(timestamp));
+  const date = safeDate(timestamp);
+  return date ? timeFormat.format(date) : "—";
 }
 
 export function dayKey(timestamp: number): string {
-  const date = new Date(timestamp);
+  const date = safeDate(timestamp);
+  if (!date) return "unknown";
   return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
 }
 
 export function dayLabel(timestamp: number): string {
-  const date = new Date(timestamp);
+  const date = safeDate(timestamp);
+  if (!date) return "Unknown date";
   const today = new Date();
   const yesterday = new Date();
   yesterday.setDate(today.getDate() - 1);

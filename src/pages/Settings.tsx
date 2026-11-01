@@ -74,13 +74,33 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
     }
   }
 
+  async function retryHotkey() {
+    setBusy("hotkey");
+    try {
+      await api.retryHotkey();
+      await refresh();
+      notify("Keyboard hook restarted");
+    } catch (error) {
+      notify(String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function update(patch: Partial<Settings>, id: string) {
     setBusy(id);
     try {
-      await api.saveSettings({ ...snapshot.settings, ...patch });
+      // The registry-derived value is the truth for launch-at-login; the copy
+      // in the store can be stale if the Run key was changed outside Ray.
+      await api.saveSettings({
+        ...snapshot.settings,
+        launch_at_login: snapshot.launch_at_login,
+        ...patch,
+      });
       await refresh();
     } catch (error) {
       notify(String(error));
+      await refresh();
     } finally {
       setBusy(null);
     }
@@ -115,6 +135,12 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
                   [provider]: event.target.value,
                 }))
               }
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && drafts[provider].trim() && !isBusy) {
+                  event.preventDefault();
+                  void saveKey(provider);
+                }
+              }}
               placeholder={isSaved ? "••••••••••••••••  saved" : placeholder}
               aria-label={`${label} API key`}
               spellCheck={false}
@@ -208,7 +234,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             aria-checked={snapshot.settings.streaming_enabled}
             aria-label="Stream while speaking"
             className="switch"
-            disabled={busy === "streaming"}
+            disabled={busy !== null}
             onClick={() =>
               void update(
                 { streaming_enabled: !snapshot.settings.streaming_enabled },
@@ -234,7 +260,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             aria-checked={snapshot.settings.cleanup_enabled}
             aria-label="Clean up transcripts"
             className="switch"
-            disabled={busy === "cleanup"}
+            disabled={busy !== null}
             onClick={() =>
               void update(
                 { cleanup_enabled: !snapshot.settings.cleanup_enabled },
@@ -278,7 +304,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             aria-checked={snapshot.launch_at_login}
             aria-label="Launch at login"
             className="switch"
-            disabled={busy === "autostart"}
+            disabled={busy !== null}
             onClick={() =>
               void update(
                 { launch_at_login: !snapshot.launch_at_login },
@@ -309,7 +335,9 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             >
               <option value="">System default</option>
               {!hasSelected && selectedDevice && (
-                <option value={selectedDevice}>{selectedDevice}</option>
+                <option value={selectedDevice}>
+                  Selected microphone (unavailable)
+                </option>
               )}
               {devices.map((device) => (
                 <option key={device.id} value={device.id}>
@@ -334,12 +362,28 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
             aria-checked={snapshot.settings.keep_raw}
             aria-label="Keep original transcripts"
             className="switch"
-            disabled={busy === "raw"}
+            disabled={busy !== null}
             onClick={() =>
               void update({ keep_raw: !snapshot.settings.keep_raw }, "raw")
             }
           />
         </div>
+
+        {snapshot.hotkey_error && (
+          <div className="setting-row">
+            <div>
+              <div className="setting-label">Keyboard shortcut unavailable</div>
+              <div className="setting-help">{snapshot.hotkey_error}</div>
+            </div>
+            <button
+              className="btn"
+              onClick={() => void retryHotkey()}
+              disabled={busy !== null}
+            >
+              {busy === "hotkey" ? "Retrying…" : "Retry"}
+            </button>
+          </div>
+        )}
 
         <div className="setting-row">
           <div>

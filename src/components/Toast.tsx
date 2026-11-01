@@ -15,10 +15,15 @@ export function Toast({ notice }: { notice: Notice | null }) {
       last.current = notice;
       setText(notice.text);
       const frame = requestAnimationFrame(() => setVisible(true));
-      const timer = window.setTimeout(() => setVisible(false), 3800);
+      let clearTimer: number | undefined;
+      const timer = window.setTimeout(() => {
+        setVisible(false);
+        clearTimer = window.setTimeout(() => setText(""), 240);
+      }, 3800);
       return () => {
         cancelAnimationFrame(frame);
         window.clearTimeout(timer);
+        if (clearTimer !== undefined) window.clearTimeout(clearTimer);
       };
     }
     setVisible(false);

@@ -6,10 +6,10 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar
 
 ## What it does
 
-- **Right Alt toggles recording.** A low-level keyboard hook swallows both edges of the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held cancels the recording and lets that key through. **Esc** cancels.
+- **Right Alt toggles recording.** A low-level keyboard hook swallows both edges of the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held cancels the recording and replays the chord with Right Alt down, so AltGr characters (`@`, `€`) and Alt+Tab still work. **Esc** cancels.
 - **AssemblyAI Sync live** streams 16 kHz mono PCM while you talk. Stopping leaves only the tail and final decode (~0.5 s typical). If live fails, Ray falls back to Sync batch, then the asynchronous v2 batch API, using the locally buffered WAV.
 - **Cleanup** sends the transcript through an OpenAI-compatible chat endpoint. Default chain: `gemma-4-31b` on the AssemblyAI LLM Gateway (same key as STT) → `openai/gpt-oss-120b` on Groq → Vercel AI Gateway if you add a key. If every provider fails, the raw transcript is pasted rather than lost.
-- **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard.
+- **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard. Restore timing is adaptive (longer for Electron, Office, and browsers) and is skipped if anything else changed the clipboard meanwhile, so slow targets never paste the old contents. Transient dictation text is excluded from Win+V clipboard history and cloud clipboard. If the focused window is elevated, Ray says so instead of silently failing.
 - **History**, a **dictionary** of preferred spellings, and **keys/settings** live in a monochrome Notion/Linear-style window. Closing it hides it; Ray stays in the tray.
 - The bar is always-on-top, click-through, non-focusable, hidden from the taskbar, and sits above the taskbar of the monitor with the focused window.
 
@@ -86,7 +86,7 @@ curl -X POST "https://api.deepgram.com/v1/speak?model=aura-2-thalia-en&encoding=
   -d '{"text":"Um, test the Ray dictation pipeline."}' -o test.wav
 ```
 
-In debug builds, `RAY_TEST_PCM=/path/to/raw-16k-mono.pcm` replaces the microphone with that PCM stream, so the entire hotkey → bar → STT → cleanup → paste path can be exercised without speaking.
+In debug builds, `RAY_TEST_PCM=/path/to/raw-16k-mono.pcm` replaces the microphone with that PCM stream, so the entire hotkey → bar → STT → cleanup → paste path can be exercised without speaking. `RAY_TEST_IGNORE_STORED_KEYS=1` makes the key lookup skip Windows Credential Manager (debug only) so the first-run and invalid-key paths can be tested with the environment-variable fallback. `RAY_TEST_MAX_RECORDING_SECONDS=N` lowers the automatic recording cap (debug only) to exercise the auto-stop path.
 
 ## Architecture
 
@@ -113,7 +113,8 @@ The bar window is a separate Tauri window (`bar.html`). It is styled with `WS_EX
 ## Known limits
 
 - Sync live accepts up to 120 s of audio per request; longer dictations roll over to a new live request and the segment transcripts are concatenated. If the live path fails, the batch endpoint is used.
-- Pasting into elevated (admin) windows can be blocked by Windows UIPI.
-- On layouts where Right Alt is AltGr, pressing Right Alt alone may be interpreted by the layout; holding it and pressing another key cancels dictation. The modifier itself is not forwarded in that case.
+- A single recording stops automatically at 5 minutes, the size of the local batch-fallback buffer. The bar tells you when that happens.
+- Pasting into elevated (admin) windows is blocked by Windows UIPI. Ray detects this and copies the text to the clipboard with a clear message instead of silently doing nothing.
+- On layouts where Right Alt is AltGr, typing an AltGr character starts and immediately cancels a dictation (a brief bar flicker), but the character itself is replayed correctly. A bare Right Alt is still the dictation toggle.
 - Groq's free tier has a daily token cap; the app falls back to the next provider or raw text.
 - Multi-monitor placement is implemented but only verified on a single monitor.
