@@ -58,6 +58,9 @@ impl Dictation {
         let http = reqwest::Client::builder()
             .user_agent("Ray/0.1 (Windows)")
             .connect_timeout(Duration::from_secs(10))
+            // Keep the pre-warmed gateway connection alive through long
+            // recordings and between dictations (reqwest defaults to 90 s).
+            .pool_idle_timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Arc::new(Self {
@@ -188,6 +191,15 @@ impl Dictation {
         } else {
             None
         };
+        // Warm the LLM gateway while the user speaks, so the first dictation
+        // does not pay a cold TLS handshake after the hotkey is released.
+        if settings.cleanup_enabled && pipeline.cleanup.enabled {
+            let http = self.http.clone();
+            let cleanup_config = pipeline.cleanup.clone();
+            tokio::spawn(async move {
+                cleanup::warm_connection(&http, &cleanup_config).await;
+            });
+        }
         let (dummy_tx, dummy_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(dummy_rx);
         let audio_tx = stream
@@ -287,6 +299,7 @@ impl Dictation {
         };
         let wav = stt::wav_from_pcm16(&samples, audio::TARGET_RATE);
         let mut raw: Option<String> = None;
+        let mut stt_error: Option<String> = None;
 
         if let Some(stream) = stream {
             let timeout = if pipeline.stt.mode.eq_ignore_ascii_case("sync_live") {
@@ -301,7 +314,10 @@ impl Dictation {
             match stream.finish(timeout).await {
                 Ok(text) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
                 Ok(_) => eprintln!("[ray] streaming returned no text; trying batch"),
-                Err(error) => eprintln!("[ray] streaming failed; trying batch: {error}"),
+                Err(error) => {
+                    eprintln!("[ray] streaming failed; trying batch: {error}");
+                    stt_error = Some(error);
+                }
             }
         }
 
@@ -319,15 +335,31 @@ impl Dictation {
                 {
                     Ok(Ok(text)) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
                     Ok(Ok(_)) => {}
-                    Ok(Err(error)) => eprintln!("[ray] batch transcription failed: {error}"),
-                    Err(_) => eprintln!("[ray] batch transcription timed out"),
+                    Ok(Err(error)) => {
+                        eprintln!("[ray] batch transcription failed: {error}");
+                        stt_error = Some(error);
+                    }
+                    Err(_) => {
+                        eprintln!("[ray] batch transcription timed out");
+                        stt_error = Some("timed out".into());
+                    }
                 }
             }
         }
 
-        let Some(raw_text) = raw else {
-            self.fail("Transcription failed. Check your connection and AssemblyAI key.")
-                .await;
+        let had_raw = raw.is_some();
+        let raw_text = raw
+            .map(|text| cleanup::sanitize_transcript(&text))
+            .filter(|text| !text.is_empty());
+        let Some(raw_text) = raw_text else {
+            // Silence and noise-only clips are not a connection problem.
+            let no_speech = had_raw || is_no_speech_error(stt_error.as_deref());
+            if no_speech {
+                self.fail("Didn't catch that. Try again.").await;
+            } else {
+                self.fail("Transcription failed. Check your connection and AssemblyAI key.")
+                    .await;
+            }
             return;
         };
 
@@ -488,5 +520,36 @@ impl Dictation {
                 windows_util::hide_bar(hwnd);
             }
         }
+    }
+}
+
+/// Distinguishes "the user said nothing" from a real network/key failure so the
+/// bar does not tell them to check their connection after a silent clip.
+fn is_no_speech_error(error: Option<&str>) -> bool {
+    error.is_some_and(|error| {
+        let error = error.to_lowercase();
+        error.contains("no speech")
+            || error.contains("empty transcript")
+            || error.contains("without a transcript")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_no_speech_error;
+
+    #[test]
+    fn recognises_silence_instead_of_reporting_a_connection_error() {
+        assert!(is_no_speech_error(Some("No speech was detected")));
+        assert!(is_no_speech_error(Some(
+            "AssemblyAI returned an empty transcript"
+        )));
+        assert!(is_no_speech_error(Some(
+            "AssemblyAI closed the stream without a transcript"
+        )));
+        assert!(!is_no_speech_error(Some(
+            "AssemblyAI Sync live 401 Unauthorized"
+        )));
+        assert!(!is_no_speech_error(None));
     }
 }

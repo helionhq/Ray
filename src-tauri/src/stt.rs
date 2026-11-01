@@ -25,6 +25,16 @@ use url::Url;
 const WEBSOCKET_URL: &str = "wss://streaming.assemblyai.com/v3/ws";
 const V2_URL: &str = "https://api.assemblyai.com/v2";
 static BOUNDARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Aborts a spawned request when the task that owns it is cancelled. Without
+/// this, a stalled upload keeps its connection (and its request timeout) alive
+/// after the app has already fallen back to batch.
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 /// One live transcription session, whichever protocol the config selects.
 pub enum LiveSession {
     WebSocket(StreamSession),
@@ -73,10 +83,19 @@ pub struct SyncLiveSession {
 impl SyncLiveSession {
     pub async fn finish(self, timeout: Duration) -> Result<String, String> {
         let _ = self.stop_tx.send(true);
-        match tokio::time::timeout(timeout, self.task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(format!("Sync live task failed: {error}")),
-            Err(_) => Err("Sync live did not finish in time".into()),
+        let mut task = self.task;
+        tokio::select! {
+            result = &mut task => match result {
+                Ok(result) => result,
+                Err(error) => Err(format!("Sync live task failed: {error}")),
+            },
+            _ = tokio::time::sleep(timeout) => {
+                // Do not leave a stalled upload running: it would hold the
+                // connection and its 300 s request timeout while the batch
+                // fallback already has the audio.
+                task.abort();
+                Err("Sync live did not finish in time".into())
+            }
         }
     }
     pub fn abort(self) {
@@ -114,6 +133,12 @@ async fn run_sync_live(
     let max_bytes = (segment_seconds * config.sample_rate as u64 * 2) as usize;
     let mut transcripts: Vec<String> = Vec::new();
     let mut pending: Option<Vec<u8>> = None;
+    // A hard 118 s cut can land inside a word. Re-send the last second of the
+    // finished segment at the start of the next one, then remove the repeated
+    // words when joining, so no word is lost or duplicated.
+    let overlap_bytes = (config.sample_rate as usize * 2).min(max_bytes / 4);
+    let mut overlap: Option<Vec<u8>> = None;
+    let mut audio_tail: Vec<u8> = Vec::new();
     loop {
         let boundary = boundary();
         let config_json = sync_config(config, keyterms)?;
@@ -143,12 +168,22 @@ async fn run_sync_live(
                 |mut rx| async move { rx.recv().await.map(|item| (item, rx)) },
             )));
         let send_task = tokio::spawn(request.send());
+        let _abort_on_drop = AbortOnDrop(send_task.abort_handle());
         let pump = async {
             let mut sent = 0usize;
+            if let Some(bytes) = overlap.take() {
+                sent += bytes.len();
+                keep_tail(&mut audio_tail, &bytes, overlap_bytes);
+                if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
+                    let _ = body_tx.send(Ok(Bytes::from(tail.clone()))).await;
+                    return true;
+                }
+            }
             if let Some(chunk) = pending.take() {
                 sent += chunk.len();
+                keep_tail(&mut audio_tail, &chunk, overlap_bytes);
                 if body_tx.send(Ok(Bytes::from(chunk))).await.is_err() {
-                    let _ = body_tx.send(Ok(Bytes::from(tail))).await;
+                    let _ = body_tx.send(Ok(Bytes::from(tail.clone()))).await;
                     return true;
                 }
             }
@@ -164,6 +199,7 @@ async fn run_sync_live(
                                     break;
                                 }
                                 sent += bytes.len();
+                                keep_tail(&mut audio_tail, &bytes, overlap_bytes);
                                 if body_tx.send(Ok(Bytes::from(bytes))).await.is_err() {
                                     stopped = true;
                                 }
@@ -178,7 +214,7 @@ async fn run_sync_live(
                     }
                 }
             }
-            let _ = body_tx.send(Ok(Bytes::from(tail))).await;
+            let _ = body_tx.send(Ok(Bytes::from(tail.clone()))).await;
             stopped
         };
         let stopped = pump.await;
@@ -212,14 +248,129 @@ async fn run_sync_live(
             break;
         }
         // The segment hit the audio cap; start a fresh request and carry on.
+        // Re-send the last second so a word cut by the boundary is complete in
+        // the next segment, and de-duplicate it when joining the transcripts.
+        overlap = Some(std::mem::take(&mut audio_tail));
     }
-    let text = transcripts.join(" ").trim().to_string();
+    let text = transcripts
+        .iter()
+        .fold(String::new(), |acc, next| join_segment_transcripts(&acc, next));
     if text.is_empty() {
         Err("No speech was detected".into())
     } else {
         Ok(text)
     }
 }
+/// Keep only the last `limit` bytes of audio sent to a segment, for the
+/// rollover overlap.
+fn keep_tail(tail: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    if limit == 0 {
+        tail.clear();
+        return;
+    }
+    if bytes.len() >= limit {
+        tail.clear();
+        tail.extend_from_slice(&bytes[bytes.len() - limit..]);
+        return;
+    }
+    tail.extend_from_slice(bytes);
+    if tail.len() > limit {
+        let excess = tail.len() - limit;
+        tail.drain(..excess);
+    }
+}
+
+fn normalize_word(word: &str) -> String {
+    word.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Join two live segments. The second segment re-sends the last second of
+/// audio, so its transcript starts with words the first one already produced.
+/// Remove that overlap, and when the cut fell inside a word, let the complete
+/// word from the second segment replace the fragment at the end of the first.
+fn join_segment_transcripts(previous: &str, next: &str) -> String {
+    let previous = previous.trim();
+    let next = next.trim();
+    if previous.is_empty() {
+        return next.to_string();
+    }
+    if next.is_empty() {
+        return previous.to_string();
+    }
+    let previous_words: Vec<&str> = previous.split_whitespace().collect();
+    let next_words: Vec<&str> = next.split_whitespace().collect();
+    let previous_norm: Vec<String> = previous_words.iter().map(|word| normalize_word(word)).collect();
+    let next_norm: Vec<String> = next_words.iter().map(|word| normalize_word(word)).collect();
+    let max = previous_words.len().min(next_words.len()).min(40);
+
+    // The overlap began inside an earlier word, so the second segment starts
+    // with only its tail ("AssemblyAI for now" | "AI for now"). Drop the tail
+    // only when the words after it line up with the rest of the first
+    // segment; that avoids eating a real word such as "is" after "analysis".
+    if next_norm.len() >= 2 && next_norm[0].len() >= 2 {
+        let tail = &next_norm[0];
+        for index in 0..previous_norm.len() {
+            let word = &previous_norm[index];
+            let remaining = previous_norm.len() - index - 1;
+            if remaining >= 1
+                && word.len() > tail.len()
+                && word.ends_with(tail.as_str())
+                && next_norm.len() > remaining
+                && previous_norm[index + 1..] == next_norm[1..=remaining]
+            {
+                let rest = next_words[1..].join(" ");
+                return join_segment_transcripts(previous, &rest);
+            }
+        }
+    }
+
+    // Complete words repeated because of the overlap: keep the first copy.
+    for k in (1..=max).rev() {
+        if previous_norm[previous_words.len() - k..] == next_norm[..k] {
+            return format!(
+                "{} {}",
+                previous,
+                next_words[k..].join(" ")
+            )
+            .trim()
+            .to_string();
+        }
+    }
+
+    // A word was cut at the boundary. The next segment contains the words
+    // before it plus the full word, so drop the fragment (and the duplicated
+    // run before it) from the first segment and keep the next one whole.
+    for k in (1..=max).rev() {
+        let fragment = &previous_norm[previous_words.len() - 1];
+        if fragment.len() < 3 {
+            continue;
+        }
+        if k == 1 {
+            if next_norm[0].starts_with(fragment) && next_norm[0].len() > fragment.len() {
+                return format!(
+                    "{} {}",
+                    previous_words[..previous_words.len() - 1].join(" "),
+                    next
+                )
+                .trim()
+                .to_string();
+            }
+        } else if previous_norm[previous_words.len() - k..previous_words.len() - 1]
+            == next_norm[..k - 1]
+            && next_norm[k - 1].starts_with(fragment)
+            && next_norm[k - 1].len() > fragment.len()
+        {
+            return format!("{} {}", previous_words[..previous_words.len() - k].join(" "), next)
+                .trim()
+                .to_string();
+        }
+    }
+    format!("{previous} {next}")
+}
+
 fn sync_config(config: &SttConfig, keyterms: &[String]) -> Result<String, String> {
     let mut value = serde_json::json!({
         "sample_rate": config.sample_rate,
@@ -273,10 +424,16 @@ pub struct StreamSession {
 impl StreamSession {
     pub async fn finish(self, timeout: Duration) -> Result<String, String> {
         let _ = self.stop_tx.send(true);
-        match tokio::time::timeout(timeout, self.task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(format!("Streaming task failed: {error}")),
-            Err(_) => Err("Streaming did not finish in time".into()),
+        let mut task = self.task;
+        tokio::select! {
+            result = &mut task => match result {
+                Ok(result) => result,
+                Err(error) => Err(format!("Streaming task failed: {error}")),
+            },
+            _ = tokio::time::sleep(timeout) => {
+                task.abort();
+                Err("Streaming did not finish in time".into())
+            }
         }
     }
     pub fn abort(self) {
@@ -823,6 +980,74 @@ mod tests {
             "Hello there. This is Ray. And a partial"
         );
     }
+    #[test]
+    fn rollover_join_removes_repeated_overlap_words() {
+        assert_eq!(
+            join_segment_transcripts(
+                "We should ship the update.",
+                "ship the update. Then tell Arham."
+            ),
+            "We should ship the update. Then tell Arham."
+        );
+        assert_eq!(
+            join_segment_transcripts("Three things.", "Three things. First is the API."),
+            "Three things. First is the API."
+        );
+    }
+
+    #[test]
+    fn rollover_join_repairs_a_word_cut_at_the_boundary() {
+        assert_eq!(
+            join_segment_transcripts("We should ship the workfl", "workflow tomorrow."),
+            "We should ship the workflow tomorrow."
+        );
+        assert_eq!(
+            join_segment_transcripts(
+                "we should ship the workfl",
+                "ship the workflow tomorrow."
+            ),
+            "we should ship the workflow tomorrow."
+        );
+        assert_eq!(
+            join_segment_transcripts("I'll ask Kuber", "Kubernetes about it."),
+            "I'll ask Kubernetes about it."
+        );
+    }
+
+    #[test]
+    fn rollover_join_drops_a_tail_of_the_last_word() {
+        assert_eq!(
+            join_segment_transcripts(
+                "The transcription stays on AssemblyAI for now.",
+                "AI for now, but we'll add an adapter."
+            ),
+            "The transcription stays on AssemblyAI for now. but we'll add an adapter."
+        );
+        // A real word that merely looks like a suffix must be kept.
+        assert_eq!(
+            join_segment_transcripts("The analysis", "is clear."),
+            "The analysis is clear."
+        );
+    }
+
+    #[test]
+    fn rollover_join_keeps_independent_segments() {
+        assert_eq!(
+            join_segment_transcripts("First part ends here.", "Second part starts here."),
+            "First part ends here. Second part starts here."
+        );
+    }
+
+    #[test]
+    fn rollover_tail_keeps_only_the_last_bytes() {
+        let mut tail = Vec::new();
+        keep_tail(&mut tail, &[1, 2, 3], 4);
+        keep_tail(&mut tail, &[4, 5, 6], 4);
+        assert_eq!(tail, vec![3, 4, 5, 6]);
+        keep_tail(&mut tail, &[7, 8, 9, 10, 11], 4);
+        assert_eq!(tail, vec![8, 9, 10, 11]);
+    }
+
     #[test]
     fn keyterms_are_trimmed_deduped_and_capped() {
         let terms = vec![

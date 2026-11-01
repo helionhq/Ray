@@ -447,6 +447,21 @@ impl Resampler {
     }
 }
 
+/// Resample mono PCM16 with the same filter and interpolator used for
+/// microphone capture. The headless resampler check feeds 48 kHz / 44.1 kHz
+/// audio through this so it exercises the shipping code, not a reimplementation.
+pub fn resample_pcm16(input: &[i16], in_rate: u32, out_rate: u32) -> Vec<i16> {
+    if in_rate == out_rate {
+        return input.to_vec();
+    }
+    let mut resampler = Resampler::new(in_rate, out_rate);
+    let mono: Vec<f32> = input
+        .iter()
+        .map(|sample| *sample as f32 / i16::MAX as f32)
+        .collect();
+    resampler.process(&mono)
+}
+
 /// Test-only capture: streams a raw 16 kHz mono PCM16 file at just above real
 /// time, so hotkey → STT → cleanup → paste can be exercised without a mic.
 #[cfg(debug_assertions)]
