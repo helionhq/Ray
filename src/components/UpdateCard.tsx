@@ -34,7 +34,7 @@ export function UpdateCard({ state, onInstall }: UpdateCardProps) {
       ? "Installing update"
       : state.phase === "downloading"
         ? "Downloading update"
-        : `Update Ray to version ${state.version}`;
+        : `Update Ray to version ${state.version}. Ray will restart when it is done.`;
 
   return (
     <div className="sidebar-foot">

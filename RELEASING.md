@@ -58,6 +58,9 @@ the version they are running.
 - The installer is not Authenticode-signed, so Windows SmartScreen may warn on
   a first install. Tauri's updater signature (separate from Authenticode) is
   what guards the update channel.
+- A local `pnpm tauri build` signs updater artifacts, so it needs the signing
+  key. For an unsigned local installer, add
+  `--config '{"bundle":{"createUpdaterArtifacts":false}}'`.
 - Development builds never check for updates (`pnpm tauri dev` is excluded in
   `src/lib/updater.ts`), so a dev build cannot replace itself.
 - If `main` ever gains a rule that blocks direct pushes, the version-bump push

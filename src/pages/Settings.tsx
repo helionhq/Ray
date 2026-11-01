@@ -63,7 +63,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   } else if (updater.phase === "installing") {
     updateHelp = "Installing. Ray will restart when it is done.";
   } else if (updater.version) {
-    updateHelp = `Ray ${updater.version} is ready to install.`;
+    updateHelp = `Ray ${updater.version} is ready to install. Ray will restart when it is done.`;
   } else if (checking) {
     updateHelp = "Looking for a new version…";
   } else if (checked?.status === "current") {

@@ -24,9 +24,12 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar
 ```sh
 pnpm install
 pnpm tauri dev          # Vite + the app
-pnpm tauri build        # installer (NSIS)
+pnpm tauri build        # installer; signs updater artifacts, needs the signing key
+pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'  # unsigned local installer
 pnpm tauri build --no-bundle   # executable only
 ```
+
+`pnpm tauri build` signs the updater artifact, so it needs `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Without them, pass the `createUpdaterArtifacts: false` override above; the release workflow builds that way and signs the installer in its publish job.
 
 The Rust side can be checked independently with `cargo check --manifest-path src-tauri/Cargo.toml`; run unit tests with `cargo test --manifest-path src-tauri/Cargo.toml --lib`.
 

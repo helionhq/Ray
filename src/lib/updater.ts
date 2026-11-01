@@ -6,6 +6,10 @@ import { hasTauri } from "./bridge";
 /** Check shortly after launch, then a few times a day. */
 const FIRST_CHECK_MS = 5_000;
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
+/** Opening the window after a long tray stint should not wait for the timer. */
+const FOCUS_CHECK_MS = 60 * 60 * 1000;
+const CHECK_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 export type UpdatePhase = "idle" | "downloading" | "installing";
 
@@ -51,21 +55,23 @@ export function useUpdater(): Updater {
   const updateRef = useRef<Update | null>(null);
   const checkRef = useRef<Promise<UpdateCheck> | null>(null);
   const busyRef = useRef(false);
+  const lastCheckAt = useRef(0);
 
   const checkNow = useCallback(async (): Promise<UpdateCheck> => {
     if (!updatesSupported()) return { status: "unavailable" };
     if (updateRef.current) {
       return { status: "available", version: updateRef.current.version };
     }
-    // Share one in-flight request between the automatic timer and the
-    // Settings button instead of asking GitHub twice.
+    // Share one in-flight request between the automatic timer, the focus
+    // check, and the Settings button instead of asking GitHub twice.
     if (checkRef.current) return checkRef.current;
 
+    lastCheckAt.current = Date.now();
     setState((current) => ({ ...current, checking: true }));
 
     const pending = (async (): Promise<UpdateCheck> => {
       try {
-        const update = await check();
+        const update = await check({ timeout: CHECK_TIMEOUT_MS });
         if (!update) return { status: "current" };
         updateRef.current = update;
         setState((current) => ({ ...current, version: update.version }));
@@ -91,9 +97,18 @@ export function useUpdater(): Updater {
   useEffect(() => {
     const first = window.setTimeout(() => void checkNow(), FIRST_CHECK_MS);
     const timer = window.setInterval(() => void checkNow(), CHECK_EVERY_MS);
+    // A tray app can sit hidden for days; bring the check forward when the
+    // user actually opens the window, at most once an hour.
+    const onFocus = () => {
+      if (Date.now() - lastCheckAt.current >= FOCUS_CHECK_MS) {
+        void checkNow();
+      }
+    };
+    window.addEventListener("focus", onFocus);
     return () => {
       window.clearTimeout(first);
       window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
     };
   }, [checkNow]);
 
@@ -112,32 +127,35 @@ export function useUpdater(): Updater {
     try {
       let total = 0;
       let downloaded = 0;
-      await update.downloadAndInstall((event) => {
-        switch (event.event) {
-          case "Started":
-            total = event.data.contentLength ?? 0;
-            break;
-          case "Progress":
-            downloaded += event.data.chunkLength;
-            setState((current) =>
-              current.phase === "downloading"
-                ? {
-                    ...current,
-                    progress:
-                      total > 0 ? Math.min(downloaded / total, 1) : null,
-                  }
-                : current,
-            );
-            break;
-          case "Finished":
-            setState((current) => ({
-              ...current,
-              phase: "installing",
-              progress: null,
-            }));
-            break;
-        }
-      });
+      await update.downloadAndInstall(
+        (event) => {
+          switch (event.event) {
+            case "Started":
+              total = event.data.contentLength ?? 0;
+              break;
+            case "Progress":
+              downloaded += event.data.chunkLength;
+              setState((current) =>
+                current.phase === "downloading"
+                  ? {
+                      ...current,
+                      progress:
+                        total > 0 ? Math.min(downloaded / total, 1) : null,
+                    }
+                  : current,
+              );
+              break;
+            case "Finished":
+              setState((current) => ({
+                ...current,
+                phase: "installing",
+                progress: null,
+              }));
+              break;
+          }
+        },
+        { timeout: DOWNLOAD_TIMEOUT_MS },
+      );
       // The NSIS installer usually closes Ray before this resolves; relaunch
       // covers the case where it hands control back to us.
       await relaunch();
