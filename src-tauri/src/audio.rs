@@ -17,7 +17,33 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub const TARGET_RATE: u32 = 16_000;
 const CHUNK_SAMPLES: usize = 1_600; // 100 ms at 16 kHz
-const MAX_RECORDING_SAMPLES: usize = TARGET_RATE as usize * 60 * 5;
+/// Hard limit for a single dictation. The pipeline stops recording here, so
+/// the local batch-fallback buffer and the advertised limit agree.
+pub const MAX_RECORDING_SECONDS: u64 = 5 * 60;
+const MAX_RECORDING_SAMPLES: usize = TARGET_RATE as usize * MAX_RECORDING_SECONDS as usize;
+
+/// The cap enforced by the pipeline. In debug builds this can be lowered with
+/// `RAY_TEST_MAX_RECORDING_SECONDS` so the auto-stop path is testable without
+/// waiting five minutes.
+pub fn max_recording_seconds() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("RAY_TEST_MAX_RECORDING_SECONDS") {
+        if let Ok(seconds) = value.trim().parse::<u64>() {
+            if seconds > 0 {
+                return seconds;
+            }
+        }
+    }
+    MAX_RECORDING_SECONDS
+}
+
+pub fn limit_label(seconds: u64) -> String {
+    if seconds >= 60 && seconds % 60 == 0 {
+        format!("{}-minute", seconds / 60)
+    } else {
+        format!("{seconds}-second")
+    }
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct InputDevice {
@@ -59,35 +85,74 @@ pub struct Capture {
     level: Arc<AtomicU32>,
     pcm: Arc<Mutex<Vec<i16>>>,
     error: Arc<Mutex<Option<String>>>,
+    warning: Arc<Mutex<Option<String>>>,
+    truncated: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Capture {
     pub fn error(&self) -> Option<String> {
-        self.error.lock().unwrap().clone()
+        self.error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// A non-fatal problem such as falling back from a missing device.
+    pub fn warning(&self) -> Option<String> {
+        self.warning
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.truncated.load(Ordering::SeqCst)
     }
 
     pub fn level_handle(&self) -> Arc<AtomicU32> {
         self.level.clone()
     }
 
-    /// Stops the stream and returns every captured sample.
-    pub fn stop(&mut self) -> Vec<i16> {
+    /// The full local buffer, shared with the capture thread. The pipeline
+    /// snapshots it after `join`, or after a timeout if a driver will not let
+    /// go.
+    pub fn pcm_handle(&self) -> Arc<Mutex<Vec<i16>>> {
+        self.pcm.clone()
+    }
+
+    pub fn request_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops the stream and returns every captured sample. The pipeline uses
+    /// `request_stop`/`join` directly so it can time out a stuck driver.
+    #[allow(dead_code)]
+    pub fn stop(&mut self) -> Vec<i16> {
+        self.request_stop();
+        self.join_inner();
+        self.pcm
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn join(mut self) {
+        self.request_stop();
+        self.join_inner();
+    }
+
+    fn join_inner(&mut self) {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let samples = self.pcm.lock().unwrap().clone();
-        samples
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.request_stop();
+        self.join_inner();
     }
 }
 
@@ -108,12 +173,16 @@ pub fn start(
     let level = Arc::new(AtomicU32::new(0f32.to_bits()));
     let pcm = Arc::new(Mutex::new(Vec::with_capacity(TARGET_RATE as usize * 20)));
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let warning: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let truncated = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
 
     let thread_stop = stop.clone();
     let thread_level = level.clone();
     let thread_pcm = pcm.clone();
     let thread_error = error.clone();
+    let thread_warning = warning.clone();
+    let thread_truncated = truncated.clone();
     let thread = thread::Builder::new()
         .name("ray-audio".into())
         .spawn(move || {
@@ -124,9 +193,13 @@ pub fn start(
                 thread_level,
                 thread_pcm,
                 thread_error.clone(),
+                thread_warning,
+                thread_truncated,
                 ready_tx,
             ) {
-                *thread_error.lock().unwrap() = Some(message);
+                *thread_error
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
             }
             // `run_capture` blocks until the stop flag is set and the stream
             // is dropped.
@@ -139,6 +212,8 @@ pub fn start(
             level,
             pcm,
             error,
+            warning,
+            truncated,
             thread: Some(thread),
         }),
         Ok(Err(message)) => {
@@ -151,7 +226,7 @@ pub fn start(
             let _ = thread.join();
             Err(error
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
                 .unwrap_or_else(|| "The audio capture stopped unexpectedly".into()))
         }
@@ -169,6 +244,7 @@ struct Processor {
     pcm: Arc<Mutex<Vec<i16>>>,
     level: Arc<AtomicU32>,
     audio_tx: UnboundedSender<Vec<u8>>,
+    truncated: Arc<AtomicBool>,
     smoothed_level: f32,
 }
 
@@ -178,6 +254,7 @@ impl Processor {
         pcm: Arc<Mutex<Vec<i16>>>,
         level: Arc<AtomicU32>,
         audio_tx: UnboundedSender<Vec<u8>>,
+        truncated: Arc<AtomicBool>,
     ) -> Self {
         Self {
             resampler: Resampler::new(in_rate, TARGET_RATE),
@@ -185,6 +262,7 @@ impl Processor {
             pcm,
             level,
             audio_tx,
+            truncated,
             smoothed_level: 0.0,
         }
     }
@@ -215,11 +293,19 @@ impl Processor {
             return;
         }
         {
-            let mut buffer = self.pcm.lock().unwrap();
-            if buffer.len() < MAX_RECORDING_SAMPLES {
-                buffer.extend_from_slice(&pcm);
+            let mut buffer = self
+                .pcm
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let room = MAX_RECORDING_SAMPLES.saturating_sub(buffer.len());
+            if pcm.len() > room {
+                self.truncated.store(true, Ordering::SeqCst);
             }
+            buffer.extend_from_slice(&pcm[..pcm.len().min(room)]);
         }
+        // Streaming continues past the local buffer cap; the live path can
+        // still transcribe it, and the pipeline stops at MAX_RECORDING_SECONDS
+        // so the batch fallback never silently loses a tail.
         self.pending.extend_from_slice(&pcm);
         while self.pending.len() >= CHUNK_SAMPLES {
             let rest = self.pending.split_off(CHUNK_SAMPLES);
@@ -249,6 +335,9 @@ fn pcm16_bytes(samples: &[i16]) -> Vec<u8> {
     bytes
 }
 
+// The capture thread owns one handle per piece of shared state; grouping them
+// into a struct would only move the noise.
+#[allow(clippy::too_many_arguments)]
 fn run_capture(
     device_id: Option<String>,
     audio_tx: UnboundedSender<Vec<u8>>,
@@ -256,39 +345,64 @@ fn run_capture(
     level: Arc<AtomicU32>,
     pcm: Arc<Mutex<Vec<i16>>>,
     error: Arc<Mutex<Option<String>>>,
+    warning: Arc<Mutex<Option<String>>>,
+    truncated: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<u32, String>>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
-    let device = match device_id.as_deref() {
-        Some(id) if !id.is_empty() => host
-            .device_by_id(
-                &id.parse()
-                    .map_err(|_| "Invalid microphone id".to_string())?,
-            )
-            .or_else(|| host.default_input_device())
-            .ok_or_else(|| "No microphone found".to_string())?,
-        _ => host
-            .default_input_device()
-            .ok_or_else(|| "No microphone found".to_string())?,
+    let missing = || "No microphone is available. Connect a microphone and choose it in Settings.";
+    let device = match device_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let device = id
+                .parse()
+                .ok()
+                .and_then(|parsed| host.device_by_id(&parsed));
+            match device {
+                Some(device) => device,
+                None => {
+                    // The chosen device was unplugged or is disabled. Falling
+                    // back to the default is better than refusing to record,
+                    // as long as we say so.
+                    *warning
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
+                        "The selected microphone is unavailable; using the system default."
+                            .into(),
+                    );
+                    host.default_input_device().ok_or_else(missing)?
+                }
+            }
+        }
+        _ => host.default_input_device().ok_or_else(missing)?,
     };
 
     if !device.supports_input() {
-        return Err("The selected device does not accept audio input".into());
+        return Err(missing().into());
     }
     let config = device
         .default_input_config()
-        .map_err(|error| format!("Could not read the microphone format: {error}"))?;
+        .map_err(|error| {
+            friendly_capture_error(format!("Could not read the microphone format: {error}"))
+        })?;
     let in_rate = config.sample_rate();
     let sample_format = config.sample_format();
 
-    let processor = Arc::new(Mutex::new(Processor::new(in_rate, pcm, level, audio_tx)));
+    let processor = Arc::new(Mutex::new(Processor::new(
+        in_rate,
+        pcm,
+        level,
+        audio_tx,
+        truncated,
+    )));
 
     let err_fn = {
         let error = error.clone();
         move |err: cpal::Error| {
-            let mut slot = error.lock().unwrap();
+            let mut slot = error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if slot.is_none() {
-                *slot = Some(format!("Microphone error: {err}"));
+                *slot = Some(friendly_capture_error(format!("Microphone error: {err}")));
             }
         }
     };
@@ -300,11 +414,12 @@ fn run_capture(
         SampleFormat::I32 => build::<i32>(&device, &config, processor.clone(), err_fn),
         SampleFormat::I8 => build::<i8>(&device, &config, processor.clone(), err_fn),
         other => Err(format!("Unsupported microphone format: {other}")),
-    }?;
+    }
+    .map_err(friendly_capture_error)?;
 
     stream
         .play()
-        .map_err(|error| format!("Could not start the microphone: {error}"))?;
+        .map_err(|error| friendly_capture_error(format!("Could not start the microphone: {error}")))?;
 
     // The stream is live; hand the capture back to `start`.
     let _ = ready_tx.send(Ok(in_rate));
@@ -351,6 +466,22 @@ where
             None,
         )
         .map_err(|error| format!("Could not open the microphone: {error}"))
+}
+
+/// Turns WASAPI/device errors into something the user can act on. The privacy
+/// case is common on Windows 10/11 and returns an opaque "Access is denied".
+fn friendly_capture_error(message: String) -> String {
+    let lower = message.to_lowercase();
+    if lower.contains("access is denied")
+        || lower.contains("access denied")
+        || lower.contains("0x80070005")
+    {
+        return "Windows is blocking microphone access. Open Settings → Privacy & security → Microphone and allow desktop apps to use your microphone.".into();
+    }
+    if lower.contains("no microphone") || lower.contains("does not accept audio input") {
+        return "No microphone is available. Connect a microphone and choose it in Settings.".into();
+    }
+    message
 }
 
 /// A 2nd-order Butterworth low-pass used before decimation.
@@ -478,9 +609,12 @@ fn start_fake_capture(path: &str, audio_tx: UnboundedSender<Vec<u8>>) -> Result<
     let level = Arc::new(AtomicU32::new(0f32.to_bits()));
     let pcm: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::with_capacity(samples.len())));
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let warning: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let truncated = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let thread_level = level.clone();
     let thread_pcm = pcm.clone();
+    let thread_truncated = truncated.clone();
     let thread = thread::Builder::new()
         .name("ray-test-audio".into())
         .spawn(move || {
@@ -498,7 +632,16 @@ fn start_fake_capture(path: &str, audio_tx: UnboundedSender<Vec<u8>>) -> Result<
                 let db = 20.0 * rms.max(1e-7).log10();
                 smoothed += (((db + 60.0) / 50.0).clamp(0.0, 1.0) - smoothed) * 0.4;
                 thread_level.store(smoothed.to_bits(), Ordering::Relaxed);
-                thread_pcm.lock().unwrap().extend_from_slice(chunk);
+                {
+                    let mut buffer = thread_pcm
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let room = MAX_RECORDING_SAMPLES.saturating_sub(buffer.len());
+                    if chunk.len() > room {
+                        thread_truncated.store(true, Ordering::SeqCst);
+                    }
+                    buffer.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
                 let mut bytes = Vec::with_capacity(chunk.len() * 2);
                 for sample in chunk {
                     bytes.extend_from_slice(&sample.to_le_bytes());
@@ -514,6 +657,8 @@ fn start_fake_capture(path: &str, audio_tx: UnboundedSender<Vec<u8>>) -> Result<
         level,
         pcm,
         error,
+        warning,
+        truncated,
         thread: Some(thread),
     })
 }
@@ -546,5 +691,41 @@ mod tests {
             "got {} samples",
             output.len()
         );
+    }
+
+    #[test]
+    fn downsamples_44k1_to_16k() {
+        let mut resampler = Resampler::new(44_100, 16_000);
+        let output = resampler.process(&vec![0.5f32; 4_410]);
+        assert!(
+            (output.len() as i32 - 1_600).abs() <= 2,
+            "got {} samples",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn recording_limit_matches_the_batch_buffer_and_covers_live_rollover() {
+        assert_eq!(
+            MAX_RECORDING_SAMPLES,
+            TARGET_RATE as usize * MAX_RECORDING_SECONDS as usize
+        );
+    }
+
+    #[test]
+    fn limit_labels_read_naturally() {
+        assert_eq!(limit_label(300), "5-minute");
+        assert_eq!(limit_label(60), "1-minute");
+        assert_eq!(limit_label(8), "8-second");
+    }
+
+    #[test]
+    fn privacy_denial_gets_an_actionable_message() {
+        let message = friendly_capture_error(
+            "Could not open the microphone: Access is denied. (0x80070005)".into(),
+        );
+        assert!(message.contains("Privacy"));
+        assert!(message.contains("Microphone"));
+        assert_eq!(friendly_capture_error("boom".into()), "boom");
     }
 }

@@ -7,18 +7,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, MAX_PATH, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::Security::{
+    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcessId, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    GetAncestor, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos, ShowWindow, GA_ROOT, GA_ROOTOWNER,
+    GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
@@ -197,6 +202,89 @@ pub fn foreground() -> Option<Foreground> {
     }
 }
 
+/// Lower-case executable stem of the foreground window, for paste timing.
+pub fn foreground_process_name() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        window_process_name(hwnd)
+    }
+}
+
+/// Returns a user-facing reason when Ctrl+V would not reach the focused
+/// window. UIPI blocks synthetic input into elevated windows without an error,
+/// so those cases must be detected before sending anything.
+pub fn paste_blocker() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return Some("No window is focused to paste into".into());
+        }
+        // The focused window can be a WebView2/child window; walk to the
+        // top-level owner so "Ray's own window" is recognised reliably.
+        let mut pid = 0u32;
+        let mut top = hwnd;
+        for flags in [GA_ROOT, GA_ROOTOWNER] {
+            let ancestor = GetAncestor(hwnd, flags);
+            if !ancestor.0.is_null() {
+                top = ancestor;
+                break;
+            }
+        }
+        GetWindowThreadProcessId(top, Some(&mut pid));
+        if pid == 0 {
+            return Some("Ray could not tell which window is focused".into());
+        }
+        if pid == GetCurrentProcessId() {
+            return Some("Ray's own window is focused".into());
+        }
+        let self_elevated = process_is_elevated(GetCurrentProcessId()).unwrap_or(false);
+        if self_elevated {
+            return None;
+        }
+        match process_is_elevated(pid) {
+            Some(true) => Some(
+                "The focused window is running as administrator, and Windows blocks paste into it"
+                    .into(),
+            ),
+            // Access denied here usually means a higher-integrity process; be
+            // honest rather than silently dropping the keystroke.
+            None => Some(
+                "Ray could not send input to the focused window; it may be running as administrator"
+                    .into(),
+            ),
+            Some(false) => None,
+        }
+    }
+}
+
+fn process_is_elevated(pid: u32) -> Option<bool> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
+        if !opened {
+            let _ = CloseHandle(process);
+            return None;
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut size = 0u32;
+        let queried = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut TOKEN_ELEVATION as *mut std::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        let _ = CloseHandle(process);
+        queried.then_some(elevation.TokenIsElevated != 0)
+    }
+}
+
 fn window_title(hwnd: HWND) -> Option<String> {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
@@ -305,9 +393,21 @@ pub fn set_launch_at_login(enabled: bool) -> Result<(), String> {
 
 pub fn launch_at_login() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ)
+    let Ok(value) = hkcu
+        .open_subkey_with_flags(RUN_KEY, KEY_READ)
         .and_then(|key| key.get_value::<String, _>(APP_NAME))
-        .is_ok()
+    else {
+        return false;
+    };
+    // A Run entry left behind by a moved or older build does not mean the
+    // current Ray will start at login. Reporting it as off lets the user fix
+    // it by turning the switch on again.
+    match std::env::current_exe() {
+        Ok(exe) => value
+            .to_lowercase()
+            .contains(&exe.display().to_string().to_lowercase()),
+        Err(_) => true,
+    }
 }
 
 /// UTF-16 for Win32 paths.

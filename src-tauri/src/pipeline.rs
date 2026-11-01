@@ -39,6 +39,7 @@ struct Session {
     keyterms: Vec<String>,
     cleanup_enabled: bool,
     level_task: tokio::task::JoinHandle<()>,
+    limit_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct Dictation {
@@ -50,6 +51,11 @@ pub struct Dictation {
     transition: tokio::sync::Mutex<()>,
     recording: Arc<AtomicBool>,
     processing: AtomicBool,
+    /// First and last instant of the current/last processing phase. Hotkey
+    /// presses that happened inside this window are stale by the time the
+    /// pipeline is free to read them; they must not start a new dictation.
+    processing_window: std::sync::Mutex<(Option<Instant>, Option<Instant>)>,
+    pending_note: std::sync::Mutex<Option<String>>,
     bar_payload: std::sync::Mutex<serde_json::Value>,
 }
 
@@ -72,6 +78,8 @@ impl Dictation {
             transition: tokio::sync::Mutex::new(()),
             recording: Arc::new(AtomicBool::new(false)),
             processing: AtomicBool::new(false),
+            processing_window: std::sync::Mutex::new((None, None)),
+            pending_note: std::sync::Mutex::new(None),
             bar_payload: std::sync::Mutex::new(json!({ "phase": "hidden" })),
         })
     }
@@ -82,6 +90,62 @@ impl Dictation {
 
     pub fn is_processing(&self) -> bool {
         self.processing.load(Ordering::SeqCst)
+    }
+
+    /// A press made while the previous stop was still running should be
+    /// dropped, not queued into a surprise new recording once it finishes.
+    pub fn should_ignore_toggle(&self, at: Instant) -> bool {
+        let window = self
+            .processing_window
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match *window {
+            (Some(since), Some(until)) => at >= since && at <= until,
+            (Some(since), None) => at >= since,
+            _ => false,
+        }
+    }
+
+    fn begin_processing(&self) {
+        let mut window = self
+            .processing_window
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if window.0.is_none() {
+            window.0 = Some(Instant::now());
+        }
+        window.1 = None;
+    }
+
+    fn end_processing(&self) {
+        let mut window = self
+            .processing_window
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if window.0.is_some() {
+            window.1 = Some(Instant::now());
+        }
+    }
+
+    fn reset_processing_window(&self) {
+        *self
+            .processing_window
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = (None, None);
+    }
+
+    fn set_pending_note(&self, note: impl Into<String>) {
+        *self
+            .pending_note
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(note.into());
+    }
+
+    fn take_pending_note(&self) -> Option<String> {
+        self.pending_note
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 
     pub fn http(&self) -> &reqwest::Client {
@@ -148,6 +212,8 @@ impl Dictation {
         if self.is_recording() || self.is_processing() {
             return;
         }
+        // A genuinely new session: presses from here on are no longer stale.
+        self.reset_processing_window();
         let Some(api_key) = secrets::get(secrets::ASSEMBLYAI) else {
             self.open_settings("Add your AssemblyAI key in Settings to start dictating.");
             self.fail("Add your AssemblyAI key in Settings").await;
@@ -232,6 +298,9 @@ impl Dictation {
                 }
             };
 
+        if let Some(warning) = capture.warning() {
+            self.notify_main(warning);
+        }
         let level = capture.level_handle();
         let recording = self.recording.clone();
         let app = self.app.clone();
@@ -243,6 +312,26 @@ impl Dictation {
             }
         });
 
+        // A recording cannot outlive the audio buffer used for the batch
+        // fallback. Stop at that limit instead of silently dropping the tail.
+        let limit_seconds = audio::max_recording_seconds();
+        let limit_task = {
+            let dictation = self.clone();
+            let recording = self.recording.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(limit_seconds)).await;
+                if recording.load(Ordering::SeqCst) {
+                    dictation.set_pending_note(format!(
+                        "Recording stopped at the {} limit.",
+                        audio::limit_label(limit_seconds)
+                    ));
+                    // Do not call stop() from the task it is about to abort.
+                    let this = dictation.clone();
+                    tokio::spawn(async move { this.stop().await; });
+                }
+            })
+        };
+
         *self.session.lock().await = Some(Session {
             capture,
             stream,
@@ -251,6 +340,7 @@ impl Dictation {
             keyterms,
             cleanup_enabled: settings.cleanup_enabled,
             level_task,
+            limit_task,
         });
     }
 
@@ -262,32 +352,66 @@ impl Dictation {
         self.recording.store(false, Ordering::SeqCst);
         hotkey::set_capturing(false);
         self.processing.store(true, Ordering::SeqCst);
+        self.begin_processing();
+        // Dropping the guard clears `processing` even if a future step panics,
+        // so a bug can never leave the hotkey permanently dead.
+        let _processing_guard = ProcessingGuard(self.as_ref());
         self.emit_bar(json!({ "phase": "processing" }));
 
         let Some(session) = self.session.lock().await.take() else {
-            self.processing.store(false, Ordering::SeqCst);
             return;
         };
         let Session {
-            mut capture,
+            capture,
             stream,
             started,
             target,
             keyterms,
             cleanup_enabled,
             level_task,
+            limit_task,
         } = session;
         level_task.abort();
+        limit_task.abort();
+
         let duration_ms = started.elapsed().as_millis() as u64;
         let audio_error = capture.error();
-        let samples = tokio::task::spawn_blocking(move || capture.stop())
-            .await
-            .unwrap_or_default();
+        let truncated = capture.truncated();
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(note) = self.take_pending_note() {
+            notes.push(note);
+        }
+
+        // Some drivers block while tearing the stream down. Do not let that
+        // hang the whole pipeline; snapshot what was captured and move on.
+        capture.request_stop();
+        let pcm = capture.pcm_handle();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(6),
+            tokio::task::spawn_blocking(move || capture.join()),
+        )
+        .await;
+        if !matches!(stopped, Ok(Ok(()))) {
+            notes.push(
+                "The microphone did not stop cleanly; transcribed the audio captured so far.".into(),
+            );
+        }
+        let samples = pcm
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
 
         if samples.len() < 1_600 {
-            let message = audio_error.unwrap_or_else(|| "Didn't catch that. Try again.".into());
+            let message = audio_error
+                .or_else(|| notes.first().cloned())
+                .unwrap_or_else(|| "Didn't catch that. Try again.".into());
             self.fail(&message).await;
             return;
+        }
+        if let Some(error) = audio_error {
+            notes.push(format!(
+                "The microphone stopped during recording ({error}). The audio before it was transcribed."
+            ));
         }
 
         let (pipeline, cleanup_prompt) = {
@@ -299,6 +423,7 @@ impl Dictation {
         };
         let wav = stt::wav_from_pcm16(&samples, audio::TARGET_RATE);
         let mut raw: Option<String> = None;
+        let mut from_stream = false;
         let mut stt_error: Option<String> = None;
 
         if let Some(stream) = stream {
@@ -312,7 +437,10 @@ impl Dictation {
                 )
             };
             match stream.finish(timeout).await {
-                Ok(text) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
+                Ok(text) if !text.trim().is_empty() => {
+                    raw = Some(text.trim().to_string());
+                    from_stream = true;
+                }
                 Ok(_) => eprintln!("[ray] streaming returned no text; trying batch"),
                 Err(error) => {
                     eprintln!("[ray] streaming failed; trying batch: {error}");
@@ -347,6 +475,15 @@ impl Dictation {
             }
         }
 
+        // Only the remote fallback uses the local buffer, so only warn about
+        // its length when the live path did not produce the transcript.
+        if truncated && !from_stream {
+            notes.push(format!(
+                "Recording reached the {}-minute buffer limit; the end may be missing.",
+                audio::MAX_RECORDING_SECONDS / 60
+            ));
+        }
+
         let had_raw = raw.is_some();
         let raw_text = raw
             .map(|text| cleanup::sanitize_transcript(&text))
@@ -357,8 +494,7 @@ impl Dictation {
             if no_speech {
                 self.fail("Didn't catch that. Try again.").await;
             } else {
-                self.fail("Transcription failed. Check your connection and AssemblyAI key.")
-                    .await;
+                self.fail(stt_failure_message(stt_error.as_deref())).await;
             }
             return;
         };
@@ -419,17 +555,38 @@ impl Dictation {
             let text = text.clone();
             tokio::task::spawn_blocking(move || paste::paste_text(&text)).await
         };
-        if let Ok(Err(error)) = pasted {
-            let _ = paste::copy_text(&text);
-            self.notify_main(format!(
-                "Couldn't paste automatically ({error}). The text is copied to your clipboard and saved in History."
-            ));
+        match pasted {
+            Ok(Ok(outcome)) => {
+                if outcome.previous_clipboard_lost {
+                    notes.push(
+                        "Your previous clipboard contents (files or rich content) couldn't be restored."
+                            .into(),
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                match paste::copy_text(&text) {
+                    Ok(()) => notes.push(format!(
+                        "Couldn't paste automatically ({error}). The text is copied to your clipboard and saved in History."
+                    )),
+                    Err(copy_error) => notes.push(format!(
+                        "Couldn't paste ({error}) or copy the text ({copy_error}). It is saved in History."
+                    )),
+                }
+            }
+            Err(error) => {
+                notes.push(format!(
+                    "The paste task failed ({error}). The text is saved in History."
+                ));
+            }
+        }
+        for note in notes {
+            self.notify_main(note);
         }
 
         self.emit_bar(json!({ "phase": "done" }));
         tokio::time::sleep(Duration::from_millis(520)).await;
         self.hide_bar();
-        self.processing.store(false, Ordering::SeqCst);
     }
 
     pub async fn cancel(self: &Arc<Self>) {
@@ -442,23 +599,30 @@ impl Dictation {
         let session = self.session.lock().await.take();
         if let Some(session) = session {
             session.level_task.abort();
+            session.limit_task.abort();
             if let Some(stream) = session.stream {
                 stream.abort();
             }
-            let mut capture = session.capture;
-            let _ = tokio::task::spawn_blocking(move || capture.stop()).await;
+            session.capture.request_stop();
+            let capture = session.capture;
+            // Detach the join: cancelling must feel instant even if a driver
+            // is slow to tear the stream down.
+            std::mem::drop(tokio::task::spawn_blocking(move || capture.join()));
         }
         self.hide_bar();
         self.processing.store(false, Ordering::SeqCst);
     }
 
     async fn fail(&self, message: &str) {
+        eprintln!("[ray] {message}");
+        self.begin_processing();
+        self.processing.store(true, Ordering::SeqCst);
+        let _guard = ProcessingGuard(self);
         self.emit_bar(json!({ "phase": "error", "message": message }));
         self.show_bar();
         self.notify_main(message.to_string());
         tokio::time::sleep(Duration::from_millis(1_600)).await;
         self.hide_bar();
-        self.processing.store(false, Ordering::SeqCst);
         self.recording.store(false, Ordering::SeqCst);
     }
 
@@ -473,6 +637,7 @@ impl Dictation {
     }
 
     fn notify_main(&self, message: String) {
+        eprintln!("[ray] {message}");
         let _ = self.app.emit_to("main", "notice", message);
     }
 
@@ -523,6 +688,46 @@ impl Dictation {
     }
 }
 
+/// Clears the processing flag and closes the stale-press window on every exit
+/// path, including early returns and panics. Without this, one unexpected
+/// error would leave the hotkey permanently dead.
+struct ProcessingGuard<'a>(&'a Dictation);
+
+impl Drop for ProcessingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.processing.store(false, Ordering::SeqCst);
+        self.0.end_processing();
+    }
+}
+
+/// Turns an STT error into something the user can act on.
+fn stt_failure_message(error: Option<&str>) -> &'static str {
+    let Some(error) = error else {
+        return "Transcription failed. Check your connection and AssemblyAI key.";
+    };
+    let error = error.to_lowercase();
+    if error.contains("401")
+        || error.contains("403")
+        || error.contains("unauthorized")
+        || error.contains("invalid api key")
+        || error.contains("authentication")
+    {
+        return "AssemblyAI rejected your key. Check it in Settings.";
+    }
+    if error.contains("error sending request")
+        || error.contains("dns")
+        || error.contains("connect")
+        || error.contains("timed out")
+        || error.contains("timeout")
+        || error.contains("network")
+        || error.contains("tls")
+        || error.contains("proxy")
+    {
+        return "Couldn't reach AssemblyAI. Check your connection and try again.";
+    }
+    "Transcription failed. Check your connection and AssemblyAI key."
+}
+
 /// Distinguishes "the user said nothing" from a real network/key failure so the
 /// bar does not tell them to check their connection after a silent clip.
 fn is_no_speech_error(error: Option<&str>) -> bool {
@@ -536,7 +741,19 @@ fn is_no_speech_error(error: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_no_speech_error;
+    use super::{is_no_speech_error, stt_failure_message};
+
+    #[test]
+    fn explains_bad_keys_and_network_failures_differently() {
+        assert!(stt_failure_message(Some("AssemblyAI Sync live 401 Unauthorized"))
+            .contains("rejected your key"));
+        assert!(stt_failure_message(Some("error sending request for url"))
+            .contains("Couldn't reach AssemblyAI"));
+        assert!(stt_failure_message(Some("timed out")).contains("Couldn't reach AssemblyAI"));
+        assert!(stt_failure_message(Some("AssemblyAI Sync live 500: boom"))
+            .contains("Transcription failed"));
+        assert!(stt_failure_message(None).contains("Transcription failed"));
+    }
 
     #[test]
     fn recognises_silence_instead_of_reporting_a_connection_error() {
