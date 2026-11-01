@@ -5,19 +5,50 @@
 //! cleanup, and prints both results. Keys come from Windows Credential Manager
 //! or the environment; nothing is compiled in.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{self, PipelineConfig};
-use crate::{cleanup, secrets, stt};
+use crate::{audio, cleanup, secrets, stt};
 
 pub fn run_selftest(path: &str, streaming: bool) -> i32 {
-    let wav = match read_wav(path) {
+    run_selftest_with(path, streaming, false)
+}
+
+/// `--selftest-resample <file.wav>`: run any sample rate through the real
+/// microphone resampler first, then the normal STT → cleanup path.
+pub fn run_selftest_resampled(path: &str, streaming: bool) -> i32 {
+    run_selftest_with(path, streaming, true)
+}
+
+fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
+    let mut wav = match read_wav(path) {
         Ok(wav) => wav,
         Err(error) => {
             eprintln!("[selftest] {error}");
             return 2;
         }
     };
+    if wav.sample_rate != 16_000 {
+        if !resample {
+            eprintln!(
+                "[selftest] Expected 16 kHz audio, got {} Hz. Use --selftest-resample to run it through the capture resampler.",
+                wav.sample_rate
+            );
+            return 2;
+        }
+        let original_rate = wav.sample_rate;
+        let original_len = wav.samples.len();
+        wav.samples = audio::resample_pcm16(&wav.samples, original_rate, 16_000);
+        wav.sample_rate = 16_000;
+        println!(
+            "[selftest] resampled {} Hz -> 16000 Hz through audio.rs ({} -> {} samples)",
+            original_rate,
+            original_len,
+            wav.samples.len()
+        );
+    } else if resample {
+        println!("[selftest] input was already 16 kHz; the resampler is a no-op");
+    }
     let key = secrets::get(secrets::ASSEMBLYAI);
     let Some(api_key) = key else {
         eprintln!("[selftest] ASSEMBLYAI_API_KEY is not set (environment or Credential Manager)");
@@ -66,6 +97,7 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
     runtime.block_on(async move {
         let http = match reqwest::Client::builder()
             .user_agent("Ray/0.1 selftest")
+            .pool_idle_timeout(Duration::from_secs(300))
             .build()
         {
             Ok(http) => http,
@@ -74,6 +106,17 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
                 return 2;
             }
         };
+
+        if std::env::var("RAY_TEST_WARM").is_ok() {
+            // Simulates the app opening the cleanup connection while the user
+            // is speaking: the request finishes long before the hotkey is up.
+            let warm_started = Instant::now();
+            cleanup::warm_connection(&http, &config.cleanup).await;
+            println!(
+                "[selftest] timing prewarm_ms={}",
+                warm_started.elapsed().as_millis()
+            );
+        }
 
         println!(
             "[selftest] {} · {:.1}s · model {} · {}",
@@ -88,8 +131,12 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
         );
 
         let raw = if streaming {
-            let session =
-                stt::spawn_live(api_key, config.stt.clone(), keyterms.clone(), http.clone());
+            let session = stt::spawn_live(
+                api_key.clone(),
+                config.stt.clone(),
+                keyterms.clone(),
+                http.clone(),
+            );
             let bytes = pcm16_bytes(&wav.samples);
             let mut sent = 0usize;
             for chunk in bytes.chunks(3_200) {
@@ -98,21 +145,62 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
                     break;
                 }
                 sent += chunk.len();
-                tokio::time::sleep(Duration::from_millis(90)).await;
+                // The shipping capture sends 100 ms chunks in real time; upload
+                // at the same pace so the live endpoint sees what the app sends.
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             println!("[selftest] sent {} bytes of audio", sent);
             tokio::time::sleep(Duration::from_millis(300)).await;
+            // Everything queued, as if the hotkey was just released.
+            let stopped = Instant::now();
             match session.finish(Duration::from_secs(20)).await {
-                Ok(text) => text,
+                Ok(text) => {
+                    println!(
+                        "[selftest] timing stop_to_transcript_ms={}",
+                        stopped.elapsed().as_millis()
+                    );
+                    text
+                }
                 Err(error) => {
-                    eprintln!("[selftest] streaming failed: {error}");
-                    return 1;
+                    // Mirror the app: a failed live request falls back to the
+                    // batch endpoint rather than losing the dictation.
+                    eprintln!("[selftest] streaming failed: {error}; falling back to batch");
+                    let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
+                    let fallback_started = Instant::now();
+                    let text = match stt::transcribe_wav(
+                        &http,
+                        &api_key,
+                        &keyterms,
+                        wav_bytes,
+                        &config.stt,
+                    )
+                    .await
+                    {
+                        Ok(text) => text,
+                        Err(error) => {
+                            eprintln!("[selftest] batch transcription failed: {error}");
+                            return 1;
+                        }
+                    };
+                    println!(
+                        "[selftest] timing stop_to_transcript_ms={} fallback=batch",
+                        fallback_started.elapsed().as_millis()
+                    );
+                    eprintln!("[selftest] note: live failed ({error}); batch succeeded");
+                    text
                 }
             }
         } else {
             let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
+            let stopped = Instant::now();
             match stt::transcribe_wav(&http, &api_key, &keyterms, wav_bytes, &config.stt).await {
-                Ok(text) => text,
+                Ok(text) => {
+                    println!(
+                        "[selftest] timing stop_to_transcript_ms={}",
+                        stopped.elapsed().as_millis()
+                    );
+                    text
+                }
                 Err(error) => {
                     eprintln!("[selftest] batch transcription failed: {error}");
                     return 1;
@@ -120,8 +208,12 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
             }
         };
 
+        let raw = cleanup::sanitize_transcript(&raw);
         println!("\n--- RAW ---\n{raw}");
 
+        let app_name =
+            std::env::var("RAY_TEST_APP_NAME").unwrap_or_else(|_| "Notepad".to_string());
+        let cleanup_started = Instant::now();
         let result = cleanup::cleanup(
             &http,
             &config.cleanup,
@@ -129,17 +221,38 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
             &raw,
             &dictionary,
             &config.known_names,
-            "Notepad",
+            &app_name,
         )
         .await;
+        let cleanup_ms = cleanup_started.elapsed().as_millis();
+        println!("\n--- CLEAN ({}) ---\n{}", result
+            .provider
+            .clone()
+            .unwrap_or_else(|| "raw fallback".into()), result.text);
         println!(
-            "\n--- CLEAN ({}) ---\n{}",
-            result
-                .provider
-                .clone()
-                .unwrap_or_else(|| "raw fallback".into()),
-            result.text
+            "[selftest] timing cleanup_ms={} app_name={:?}",
+            cleanup_ms, app_name
         );
+        if std::env::var("RAY_TEST_REPEAT_CLEANUP").is_ok() {
+            // A second call on the already-warm connection pool measures what a
+            // normal (non-first) dictation pays.
+            let warm_started = Instant::now();
+            let warm = cleanup::cleanup(
+                &http,
+                &config.cleanup,
+                config::EMBEDDED_PROMPT,
+                &raw,
+                &dictionary,
+                &config.known_names,
+                &app_name,
+            )
+            .await;
+            println!(
+                "[selftest] timing cleanup_warm_ms={}",
+                warm_started.elapsed().as_millis()
+            );
+            let _ = warm;
+        }
         if let Some(note) = result.note {
             println!("\n[selftest] note: {note}");
         }
@@ -149,6 +262,7 @@ pub fn run_selftest(path: &str, streaming: bool) -> i32 {
 
 struct WavFile {
     samples: Vec<i16>,
+    sample_rate: u32,
 }
 
 fn read_wav(path: &str) -> Result<WavFile, String> {
@@ -202,10 +316,8 @@ fn read_wav(path: &str) -> Result<WavFile, String> {
             "Expected 16-bit PCM WAV, got format {code} with {bits}-bit samples"
         ));
     }
-    if sample_rate != 16_000 {
-        return Err(format!(
-            "Expected 16 kHz audio, got {sample_rate} Hz. Resample it first."
-        ));
+    if sample_rate == 0 {
+        return Err("WAV has a zero sample rate".into());
     }
     if channels == 0 {
         return Err("WAV has zero channels".into());
@@ -226,7 +338,10 @@ fn read_wav(path: &str) -> Result<WavFile, String> {
             })
             .collect()
     };
-    Ok(WavFile { samples })
+    Ok(WavFile {
+        samples,
+        sample_rate,
+    })
 }
 
 fn pcm16_bytes(samples: &[i16]) -> Vec<u8> {

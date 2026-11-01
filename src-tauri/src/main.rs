@@ -13,21 +13,29 @@ fn main() {
             });
         std::process::exit(result.unwrap_or(2));
     }
-    if let Some(position) = args
-        .iter()
-        .position(|arg| arg == "--selftest" || arg == "--selftest-stream")
-    {
-        let streaming = args[position] == "--selftest-stream";
+    if let Some(position) = args.iter().position(|arg| {
+        arg == "--selftest" || arg == "--selftest-stream" || arg == "--selftest-resample"
+    }) {
+        let flag = args[position].as_str();
+        let streaming = flag != "--selftest";
+        let resample = flag == "--selftest-resample";
         let Some(path) = args.get(position + 1) else {
             eprintln!("usage: ray --selftest <16kHz-mono.wav>");
             eprintln!("       ray --selftest-stream <16kHz-mono.wav>");
+            eprintln!("       ray --selftest-resample <any-rate-mono.wav>");
             std::process::exit(2);
         };
         let path = path.clone();
         // The HTTP/TLS futures are large in debug builds; give them room.
         let result = std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
-            .spawn(move || ray_lib::run_selftest(&path, streaming))
+            .spawn(move || {
+                if resample {
+                    ray_lib::run_selftest_resampled(&path, streaming)
+                } else {
+                    ray_lib::run_selftest(&path, streaming)
+                }
+            })
             .and_then(|handle| {
                 handle
                     .join()

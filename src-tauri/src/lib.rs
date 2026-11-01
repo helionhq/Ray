@@ -19,7 +19,7 @@ use tauri::{Manager, RunEvent, WindowEvent};
 
 use crate::pipeline::Dictation;
 
-pub use selftest::{run_mic_test, run_selftest};
+pub use selftest::{run_mic_test, run_selftest, run_selftest_resampled};
 
 pub fn run() {
     tauri::Builder::default()

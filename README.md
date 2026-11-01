@@ -63,6 +63,9 @@ cargo run --manifest-path src-tauri/Cargo.toml -- --selftest path/to/16k-mono.wa
 # Live STT (Sync live by default) + cleanup
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-stream path/to/16k-mono.wav
 
+# Any-rate audio: run it through the real capture resampler, then live STT + cleanup
+cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-resample path/to/48k-mono.wav
+
 # Force the WebSocket STT implementation instead
 RAY_STT_MODE=websocket cargo run ... -- --selftest-stream ...
 
@@ -72,6 +75,8 @@ RAY_TEST_FORCE_FALLBACK=1 cargo run ... --selftest ...
 # Real microphone capture for ~2.5 seconds (sample count + ambient level)
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-mic
 ```
+
+The selftest prints `stop_to_transcript_ms` and `cleanup_ms`, and falls back to batch if the live request fails, exactly like the app. Set `RAY_TEST_WARM=1` to pre-warm the cleanup connection before STT (simulating a recording), and `RAY_TEST_REPEAT_CLEANUP=1` to measure a second, already-warm cleanup call.
 
 A 16 kHz mono WAV can be generated with Deepgram:
 

@@ -6,6 +6,8 @@ dist/
 research/audio/
 research/out/
 *.log
+__pycache__/
+*.pyc
 src-tauri/gen/
 .vite/
 *.pdb
