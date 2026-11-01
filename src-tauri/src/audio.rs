@@ -366,8 +366,7 @@ fn run_capture(
                     *warning
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(
-                        "The selected microphone is unavailable; using the system default."
-                            .into(),
+                        "The selected microphone is unavailable; using the system default.".into(),
                     );
                     host.default_input_device().ok_or_else(missing)?
                 }
@@ -379,20 +378,14 @@ fn run_capture(
     if !device.supports_input() {
         return Err(missing().into());
     }
-    let config = device
-        .default_input_config()
-        .map_err(|error| {
-            friendly_capture_error(format!("Could not read the microphone format: {error}"))
-        })?;
+    let config = device.default_input_config().map_err(|error| {
+        friendly_capture_error(format!("Could not read the microphone format: {error}"))
+    })?;
     let in_rate = config.sample_rate();
     let sample_format = config.sample_format();
 
     let processor = Arc::new(Mutex::new(Processor::new(
-        in_rate,
-        pcm,
-        level,
-        audio_tx,
-        truncated,
+        in_rate, pcm, level, audio_tx, truncated,
     )));
 
     let err_fn = {
@@ -417,9 +410,9 @@ fn run_capture(
     }
     .map_err(friendly_capture_error)?;
 
-    stream
-        .play()
-        .map_err(|error| friendly_capture_error(format!("Could not start the microphone: {error}")))?;
+    stream.play().map_err(|error| {
+        friendly_capture_error(format!("Could not start the microphone: {error}"))
+    })?;
 
     // The stream is live; hand the capture back to `start`.
     let _ = ready_tx.send(Ok(in_rate));
@@ -479,7 +472,8 @@ fn friendly_capture_error(message: String) -> String {
         return "Windows is blocking microphone access. Open Settings → Privacy & security → Microphone and allow desktop apps to use your microphone.".into();
     }
     if lower.contains("no microphone") || lower.contains("does not accept audio input") {
-        return "No microphone is available. Connect a microphone and choose it in Settings.".into();
+        return "No microphone is available. Connect a microphone and choose it in Settings."
+            .into();
     }
     message
 }

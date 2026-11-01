@@ -24,8 +24,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_ESCAPE, VK_RMENU,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_ESCAPE, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, KillTimer, PostThreadMessageW, SetTimer, SetWindowsHookExW,
@@ -199,7 +199,9 @@ unsafe fn hook_thread(ready_tx: mpsc::Sender<Result<(), String>>) {
         if message.message == WM_TIMER && message.hwnd.0.is_null() {
             // Health check. Unhooking a hook Windows already removed fails
             // harmlessly; installing again restores the hotkey.
-            unsafe { let _ = UnhookWindowsHookEx(hook); };
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            };
             ALT_DOWN.store(false, Ordering::SeqCst);
             ALT_CHORD.store(false, Ordering::SeqCst);
             SWALLOW_VK.store(0, Ordering::SeqCst);

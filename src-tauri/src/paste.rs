@@ -27,8 +27,9 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_MENU, VK_RMENU, VK_V,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_MENU, VK_RMENU,
+    VK_V,
 };
 
 use crate::windows_util;
@@ -156,7 +157,10 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
     }
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = unsafe {
-        std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * std::mem::size_of::<u16>())
+        std::slice::from_raw_parts(
+            wide.as_ptr() as *const u8,
+            wide.len() * std::mem::size_of::<u16>(),
+        )
     };
     let text_handle = unsafe { alloc_bytes(bytes) }?;
     let markers = if exclude_from_history {
@@ -176,7 +180,9 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
     }
 
     if let Err(error) = unsafe { EmptyClipboard() } {
-        unsafe { let _ = CloseClipboard(); };
+        unsafe {
+            let _ = CloseClipboard();
+        };
         unsafe {
             let _ = windows::Win32::Foundation::GlobalFree(Some(text_handle));
             for (_, handle) in markers {
@@ -187,7 +193,9 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
     }
 
     if let Err(error) = unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(text_handle.0))) } {
-        unsafe { let _ = CloseClipboard(); };
+        unsafe {
+            let _ = CloseClipboard();
+        };
         unsafe {
             let _ = windows::Win32::Foundation::GlobalFree(Some(text_handle));
             for (_, handle) in markers {
@@ -203,10 +211,14 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
     // here only means the transcript may appear in Win+V.
     for (format, handle) in markers {
         if unsafe { SetClipboardData(format, Some(HANDLE(handle.0))) }.is_err() {
-            unsafe { let _ = windows::Win32::Foundation::GlobalFree(Some(handle)); };
+            unsafe {
+                let _ = windows::Win32::Foundation::GlobalFree(Some(handle));
+            };
         }
     }
-    unsafe { let _ = CloseClipboard(); };
+    unsafe {
+        let _ = CloseClipboard();
+    };
     Ok(unsafe { GetClipboardSequenceNumber() })
 }
 
@@ -237,7 +249,9 @@ unsafe fn alloc_bytes(bytes: &[u8]) -> Result<HGLOBAL, String> {
         .map_err(|error| format!("Clipboard memory: {error}"))?;
     let pointer = unsafe { GlobalLock(handle) };
     if pointer.is_null() {
-        unsafe { let _ = windows::Win32::Foundation::GlobalFree(Some(handle)); };
+        unsafe {
+            let _ = windows::Win32::Foundation::GlobalFree(Some(handle));
+        };
         return Err("Could not lock clipboard memory".into());
     }
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer as *mut u8, bytes.len()) };
@@ -265,7 +279,9 @@ fn count_clipboard_formats() -> Option<i32> {
         return None;
     }
     let count = unsafe { CountClipboardFormats() };
-    unsafe { let _ = CloseClipboard(); };
+    unsafe {
+        let _ = CloseClipboard();
+    };
     Some(count)
 }
 
@@ -276,7 +292,9 @@ fn clipboard_is_empty() -> bool {
 fn clear_clipboard() -> Result<(), String> {
     open_clipboard()?;
     let result = unsafe { EmptyClipboard() }.map_err(|error| format!("Clipboard: {error}"));
-    unsafe { let _ = CloseClipboard(); };
+    unsafe {
+        let _ = CloseClipboard();
+    };
     result
 }
 

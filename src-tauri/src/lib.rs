@@ -119,7 +119,13 @@ pub fn run() {
 
 fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Ray", true, None::<&str>)?;
-    let dictate = MenuItem::with_id(app, "dictate", "Start or stop dictation", true, None::<&str>)?;
+    let dictate = MenuItem::with_id(
+        app,
+        "dictate",
+        "Start or stop dictation",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit Ray", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &dictate, &quit])?;
 

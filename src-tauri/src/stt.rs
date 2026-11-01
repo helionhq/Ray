@@ -252,9 +252,9 @@ async fn run_sync_live(
         // the next segment, and de-duplicate it when joining the transcripts.
         overlap = Some(std::mem::take(&mut audio_tail));
     }
-    let text = transcripts
-        .iter()
-        .fold(String::new(), |acc, next| join_segment_transcripts(&acc, next));
+    let text = transcripts.iter().fold(String::new(), |acc, next| {
+        join_segment_transcripts(&acc, next)
+    });
     if text.is_empty() {
         Err("No speech was detected".into())
     } else {
@@ -302,7 +302,10 @@ fn join_segment_transcripts(previous: &str, next: &str) -> String {
     }
     let previous_words: Vec<&str> = previous.split_whitespace().collect();
     let next_words: Vec<&str> = next.split_whitespace().collect();
-    let previous_norm: Vec<String> = previous_words.iter().map(|word| normalize_word(word)).collect();
+    let previous_norm: Vec<String> = previous_words
+        .iter()
+        .map(|word| normalize_word(word))
+        .collect();
     let next_norm: Vec<String> = next_words.iter().map(|word| normalize_word(word)).collect();
     let max = previous_words.len().min(next_words.len()).min(40);
 
@@ -330,13 +333,9 @@ fn join_segment_transcripts(previous: &str, next: &str) -> String {
     // Complete words repeated because of the overlap: keep the first copy.
     for k in (1..=max).rev() {
         if previous_norm[previous_words.len() - k..] == next_norm[..k] {
-            return format!(
-                "{} {}",
-                previous,
-                next_words[k..].join(" ")
-            )
-            .trim()
-            .to_string();
+            return format!("{} {}", previous, next_words[k..].join(" "))
+                .trim()
+                .to_string();
         }
     }
 
@@ -363,9 +362,13 @@ fn join_segment_transcripts(previous: &str, next: &str) -> String {
             && next_norm[k - 1].starts_with(fragment)
             && next_norm[k - 1].len() > fragment.len()
         {
-            return format!("{} {}", previous_words[..previous_words.len() - k].join(" "), next)
-                .trim()
-                .to_string();
+            return format!(
+                "{} {}",
+                previous_words[..previous_words.len() - k].join(" "),
+                next
+            )
+            .trim()
+            .to_string();
         }
     }
     format!("{previous} {next}")
@@ -1002,10 +1005,7 @@ mod tests {
             "We should ship the workflow tomorrow."
         );
         assert_eq!(
-            join_segment_transcripts(
-                "we should ship the workfl",
-                "ship the workflow tomorrow."
-            ),
+            join_segment_transcripts("we should ship the workfl", "ship the workflow tomorrow."),
             "we should ship the workflow tomorrow."
         );
         assert_eq!(

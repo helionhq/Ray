@@ -211,8 +211,7 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         let raw = cleanup::sanitize_transcript(&raw);
         println!("\n--- RAW ---\n{raw}");
 
-        let app_name =
-            std::env::var("RAY_TEST_APP_NAME").unwrap_or_else(|_| "Notepad".to_string());
+        let app_name = std::env::var("RAY_TEST_APP_NAME").unwrap_or_else(|_| "Notepad".to_string());
         let cleanup_started = Instant::now();
         let result = cleanup::cleanup(
             &http,
@@ -225,10 +224,14 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         )
         .await;
         let cleanup_ms = cleanup_started.elapsed().as_millis();
-        println!("\n--- CLEAN ({}) ---\n{}", result
-            .provider
-            .clone()
-            .unwrap_or_else(|| "raw fallback".into()), result.text);
+        println!(
+            "\n--- CLEAN ({}) ---\n{}",
+            result
+                .provider
+                .clone()
+                .unwrap_or_else(|| "raw fallback".into()),
+            result.text
+        );
         println!(
             "[selftest] timing cleanup_ms={} app_name={:?}",
             cleanup_ms, app_name

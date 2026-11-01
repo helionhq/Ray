@@ -327,7 +327,9 @@ impl Dictation {
                     ));
                     // Do not call stop() from the task it is about to abort.
                     let this = dictation.clone();
-                    tokio::spawn(async move { this.stop().await; });
+                    tokio::spawn(async move {
+                        this.stop().await;
+                    });
                 }
             })
         };
@@ -393,7 +395,8 @@ impl Dictation {
         .await;
         if !matches!(stopped, Ok(Ok(()))) {
             notes.push(
-                "The microphone did not stop cleanly; transcribed the audio captured so far.".into(),
+                "The microphone did not stop cleanly; transcribed the audio captured so far."
+                    .into(),
             );
         }
         let samples = pcm
@@ -745,8 +748,10 @@ mod tests {
 
     #[test]
     fn explains_bad_keys_and_network_failures_differently() {
-        assert!(stt_failure_message(Some("AssemblyAI Sync live 401 Unauthorized"))
-            .contains("rejected your key"));
+        assert!(
+            stt_failure_message(Some("AssemblyAI Sync live 401 Unauthorized"))
+                .contains("rejected your key")
+        );
         assert!(stt_failure_message(Some("error sending request for url"))
             .contains("Couldn't reach AssemblyAI"));
         assert!(stt_failure_message(Some("timed out")).contains("Couldn't reach AssemblyAI"));

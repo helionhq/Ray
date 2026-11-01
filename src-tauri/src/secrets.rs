@@ -89,15 +89,14 @@ mod tests {
         // touched.
         let name = "ray-selftest-roundtrip";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
-        entry.set_password("round-trip-value").expect("store secret");
+        entry
+            .set_password("round-trip-value")
+            .expect("store secret");
         assert_eq!(
             entry.get_password().expect("read secret"),
             "round-trip-value"
         );
         entry.delete_credential().expect("remove secret");
-        assert!(matches!(
-            entry.get_password(),
-            Err(keyring::Error::NoEntry)
-        ));
+        assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
     }
 }
