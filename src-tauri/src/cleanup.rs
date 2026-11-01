@@ -627,19 +627,84 @@ fn meridiem_word(text: &str) -> Option<Meridiem> {
     }
 }
 
-/// Every "3:30 p.m." / "3pm" / "3 PM" in the cleaned output, paired with the
-/// clock time it belongs to. Each one has to be verified separately.
-fn cleaned_meridiems(cleaned: &str) -> Vec<(ClockTime, Meridiem)> {
+/// What a meridiem marker is attached to. A range carries one marker for both
+/// endpoints, so it cannot be checked against a single clock time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MeridiemAnchor {
+    Time(ClockTime),
+    Range(ClockTime, ClockTime),
+}
+
+/// Split "10-11", "10–11" or "9:30-10:15" into its two clock times.
+fn split_range(text: &str) -> Option<(ClockTime, ClockTime)> {
+    ['-', '\u{2013}']
+        .into_iter()
+        .find_map(|separator| text.split_once(separator))
+        .and_then(|(start, end)| Some((parse_clock(start)?, parse_clock(end)?)))
+}
+
+/// The range a meridiem marker is attached to at `index`, with how many tokens
+/// it covers: "10-11am", "9:30–10:15 a.m.", "10 to 11 am", or "10 – 11 am"
+/// (whose separator the tokenizer drops as punctuation).
+fn range_at(tokens: &[String], index: usize) -> Option<(ClockTime, ClockTime, Meridiem, usize)> {
+    let token = tokens.get(index)?;
+    let (bare, attached) = match split_meridiem_suffix(token) {
+        Some((clock, meridiem)) => (clock, Some(meridiem)),
+        None => (token.as_str(), None),
+    };
+    if let Some((start, end)) = split_range(bare) {
+        return match attached {
+            Some(meridiem) => Some((start, end, meridiem, 1)),
+            None => Some((start, end, meridiem_word(tokens.get(index + 1)?)?, 2)),
+        };
+    }
+    // A range with an explicit marker on its end only, never on its start.
+    if attached.is_some() {
+        return None;
+    }
+    let start = parse_clock(token)?;
+    if tokens.get(index + 1).is_some_and(|word| word == "to") {
+        let (end, end_attached) = parse_time(tokens.get(index + 2)?)?;
+        return match end_attached {
+            Some(meridiem) => Some((start, end, meridiem, 3)),
+            None => Some((start, end, meridiem_word(tokens.get(index + 3)?)?, 4)),
+        };
+    }
+    // "10 – 11 am" tokenizes to ["10", "11", "am"]; two adjacent clock times
+    // are still a range when a marker follows.
+    let (end, end_attached) = parse_time(tokens.get(index + 1)?)?;
+    match end_attached {
+        Some(meridiem) => Some((start, end, meridiem, 2)),
+        None => Some((start, end, meridiem_word(tokens.get(index + 2)?)?, 3)),
+    }
+}
+
+/// The single clock time a marker is attached to at `index`, with how many
+/// tokens it covers: "3:30pm" or "3:30 p.m.".
+fn time_at(tokens: &[String], index: usize) -> Option<(ClockTime, Meridiem, usize)> {
+    let (clock, attached) = parse_time(tokens.get(index)?)?;
+    if let Some(meridiem) = attached {
+        return Some((clock, meridiem, 1));
+    }
+    let meridiem = meridiem_word(tokens.get(index + 1)?)?;
+    Some((clock, meridiem, 2))
+}
+
+/// Every meridiem marker in the cleaned output, paired with the time or range
+/// it belongs to. Each one has to be verified separately.
+fn meridiem_markers(cleaned: &str) -> Vec<(MeridiemAnchor, Meridiem)> {
     let tokens = time_tokens(cleaned);
     let mut found = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
-        let Some((clock, attached)) = parse_time(token) else {
-            continue;
-        };
-        if let Some(meridiem) = attached {
-            found.push((clock, meridiem));
-        } else if let Some(meridiem) = tokens.get(index + 1).and_then(|next| meridiem_word(next)) {
-            found.push((clock, meridiem));
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((start, end, meridiem, consumed)) = range_at(&tokens, index) {
+            found.push((MeridiemAnchor::Range(start, end), meridiem));
+            index += consumed;
+        } else if let Some((clock, meridiem, consumed)) = time_at(&tokens, index) {
+            found.push((MeridiemAnchor::Time(clock), meridiem));
+            index += consumed;
+        } else {
+            index += 1;
         }
     }
     found
@@ -719,23 +784,49 @@ fn transcript_supports(tokens: &[String], clock: ClockTime, meridiem: Meridiem) 
     })
 }
 
+/// Does the transcript attach this exact half of day to this same range?
+/// "10-11 am", "10–11am" and "10 to 11 AM" all normalise to the same anchor.
+fn transcript_supports_range(
+    tokens: &[String],
+    start: ClockTime,
+    end: ClockTime,
+    meridiem: Meridiem,
+) -> bool {
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Some((spoken_start, spoken_end, said, consumed)) = range_at(tokens, index) {
+            if spoken_start == start && spoken_end == end && said == meridiem {
+                return true;
+            }
+            index += consumed;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
 /// The model must not invent a time of day. "Thursday at 3:30" became "3:30
 /// p.m." in round 2; only allow a marker when the transcript attaches that
-/// meridiem, or a matching time-of-day cue, to the same time. A cue elsewhere
-/// ("tomorrow morning ... at 3:30") is not evidence for this time.
+/// meridiem, or a matching time-of-day cue, to the same time. A marker on a
+/// range ("10-11 a.m.") needs the same range with the same half of day, since
+/// another meridiem elsewhere in the transcript does not belong to it.
 fn adds_meridiem(cleaned: &str, transcript: &str) -> bool {
     if !has_meridiem(cleaned) {
         return false;
     }
-    let added = cleaned_meridiems(cleaned);
+    let added = meridiem_markers(cleaned);
     if added.is_empty() {
-        // A marker we cannot attach to a clock time is not trustworthy.
+        // A marker we cannot attach to a clock time or range is not trustworthy.
         return true;
     }
     let transcript = time_tokens(transcript);
-    added
-        .iter()
-        .any(|(clock, meridiem)| !transcript_supports(&transcript, *clock, *meridiem))
+    added.iter().any(|(anchor, meridiem)| match anchor {
+        MeridiemAnchor::Time(clock) => !transcript_supports(&transcript, *clock, *meridiem),
+        MeridiemAnchor::Range(start, end) => {
+            !transcript_supports_range(&transcript, *start, *end, *meridiem)
+        }
+    })
 }
 
 /// "Goff reply" became "Gough replied" in round 1: the model invented a person.
@@ -1021,6 +1112,69 @@ mod tests {
         assert!(is_plausible(
             "Call at 3:30PM.",
             "call at 3:30 in the evening"
+        ));
+    }
+
+    #[test]
+    fn accepts_a_faithful_range() {
+        assert!(is_plausible(
+            "The meeting is 10-11am.",
+            "the meeting is 10-11am"
+        ));
+        assert!(is_plausible(
+            "The meeting is 10–11 a.m.",
+            "the meeting is 10-11am"
+        ));
+        assert!(is_plausible(
+            "The meeting is 9:30-10:15 a.m.",
+            "the meeting is 9:30 to 10:15 am"
+        ));
+    }
+
+    #[test]
+    fn normalises_range_separators_and_meridiem_spelling() {
+        assert!(is_plausible(
+            "The meeting is 10 to 11am.",
+            "the meeting is 10–11 am"
+        ));
+        assert!(is_plausible(
+            "The meeting is 10–11 AM.",
+            "the meeting is 10 to 11am"
+        ));
+        assert!(is_plausible(
+            "The meeting is 10 – 11 a.m.",
+            "the meeting is 10-11am"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_range_marker_the_transcript_supports_elsewhere() {
+        // The transcript's "pm" belongs to 3, not to the 10-11 range.
+        assert!(!is_plausible(
+            "The review is 10-11 a.m.",
+            "call at 3pm, the review is 10-11"
+        ));
+        // The transcript's range is the other half of the day.
+        assert!(!is_plausible(
+            "The review is 10-11pm.",
+            "the review is 10-11am"
+        ));
+        assert!(!is_plausible(
+            "The review is 10 to 11 p.m.",
+            "the review is 10–11 a.m."
+        ));
+    }
+
+    #[test]
+    fn checks_unparseable_markers_alongside_parseable_ones() {
+        // 3 p.m. is supported; the unattached range marker is not.
+        assert!(!is_plausible(
+            "Call at 3 p.m. and the review is 10-11 a.m.",
+            "call at 3pm and the review is 10-11"
+        ));
+        assert!(is_plausible(
+            "Call at 3 p.m. and the review is 10-11 a.m.",
+            "call at 3pm and the review is 10-11 am"
         ));
     }
 
