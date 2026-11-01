@@ -316,6 +316,9 @@ export class DotScope {
 
   private raf = 0;
   private last = 0;
+  /** Offscreen layer for the entrance's soft-focus pass (see `draw`). */
+  private layer: HTMLCanvasElement;
+  private layerCtx: CanvasRenderingContext2D;
   private dark = false;
   private reduceMotion = false;
   private media: MediaQueryList;
@@ -327,6 +330,11 @@ export class DotScope {
     const context = canvas.getContext("2d", { alpha: true });
     if (!context) throw new Error("Canvas is unavailable");
     this.ctx = context;
+    const layer = document.createElement("canvas");
+    const layerContext = layer.getContext("2d", { alpha: true });
+    if (!layerContext) throw new Error("Canvas is unavailable");
+    this.layer = layer;
+    this.layerCtx = layerContext;
     this.media = window.matchMedia("(prefers-color-scheme: dark)");
     this.motion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const forced = new URLSearchParams(window.location.search).get("theme");
@@ -341,7 +349,7 @@ export class DotScope {
     this.observer.observe(canvas);
     this.resize();
     this.last = performance.now();
-    this.raf = requestAnimationFrame(this.frame);
+    this.wake();
   }
 
   destroy() {
@@ -354,6 +362,7 @@ export class DotScope {
 
   setLevel(level: number) {
     this.levelInput = clamp(level);
+    if (this.phase === "recording") this.wake();
   }
 
   /** Browser QA: run `seconds` of simulation synchronously and paint once. */
@@ -387,6 +396,7 @@ export class DotScope {
         this.armDone();
       }
     }
+    this.wake();
   }
 
   private reset() {
@@ -690,11 +700,13 @@ export class DotScope {
     const forced = new URLSearchParams(window.location.search).get("theme");
     this.dark = forced ? forced === "dark" : this.media.matches;
     this.settled = false;
+    this.wake();
   };
 
   private onMotion = () => {
     this.reduceMotion = this.motion.matches;
     this.settled = false;
+    this.wake();
   };
 
   private resize = () => {
@@ -707,13 +719,18 @@ export class DotScope {
     const height = Math.round(this.heightPx * this.dpr);
     if (this.canvas.width !== width) this.canvas.width = width;
     if (this.canvas.height !== height) this.canvas.height = height;
+    if (this.layer.width !== width) this.layer.width = width;
+    if (this.layer.height !== height) this.layer.height = height;
     this.settled = false;
+    this.wake();
   };
 
   private frame = (now: number) => {
-    const dt = Math.min(0.05, (now - this.last) / 1000 || 0);
+    this.raf = 0;
+    const dt = Math.max(0, Math.min(0.05, (now - this.last) / 1000 || 0));
     this.last = now;
-    if (!this.settled || this.visible || this.windowVisible()) {
+    const running = !this.settled || this.visible || this.windowVisible();
+    if (running) {
       this.pending += dt;
       while (this.pending >= STEP) {
         this.pending -= STEP;
@@ -724,8 +741,23 @@ export class DotScope {
         this.settled = true;
       }
     }
-    this.raf = requestAnimationFrame(this.frame);
+    if (!this.settled || this.visible || this.windowVisible()) {
+      this.raf = requestAnimationFrame(this.frame);
+    }
   };
+
+  /**
+   * Restarts the loop after it has settled. The bar is hidden most of the
+   * time; leaving a 60 Hz callback running then is pure battery cost. Resetting
+   * `last` keeps the first frame's dt honest instead of clamping a long idle
+   * gap to 50 ms, which would skip the start of the entrance.
+   */
+  private wake() {
+    if (this.raf === 0) {
+      this.last = performance.now();
+      this.raf = requestAnimationFrame(this.frame);
+    }
+  }
 
   private windowVisible() {
     return this.phase === "processing" || this.phase === "done" || this.phase === "error";
@@ -780,8 +812,25 @@ export class DotScope {
     ctx.clip();
 
     const softness = this.softness.value;
-    if (softness > 0.05) {
-      ctx.filter = `blur(${(softness * scale * 0.9).toFixed(2)}px)`;
+    const blurred = softness > 0.05;
+    // Chromium filters every individual canvas draw call when `filter` is
+    // set, so the entrance's hundreds of dot fills would each pay a full
+    // blur pass and the bar drops frames for the first half second. Compose
+    // the soft-focus content once in an offscreen layer and blur that layer
+    // with a single drawImage instead; the result is the same soft field.
+    const paint = blurred ? this.layerCtx : ctx;
+    if (paint !== ctx) {
+      paint.setTransform(1, 0, 0, 1, 0, 0);
+      paint.clearRect(0, 0, this.layer.width, this.layer.height);
+      paint.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      paint.translate(w / 2, h / 2);
+      // Same global alpha as the main canvas: the aggregate then composites
+      // over the plate exactly as the per-dot draws would.
+      paint.globalAlpha = opacity;
+      paint.save();
+      paint.beginPath();
+      paint.roundRect(-halfW, -halfH, halfW * 2, halfH * 2, radius);
+      paint.clip();
     }
 
     // Glow behind the voice.
@@ -792,7 +841,7 @@ export class DotScope {
       const strength = (dark ? 0.19 : 0.3) * 0.55 * Math.min(1, glow);
       // Hex mixes the colour from the voice toward the plate's base and
       // fades the glow linearly to the reach.
-      const gradient = ctx.createRadialGradient(0, 0, 0, 0, 0, reach);
+      const gradient = paint.createRadialGradient(0, 0, 0, 0, 0, reach);
       for (let stop = 0; stop <= 5; stop += 1) {
         const t = stop / 5;
         const color = mix3(middle, colors.base, t);
@@ -803,8 +852,8 @@ export class DotScope {
           )},${strength * (1 - t)})`,
         );
       }
-      ctx.fillStyle = gradient;
-      ctx.fillRect(-halfW, -halfH, halfW * 2, halfH * 2);
+      paint.fillStyle = gradient;
+      paint.fillRect(-halfW, -halfH, halfW * 2, halfH * 2);
     }
 
     const presence = 0.5 + 0.5 * Math.max(this.live, this.cool.value);
@@ -843,20 +892,30 @@ export class DotScope {
         const x = nx * scale;
         const y = ny * scale;
         if (power > 0.05) {
-          ctx.fillStyle = `rgba(${Math.round(color[0] * 255)},${Math.round(
+          paint.fillStyle = `rgba(${Math.round(color[0] * 255)},${Math.round(
             color[1] * 255,
           )},${Math.round(color[2] * 255)},${0.132 * power * power * mask})`;
-          ctx.beginPath();
-          ctx.arc(x, y, dotRadius * 2, 0, Math.PI * 2);
-          ctx.fill();
+          paint.beginPath();
+          paint.arc(x, y, dotRadius * 2, 0, Math.PI * 2);
+          paint.fill();
         }
-        ctx.fillStyle = `rgba(${Math.round(color[0] * 255)},${Math.round(
+        paint.fillStyle = `rgba(${Math.round(color[0] * 255)},${Math.round(
           color[1] * 255,
         )},${Math.round(color[2] * 255)},${alpha * mask})`;
-        ctx.beginPath();
-        ctx.arc(x, y, dotRadius, 0, Math.PI * 2);
-        ctx.fill();
+        paint.beginPath();
+        paint.arc(x, y, dotRadius, 0, Math.PI * 2);
+        paint.fill();
       }
+    }
+
+    if (paint !== ctx) {
+      paint.restore();
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.filter = `blur(${(softness * scale * 0.9).toFixed(2)}px)`;
+      ctx.drawImage(this.layer, -w / 2, -h / 2, w, h);
+      ctx.filter = "none";
+      ctx.restore();
     }
     ctx.restore();
     ctx.restore();
