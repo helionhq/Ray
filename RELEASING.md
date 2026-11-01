@@ -1,14 +1,24 @@
 # Releasing Ray
 
-Releases are automatic. Every merge into `main`:
+Releases are automatic. Every merge into `main` runs two jobs:
 
-1. Bumps the patch version in `package.json`, `src-tauri/tauri.conf.json`,
-   `src-tauri/Cargo.toml`, and `src-tauri/Cargo.lock`
-   (`scripts/bump-version.mjs`).
-2. Commits and pushes that bump with `[skip release]` in the message.
-3. Builds the NSIS installer on `windows-latest`.
-4. Signs the updater bundle and publishes a GitHub Release tagged
-   `v<version>`, including `latest.json`.
+1. **Build** — a read-only job with no signing key and no `GITHUB_TOKEN`.
+   It bumps the patch version in `package.json`,
+   `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and
+   `src-tauri/Cargo.lock` (`scripts/bump-version.mjs`), builds the NSIS
+   installer on `windows-latest`, and checks that the installer exists, is
+   non-empty, has the version in its filename, and that all four version
+   files agree.
+2. **Publish** — the only job with write access. It commits those four
+   version files as `github-actions[bot]` with `[skip release]` in the
+   message, signs the installer with `--app-version` so the signature's
+   trusted comment carries the release version (`requireSignedVersion`),
+   writes `latest.json`, pushes the bump to `main`, and creates the GitHub
+   Release tagged `v<version>`. The tag points at the bump commit, and the
+   bump is pushed only after the build and signing have both succeeded.
+
+Assets on the release are the NSIS installer, its `.sig`, and `latest.json`.
+Publishing uses `gh release` directly; `tauri-action` is no longer involved.
 
 Installed copies of Ray check that release endpoint at launch and every six
 hours, then offer the update in the sidebar. A manual check (and install) is
@@ -29,7 +39,7 @@ Actions → **Release** → **Run workflow**, on `main`, choosing `patch`,
   without credentials. **Making the repo private again will stop updates.**
 - The updater public key is in `src-tauri/tauri.conf.json`.
 - `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` are
-  repository secrets.
+  repository secrets. Only the publish job receives them.
 - The matching private key was generated at `~/.tauri/ray.key`, with its
   password at `~/.tauri/ray.key.password`.
 
@@ -48,4 +58,7 @@ the version they are running.
   `src/lib/updater.ts`), so a dev build cannot replace itself.
 - If `main` ever gains a rule that blocks direct pushes, the version-bump push
   will fail. Give the workflow a fine-grained PAT with `contents: write` for
-  this repository and use it as the checkout token instead.
+  this repository and use it as `GH_TOKEN` in the push and publish steps; the
+  checkout deliberately does not persist credentials.
+- If a release for the tag already exists, the publish step uploads the assets
+  with `--clobber` instead of failing.

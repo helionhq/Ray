@@ -15,11 +15,11 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-permissions:
-  contents: write
-
 jobs:
-  release:
+  # Build in a read-only job with no credentials. Nothing here can write to the
+  # repository, and no signing key or token is exposed to the compiler or to
+  # pnpm scripts.
+  build:
     # A release commit must not start another release. Pushes made with
     # GITHUB_TOKEN do not retrigger workflows; keeping the marker in the
     # message also covers manual runs and a future PAT.
@@ -28,10 +28,15 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       !contains(github.event.head_commit.message, '[skip release]'))
     runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - uses: pnpm/action-setup@v4
         with:
@@ -44,7 +49,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
@@ -57,33 +62,185 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Ray v$VERSION"
 
-      - name: Commit the version bump
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Build without updater artifacts: creating them needs the signing key,
+      # which this job must not have. The publish job signs the installer.
+      - name: Build installer
         shell: bash
+        run: pnpm tauri build -c '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Validate the build
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "Expected exactly one NSIS installer, found ${#installers[@]}." >&2
+            exit 1
+          fi
+          INSTALLER="${installers[0]}"
+          if [ ! -s "$INSTALLER" ]; then
+            echo "Installer $INSTALLER is empty." >&2
+            exit 1
+          fi
+          if [[ "$(basename "$INSTALLER")" != *"$VERSION"* ]]; then
+            echo "Installer name $(basename "$INSTALLER") does not contain version $VERSION." >&2
+            exit 1
+          fi
+          node -e '
+          const fs = require("node:fs");
+          const expected = process.env.VERSION;
+          const found = {
+            "package.json": JSON.parse(fs.readFileSync("package.json", "utf8")).version,
+            "src-tauri/tauri.conf.json": JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).version,
+            "src-tauri/Cargo.toml": /\[package\][\s\S]*?^version = "([^"]+)"/m.exec(fs.readFileSync("src-tauri/Cargo.toml", "utf8"))?.[1],
+            "src-tauri/Cargo.lock": /\[\[package\]\]\r?\nname = "ray"\r?\nversion = "([^"]+)"/.exec(fs.readFileSync("src-tauri/Cargo.lock", "utf8"))?.[1],
+          };
+          for (const [file, version] of Object.entries(found)) {
+            if (version !== expected) {
+              console.error(`${file} is at ${version ?? "an unknown version"}, expected ${expected}.`);
+              process.exit(1);
+            }
+          }
+          console.log(`All version files are at ${expected}.`);
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            package.json
+            src-tauri/tauri.conf.json
+            src-tauri/Cargo.toml
+            src-tauri/Cargo.lock
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+
+  # The only job with write access. It commits the bump without pushing it,
+  # signs the installer, and publishes only after both succeeded.
+  publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: .
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Commit here but do not push: the bump must not land on main unless the
+      # build, the signature, and latest.json all succeed.
+      - name: Commit the version bump
+        id: commit
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-          git commit -m "chore: release v${{ steps.version.outputs.version }} [skip release]"
-          git push origin HEAD:main
+          git commit -m "chore: release v${VERSION} [skip release]"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build and publish
-        uses: tauri-apps/tauri-action@v1
+      # requireSignedVersion means the trusted comment must carry this version,
+      # hence --app-version rather than signing whatever the build emitted.
+      - name: Sign the installer
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: v${{ steps.version.outputs.version }}
-          releaseName: Ray v${{ steps.version.outputs.version }}
-          releaseBody: |
-            Ray ${{ steps.version.outputs.version }} for Windows.
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.build.outputs.version }}"
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "Expected exactly one NSIS installer, found ${#installers[@]}." >&2
+            exit 1
+          fi
+          INSTALLER="${installers[0]}"
+          pnpm tauri signer sign --app-version "$VERSION" "$INSTALLER"
+          if [ ! -s "${INSTALLER}.sig" ]; then
+            echo "Signing did not produce ${INSTALLER}.sig." >&2
+            exit 1
+          fi
 
-            Press Right Alt, speak, press it again. Ray updates itself; run the setup file below for a fresh install.
-          releaseDraft: false
-          prerelease: false
-          uploadUpdaterJson: true
-          updaterJsonPreferNsis: true
+      - name: Write latest.json
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          INSTALLER="${installers[0]}"
+          node scripts/latest-json.mjs "$VERSION" "$INSTALLER" "$GITHUB_REPOSITORY" "v$VERSION" > latest.json
+          cat latest.json
+
+      # Push only after the build, the signature, and latest.json succeeded.
+      # The credential goes on the remote for this one push and is removed
+      # again, even if the push fails.
+      - name: Push the version commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth_remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          public_remote="https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "$auth_remote"
+          trap 'git remote set-url origin "$public_remote"' EXIT
+          git push origin HEAD:main
+          git remote set-url origin "$public_remote"
+          trap - EXIT
+
+      # Tag the bump commit itself, not github.sha (the pre-bump checkout).
+      - name: Publish the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          shopt -s nullglob
+          installers=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          INSTALLER="${installers[0]}"
+          NOTES="Ray ${VERSION} for Windows.
+
+          Press Right Alt, speak, press it again. Ray updates itself; run the setup file below for a fresh install."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              "$INSTALLER" "${INSTALLER}.sig" latest.json
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "${{ steps.commit.outputs.sha }}" \
+              --title "Ray $VERSION" \
+              --notes "$NOTES" \
+              "$INSTALLER" "${INSTALLER}.sig" latest.json
+          fi
