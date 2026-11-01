@@ -5,7 +5,7 @@ Writes 16 kHz mono WAV into research/audio/ and repairs Deepgram's streaming
 WAV header sizes.
 
 Usage: python research/scripts/gen_hard_audio.py [--force]
-       python research/scripts/gen_hard_audio.py --corpus ../corpus/heldout_scripts.json
+       python research/scripts/gen_hard_audio.py --corpus research/corpus/heldout_scripts.json
 """
 from __future__ import annotations
 

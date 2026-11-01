@@ -80,17 +80,22 @@ pre-fix baseline.
 ```bash
 cd research/scripts
 
-# Held-out TTS (~4.6 min audio, ~$0.11 Deepgram). --corpus defaults to hard_scripts.json.
-python gen_hard_audio.py --corpus ../corpus/heldout_scripts.json
+# Held-out TTS (~4.6 min audio, ~$0.11 Deepgram). --corpus defaults to hard_scripts.json;
+# --force regenerates existing WAVs instead of reusing possibly outdated audio.
+python gen_hard_audio.py --corpus ../corpus/heldout_scripts.json --force
 
-# Build, then copy the binary to a private path. Running target/debug/ray.exe directly locks
-# it, which breaks `pnpm tauri dev`; the copy is also the frozen binary behind the numbers.
-# After a prompt edit, rebuild into a separate target dir so the dev binary is untouched:
-#   cd ../src-tauri
-#   CARGO_TARGET_DIR='D:\dev\ray\src-tauri\target\eval-build' cargo build
-#   cp target/eval-build/debug/ray.exe target/eval/ray.exe
+# Build into a separate target dir and copy the binary to a private path. Running
+# target/debug/ray.exe directly locks it, which breaks `pnpm tauri dev`; the copy is also
+# the frozen binary behind the numbers. Paths derive from the checkout, so they work on
+# any machine.
+REPO="$(git rev-parse --show-toplevel)"
+cd ../../src-tauri
+CARGO_TARGET_DIR="$REPO/src-tauri/target/eval-build" cargo build
+mkdir -p target/eval
+cp target/eval-build/debug/ray.exe target/eval/ray.exe
+cd ../research/scripts
 cd ../review
-export RAY_REVIEW_EXE='D:\dev\ray\src-tauri\target\eval\ray.exe'
+export RAY_REVIEW_EXE="$REPO/src-tauri/target/eval/ray.exe"
 python run_app_corpus.py --tag app_v11 --warm
 python run_app_corpus.py --tag hard_v11 --corpus ../corpus/hard_scripts.json --warm
 python run_app_corpus.py --tag heldout_v11 --corpus ../corpus/heldout_scripts.json --warm
