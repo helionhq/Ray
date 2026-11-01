@@ -1303,6 +1303,8 @@ kbd {
   }
 
   .btn-primary:hover {
+    background: var(--ink);
+    color: var(--bg);
     opacity: 0.92;
   }
 

@@ -73,7 +73,7 @@ export function DictionaryPage({ snapshot, refresh, notify }: Props) {
         />
         <button
           type="submit"
-          className="btn-primary"
+          className="btn btn-primary"
           disabled={!term.trim() || busy}
         >
           Add
