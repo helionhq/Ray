@@ -87,7 +87,8 @@ it did not change the acoustic "ClickOne"/"Gough" errors. Keep the full list.
 
 Prompt v3, 29 clips, same raw transcripts. Judge = `gpt-oss-120b` (`reasoning_effort: low`)
 with a rubric that does not penalise required filler removal. Auto = deterministic checks
-(names, fillers, correction cues, list format, similarity).
+(names, fillers, correction cues, list format, similarity). Several prompt examples overlap
+these clips, so they are in-sample scores; see the caveat in §8.4.
 
 | Model | Provider | Judge overall | Fidelity | Names | Format | Safety | p50 | p95 | Cost |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
@@ -128,6 +129,8 @@ V4 keeps names at 10/10 and safety at 10/10 in the hard cases; see §4 for the f
 ---
 
 ## 4. Final numbers (v4 prompt, 29 clips)
+
+These are in-sample for the clips the prompt examples overlap; see the caveat in §8.4.
 
 | Model | Auto score | Judge overall (v3 prompt, n=28) | Fidelity | Names | Format | Safety | p50 | p95 | Max |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -190,9 +193,11 @@ better fallback anyway because it uses the STT key.
 
 ## 6. Spend
 
-AssemblyAI total: **~$0.44** of the $10 budget (46.2 audio-minutes across all STT runs).
-See `research/SPEND.md` for the per-run table. LLM Gateway tokens ~$0.06. Deepgram TTS ~$0.38
-(not AssemblyAI).
+AssemblyAI total: **~$0.91** (~$0.85 STT across 46.2 round-1 + 48.6 round-2 audio-minutes,
+plus ~$0.06 LLM Gateway tokens), well under the $10 budget. The $0.06 gateway figure covers
+round-1 requests only; round-2 app-path/judge calls record no token counts, and the two
+recorded round-2 sweeps add ~$0.03, so the artifact-backed total is at least **~$0.94**.
+Deepgram TTS ~$0.38 (not AssemblyAI). See `research/SPEND.md` for the per-run table.
 
 ---
 
@@ -225,8 +230,11 @@ the gemma output into the HUD token-by-token so perceived latency ≈ TTFT (~1.3
 - **LLM auth:** `Authorization: Bearer <ASSEMBLYAI_API_KEY>` at
   `https://llm-gateway.assemblyai.com/v1/chat/completions`; model id `gemma-4-31b`.
 - **Prompt:** fill `{{DICTIONARY}}`, `{{KNOWN_NAMES}}`, `{{APP_NAME}}`; wrap the transcript
-  as `<transcript>…</transcript>`. Keep `temperature: 0`, `max_tokens: 1500` (the value used by
-  `llm_eval.py` for the scored runs).
+  as `<transcript>…</transcript>`. Keep `temperature: 0`, `max_tokens: 3000` for both
+  providers, as in the app (`src-tauri/config/pipeline.json`) and
+  `research/final/pipeline.json`. `1500` was the historical `llm_eval.py` default used for the
+  scored round-1 runs; it is not enough once a reasoning model spends the budget on the long
+  monologue.
 - Sanitise stray U+FFFD / em-dash characters from the transcript before insertion.
 - The cleanup prompt is deliberately conservative: it does not fix every code dictation
   (`supabase.fromUsers.select(*.eq(id))` stays garbled because ASR dropped tokens). Code
@@ -269,8 +277,9 @@ The STT keyterm list also contained "Qwen", which made AssemblyAI hear "Hey, Cli
 now has an explicit "ClickOne is never Qwen" example. A no-reorder rule keeps pairs such as
 "Grok and Groq" in the speaker's order.
 
-A rejected candidate is skipped; the next provider is tried, and if every provider fails the
-raw transcript is pasted. The user's words are never lost.
+A rejected candidate is skipped and the next provider is tried; if every candidate is
+rejected or every provider fails, cleanup falls back to the raw transcript and pastes it
+unchanged.
 
 **2. Ordinal enumerations.**
 
@@ -299,6 +308,9 @@ misheard names, numbers/times, product names and the 2.7-minute monologue. The o
 29-clip corpus remains the regression set.
 
 ### 8.2 Model sweep
+
+These auto scores are in-sample for the clips that overlap the prompt examples; see the
+caveat in §8.4.
 
 | Model | Provider | Old auto | Hard auto | p50 old/hard | p95 old/hard | Outcome |
 |---|---|---:|---:|---:|---:|---|
@@ -368,6 +380,29 @@ clip through Groq in 3.4 s cold, proving the fallback path itself is healthy.
 
 ### 8.4 Final scores
 
+**In-sample caveat (few-shot overlap).** The cleanup prompt's few-shot examples overlap the
+evaluation corpora, so the scores in this document are in-sample for those clips. The
+overlapping ids are:
+
+- `scripts.json`: `enum-tasks` and `instruction-not-executed` (near-verbatim),
+  `email-with-question` (the "Goff reply" example), `long-technical` (the "cleanup pass ...
+  Groq ... fallback to Vercel" sentence), `slack-casual` (the "ClickOne"/"quick one" example;
+  `hard-restart-topic` also uses "the deploy broke again"), and `long-rambling` (the
+  "onboarding copy needs a pass. It's too wordy" sentence shared with the "Yo, quick one"
+  example). The round-1 v4 prompt also used a near-verbatim `self-correction-word` example
+  ("Send it to Mark, sorry, Mike ... cc ..."), so the round-1 numbers are in-sample for that
+  clip too.
+- `hard_scripts.json`: `hard-tone-preserve` (the "Yo, quick one ... too wordy" example),
+  `hard-self-correction-name` ("Mark, no, wait, Sarah ... cc Arham"), `hard-mixed-corrections`
+  (verbatim), and `hard-email-lines` ("Hi Sarah ... quick update on the Ray launch ..."). The
+  `hard-misheard-names` "Helium" -> "Helion" rule is also a prompt example.
+
+The prompt's number/formatting examples reuse values from `numbers-dates` (`$4,250`,
+`March 3, 2027`, `415-555-0198`), `hard-numbers-times` (`3:30 p.m.`, `12.5%`) and
+`hard-monologue` (`2,400`). The overlap makes those clips in-sample; a held-out corpus is
+needed for generalization numbers and has not yet been run. This note makes no claim about
+whether the overlap explains the scores.
+
 | Corpus | n | Auto | Judge overall | p50 cleanup | p95 cleanup | max |
 |---|---:|---:|---:|---:|---:|---:|
 | Regression, round 1 (v4 prompt) | 29 | 98.1 | 9.40 | 1,776 ms | 2,792 ms | 7,796 ms |
@@ -375,6 +410,10 @@ clip through Groq in 3.4 s cold, proving the fallback path itself is healthy.
 | Hard corpus, round 1 baseline | 18 | 79.7 | — | — | — | — |
 | Hard corpus, round 2 | 18 | 99.1 | 9.89 (n=18) | 781 ms | 1,193 ms | 2,112 ms |
 
+**Ideal corrections (re-run needed).** The `hard-runon-list` and `hard-monologue` ideals in
+`research/corpus/hard_scripts.json` were corrected after the runs above so they no longer
+reorder or drop the speaker's words. The hard-corpus auto scores in this table were computed
+against the old ideals and should be re-run before being cited.
 
 Judge note: round 1 used `openai/gpt-oss-120b` on Groq (9.40 overall). The round-2 judge is
 `qwen3.5-4b-32k-fast` on the AssemblyAI gateway because the Groq free tier hit its daily token

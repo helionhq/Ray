@@ -57,7 +57,7 @@ def call(model: str, system: str, user: str) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 obj = json.loads(r.read())
-            return obj["choices"][0]["message"]["content"]
+            return obj["choices"][0]["message"]["content"] or ""
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < 5:
                 time.sleep(8 * (attempt + 1)); continue
@@ -110,6 +110,8 @@ def main() -> None:
             if ids and sid not in ids:
                 continue
             if not r.get("ok"):
+                continue
+            if sid not in scripts:
                 continue
             s = scripts[sid]
             user = (f"<transcript>\n{r['transcript']}\n</transcript>\n\n"

@@ -39,10 +39,15 @@ def load_prompt() -> str:
         "TypeScript", "GitHub", "Slack", "Deepgram", "AssemblyAI", "Typeless",
         "Rust", "pnpm",
     ]
+    # Match the app: reference data is JSON (serde_json has no spaces after
+    # separators) so it can never break out of its literal.
+    def dumps(value) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
     return (
-        text.replace("{{DICTIONARY}}", ", ".join(dictionary))
-        .replace("{{KNOWN_NAMES}}", ", ".join(known))
-        .replace("{{APP_NAME}}", "(unknown)")
+        text.replace("{{DICTIONARY}}", dumps(dictionary))
+        .replace("{{KNOWN_NAMES}}", dumps(known))
+        .replace("{{APP_NAME}}", dumps("(unknown)"))
     )
 
 

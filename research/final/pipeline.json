@@ -109,9 +109,9 @@
     "request": {
       "system_prompt_file": "research/final/cleanup_system_prompt.md",
       "placeholders": {
-        "{{DICTIONARY}}": "comma-separated user dictionary terms",
-        "{{KNOWN_NAMES}}": "comma-separated built-in product/company list",
-        "{{APP_NAME}}": "foreground app/process name or 'unknown'"
+        "{{DICTIONARY}}": "JSON array of user dictionary terms",
+        "{{KNOWN_NAMES}}": "JSON array of built-in product/company names",
+        "{{APP_NAME}}": "JSON string of the foreground app/process name or 'unknown'"
       },
       "user_message_template": "<transcript>\n{{TRANSCRIPT}}\n</transcript>",
       "temperature": 0,

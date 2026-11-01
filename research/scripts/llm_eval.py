@@ -32,9 +32,18 @@ def load_prompt() -> str:
     # Drop the markdown title line; keep everything else.
     text = re.sub(r"^#.*\n", "", text).strip()
     data = corpus()
-    names = ", ".join(data["dictionary"])
-    known = ", ".join(data["builtin_names"])
-    return text.replace("{{DICTIONARY}}", names).replace("{{KNOWN_NAMES}}", known).replace("{{APP_NAME}}", "(unknown)")
+    # Match the app: reference data is JSON (serde_json has no spaces after
+    # separators) so it can never break out of its literal.
+    def dumps(value) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    names = dumps(data["dictionary"])
+    known = dumps(data["builtin_names"])
+    return (
+        text.replace("{{DICTIONARY}}", names)
+        .replace("{{KNOWN_NAMES}}", known)
+        .replace("{{APP_NAME}}", dumps("(unknown)"))
+    )
 
 
 def stream_chat(base: str, key: str, model: str, system: str, user: str, temperature: float = 0.0, retries: int = 0, reasoning: str | None = None) -> dict:

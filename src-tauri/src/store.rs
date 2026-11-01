@@ -83,7 +83,10 @@ impl Store {
     }
 
     fn normalize(&self) {
-        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         data.history
             .sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
         data.history.truncate(MAX_HISTORY);
@@ -108,20 +111,35 @@ impl Store {
     }
 
     pub fn snapshot(&self) -> StoreData {
-        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn settings(&self) -> Settings {
-        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).settings.clone()
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .settings
+            .clone()
     }
 
     pub fn dictionary(&self) -> Vec<String> {
-        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).dictionary.clone()
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dictionary
+            .clone()
     }
 
     pub fn update_settings(&self, settings: Settings) -> Result<Settings, String> {
-        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        data.settings = Settings {
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        candidate.settings = Settings {
             launch_at_login: settings.launch_at_login,
             input_device: settings
                 .input_device
@@ -131,27 +149,46 @@ impl Store {
             streaming_enabled: settings.streaming_enabled,
             keep_raw: settings.keep_raw,
         };
-        self.persist(&data)?;
+        self.persist(&candidate)?;
+        *data = candidate;
         Ok(data.settings.clone())
     }
 
     pub fn add_history(&self, entry: HistoryEntry) -> Result<(), String> {
-        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        data.history.insert(0, entry);
-        data.history.truncate(MAX_HISTORY);
-        self.persist(&data)
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        candidate.history.insert(0, entry);
+        candidate.history.truncate(MAX_HISTORY);
+        self.persist(&candidate)?;
+        *data = candidate;
+        Ok(())
     }
 
     pub fn delete_history(&self, id: &str) -> Result<(), String> {
-        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        data.history.retain(|entry| entry.id != id);
-        self.persist(&data)
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        candidate.history.retain(|entry| entry.id != id);
+        self.persist(&candidate)?;
+        *data = candidate;
+        Ok(())
     }
 
     pub fn clear_history(&self) -> Result<(), String> {
-        let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        data.history.clear();
-        self.persist(&data)
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        candidate.history.clear();
+        self.persist(&candidate)?;
+        *data = candidate;
+        Ok(())
     }
 
     pub fn add_dictionary(&self, term: &str) -> Result<Vec<String>, String> {
@@ -162,38 +199,55 @@ impl Store {
         if term.chars().count() > 80 {
             return Err("Keep dictionary terms under 80 characters".into());
         }
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !data
+            .dictionary
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case(term))
         {
-            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !data
-                .dictionary
-                .iter()
-                .any(|word| word.eq_ignore_ascii_case(term))
-            {
-                if data.dictionary.len() >= MAX_DICTIONARY {
-                    return Err("The dictionary is full".into());
-                }
-                data.dictionary.push(term.to_string());
-                self.persist(&data)?;
+            if data.dictionary.len() >= MAX_DICTIONARY {
+                return Err("The dictionary is full".into());
             }
+            let mut candidate = data.clone();
+            candidate.dictionary.push(term.to_string());
+            self.persist(&candidate)?;
+            *data = candidate;
         }
-        Ok(self.dictionary())
+        Ok(data.dictionary.clone())
     }
 
     pub fn remove_dictionary(&self, term: &str) -> Result<Vec<String>, String> {
-        {
-            let mut data = self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.dictionary
-                .retain(|word| !word.eq_ignore_ascii_case(term));
-            self.persist(&data)?;
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        let before = candidate.dictionary.len();
+        candidate
+            .dictionary
+            .retain(|word| !word.eq_ignore_ascii_case(term));
+        // Nothing matched: leave both memory and disk alone.
+        if candidate.dictionary.len() != before {
+            self.persist(&candidate)?;
+            *data = candidate;
         }
-        Ok(self.dictionary())
+        Ok(data.dictionary.clone())
     }
 
     /// STT keyterms: trimmed, de-duplicated, capped.
     pub fn keyterms(&self, limit: usize) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut terms = Vec::new();
-        for term in self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).dictionary.iter() {
+        for term in self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .dictionary
+            .iter()
+        {
             let term = term.trim();
             if term.is_empty() || term.chars().count() > 50 {
                 continue;
@@ -233,6 +287,43 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         Store::load(&dir)
+    }
+
+    #[test]
+    fn failed_persist_leaves_memory_and_disk_state_unchanged() {
+        // The store's parent path is an existing *file*, so create_dir_all /
+        // write always fail. A mutation must not reach memory when the write
+        // did not happen.
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"blocker").unwrap();
+        let store = Store::load(&blocker);
+
+        let entry = HistoryEntry {
+            id: "a".into(),
+            created_at: 1,
+            text: "text".into(),
+            raw: None,
+            app: None,
+            duration_ms: 10,
+        };
+        assert!(store.add_history(entry).is_err());
+        assert!(store.snapshot().history.is_empty());
+
+        let settings = Settings {
+            launch_at_login: true,
+            ..Settings::default()
+        };
+        assert!(store.update_settings(settings).is_err());
+        assert!(!store.settings().launch_at_login);
+
+        assert!(store.add_dictionary("Helion").is_err());
+        assert!(store.dictionary().is_empty());
+        assert!(store.delete_history("a").is_err());
+        assert!(store.clear_history().is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -39,4 +39,10 @@ Deepgram TTS: ~12.7k characters generated (two full corpus passes) ≈ **$0.38**
 | round-2 final suite | sync live + sync batch | 32.71 | 0.2726 | old + hard final, warm repeats, fallback probe, adversarial extras, rollover |
 
 **Round 2 STT subtotal: ~48.6 audio-minutes, ~$0.405.** Round 1 STT was ~$0.44, so total
-AssemblyAI STT is **~$0.85** (~$0.11 more for LLM Gateway tokens), well under the $10 cap.
+AssemblyAI STT is **~$0.85**. Adding the **~$0.06** LLM Gateway estimate gives **~$0.91
+overall**, well under the $10 cap. The $0.06 covers round-1 requests only: the app path and
+the judge do not record token usage, so full round-2 gateway spend cannot be reconstructed
+from the artifacts. The two round-2 sweeps that do record usage (119.6k input / 2.3k output
+on gemma-4-31b; 119.1k / 2.1k on qwen3.5-4b-32k-fast) add **~$0.03** at list rates, so the
+artifact-backed total is at least **~$0.94** before unrecorded round-2 calls. Deepgram TTS
+(~$0.38) is separate and not AssemblyAI.

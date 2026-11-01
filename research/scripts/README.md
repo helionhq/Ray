@@ -34,21 +34,29 @@ run-on lists, an email, spoken formatting commands, numbers/times and a 2-3 minu
 ```bash
 cd research/scripts
 
-# Hard-corpus TTS (~3.5 min audio, ~$0.11 Deepgram), then the real app path
+# Hard-corpus TTS (~3.5 min audio, ~$0.11 Deepgram), then the real app path.
+# run_app_corpus.py defaults to corpus/scripts.json and writes out/stt/<tag>.json +
+# out/llm/<tag>.json, so the regression corpus needs no --corpus flag.
 python gen_hard_audio.py
 cd ../review
+python run_app_corpus.py --tag app_v7 --warm
 python run_app_corpus.py --tag hard_v7 --corpus ../corpus/hard_scripts.json --warm
 
-# Side-by-side model sweep on old + hard (non-streaming, paced for free tiers)
+# Side-by-side model sweep on old + hard (non-streaming, paced for free tiers).
+# Both transcript sources are explicit: app_v7.json (old) and hard_v7.json (hard).
 cd ../scripts
-python sweep.py --provider aai  --tag v7 --models gemma-4-31b,qwen3.5-4b-32k-fast --sleep 2.2
-python sweep.py --provider groq --tag v7 --models openai/gpt-oss-120b --split hard --sleep 20
+python sweep.py --provider aai  --tag v7 --models gemma-4-31b,qwen3.5-4b-32k-fast \
+  --old-source app_v7.json --hard-source hard_v7.json --sleep 2.2
+python sweep.py --provider groq --tag v7 --models openai/gpt-oss-120b --split hard \
+  --old-source app_v7.json --hard-source hard_v7.json --sleep 20
 python sweep.py --provider groq --tag v7 --models openai/gpt-oss-20b --split old \
+  --old-source app_v7.json --hard-source hard_v7.json \
   --ids long-rambling,long-technical,names-tech,heavy-disfluency,run-on,self-correction-date,self-correction-word,false-start,enum-tasks,numbers-dates,email-with-question,code-ish --sleep 20
 
-# Score / judge / inspect (score.py understands require/forbid and email formatting)
-python score.py --tags v7__gemma-4-31b --corpus ../corpus/hard_scripts.json --source hard_merged.json
-python judge.py --tags v7__gemma-4-31b --corpus ../corpus/hard_scripts.json --source hard_merged --sleep 3
+# Score / judge / inspect (score.py understands require/forbid, email and format checks).
+# score.py resolves --source by filename under out/stt/; judge.py takes the tag without .json.
+python score.py --tags v7__gemma-4-31b --corpus ../corpus/hard_scripts.json --source ../out/stt/hard_v7.json
+python judge.py --tags v7__gemma-4-31b --corpus ../corpus/hard_scripts.json --source hard_v7 --sleep 3
 ```
 
 `run_app_corpus.py --warm` simulates the app pre-warming the gateway during recording;
