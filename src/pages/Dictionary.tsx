@@ -65,7 +65,7 @@ export function DictionaryPage({ snapshot, refresh, notify }: Props) {
           ref={input}
           value={term}
           onChange={(event) => setTerm(event.target.value)}
-          placeholder="Add a name, product, or term — e.g. Helion HQ"
+          placeholder="Add a name, product, or term, e.g. Helion HQ"
           aria-label="Add a dictionary term"
           spellCheck={false}
           autoComplete="off"

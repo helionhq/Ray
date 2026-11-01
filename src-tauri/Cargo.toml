@@ -1,7 +1,7 @@
 [package]
 name = "ray"
 version = "0.1.0"
-description = "Ray — fast, clean dictation for Windows"
+description = "Ray: fast, clean dictation for Windows"
 authors = ["Helion"]
 edition = "2021"
 rust-version = "1.77"

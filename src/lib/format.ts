@@ -28,7 +28,7 @@ export function isoOf(timestamp: number): string | undefined {
 
 export function timeOf(timestamp: number): string {
   const date = safeDate(timestamp);
-  return date ? timeFormat.format(date) : "—";
+  return date ? timeFormat.format(date) : "Unknown time";
 }
 
 export function dayKey(timestamp: number): string {

@@ -130,7 +130,7 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open, &dictate, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("ray-tray")
-        .tooltip("Ray — Right Alt to dictate")
+        .tooltip("Ray · Right Alt to dictate")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
