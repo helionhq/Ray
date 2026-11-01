@@ -56,6 +56,12 @@ pub struct Dictation {
     /// pipeline is free to read them; they must not start a new dictation.
     processing_window: std::sync::Mutex<(Option<Instant>, Option<Instant>)>,
     pending_note: std::sync::Mutex<Option<String>>,
+    /// The most recent transcript that History could not save. Kept in memory
+    /// (and on the clipboard) so a disk failure never loses the dictation.
+    unsaved_text: std::sync::Mutex<Option<String>>,
+    /// Messages waiting for the main window to be opened. The window normally
+    /// lives in the tray, and a toast fired while it is hidden expires unseen.
+    buffered_notices: std::sync::Mutex<Vec<String>>,
     bar_payload: std::sync::Mutex<serde_json::Value>,
 }
 
@@ -80,6 +86,8 @@ impl Dictation {
             processing: AtomicBool::new(false),
             processing_window: std::sync::Mutex::new((None, None)),
             pending_note: std::sync::Mutex::new(None),
+            unsaved_text: std::sync::Mutex::new(None),
+            buffered_notices: std::sync::Mutex::new(Vec::new()),
             bar_payload: std::sync::Mutex::new(json!({ "phase": "hidden" })),
         })
     }
@@ -457,7 +465,10 @@ impl Dictation {
                 let http = self.http.clone();
                 let stt_config = pipeline.stt.clone();
                 let terms = keyterms.clone();
-                let timeout = Duration::from_millis(pipeline.stt.batch.timeout_ms + 15_000);
+                // Let Sync batch and the v2 upload/poll fallback each reach their
+                // own deadline; the margin only guards against a hung task.
+                let timeout = stt::batch_time_budget(&pipeline.stt)
+                    .saturating_add(Duration::from_secs(15));
                 match tokio::time::timeout(
                     timeout,
                     stt::transcribe_wav(&http, &api_key, &terms, wav, &stt_config),
@@ -546,9 +557,20 @@ impl Dictation {
             app: target.as_ref().and_then(|target| target.app.clone()),
             duration_ms,
         };
-        if let Err(error) = self.store.add_history(entry) {
-            eprintln!("[ray] could not save history: {error}");
-        }
+        let history_saved = match self.store.add_history(entry) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("[ray] could not save history: {error}");
+                // The store leaves the entry out of memory when the write
+                // fails, so hold a recovery copy and keep the transcript on
+                // the clipboard (see `keep_on_clipboard` below).
+                *self
+                    .unsaved_text
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(text.clone());
+                false
+            }
+        };
         let _ = self.app.emit_to("main", "state-changed", ());
         if let Some(note) = note {
             eprintln!("[ray] {note}");
@@ -556,7 +578,11 @@ impl Dictation {
 
         let pasted = {
             let text = text.clone();
-            tokio::task::spawn_blocking(move || paste::paste_text(&text)).await
+            let target = target.as_ref().map(|target| target.hwnd);
+            // Without History, the clipboard is the only durable copy left.
+            let keep_on_clipboard = !history_saved;
+            tokio::task::spawn_blocking(move || paste::paste_text(&text, target, keep_on_clipboard))
+                .await
         };
         match pasted {
             Ok(Ok(outcome)) => {
@@ -566,29 +592,59 @@ impl Dictation {
                             .into(),
                     );
                 }
-            }
-            Ok(Err(error)) => {
-                match paste::copy_text(&text) {
-                    Ok(()) => notes.push(format!(
-                        "Couldn't paste automatically ({error}). The text is copied to your clipboard and saved in History."
-                    )),
-                    Err(copy_error) => notes.push(format!(
-                        "Couldn't paste ({error}) or copy the text ({copy_error}). It is saved in History."
-                    )),
+                if !history_saved {
+                    notes.push(
+                        "This dictation couldn't be saved to History. The text is on your clipboard."
+                            .into(),
+                    );
                 }
             }
-            Err(error) => {
-                notes.push(format!(
-                    "The paste task failed ({error}). The text is saved in History."
-                ));
-            }
+            Ok(Err(error)) => match paste::copy_text(&text) {
+                Ok(()) if history_saved => notes.push(format!(
+                    "Couldn't paste automatically ({error}). The text is copied to your clipboard and saved in History."
+                )),
+                Ok(()) => notes.push(format!(
+                    "Couldn't paste automatically ({error}). The text is copied to your clipboard; History couldn't save it either."
+                )),
+                Err(copy_error) if history_saved => notes.push(format!(
+                    "Couldn't paste ({error}) or copy the text ({copy_error}). It is saved in History."
+                )),
+                Err(copy_error) => notes.push(format!(
+                    "Couldn't paste ({error}) or copy the text ({copy_error}). History couldn't save it either; the transcript is kept until Ray quits."
+                )),
+            },
+            Err(error) => match paste::copy_text(&text) {
+                Ok(()) if history_saved => notes.push(format!(
+                    "The paste task failed ({error}). The text is copied to your clipboard and saved in History."
+                )),
+                Ok(()) => notes.push(format!(
+                    "The paste task failed ({error}). The text is copied to your clipboard; History couldn't save it either."
+                )),
+                Err(copy_error) if history_saved => notes.push(format!(
+                    "The paste task failed ({error}) and the text couldn't be copied ({copy_error}). It is saved in History."
+                )),
+                Err(copy_error) => notes.push(format!(
+                    "The paste task failed ({error}) and the text couldn't be copied ({copy_error}). History couldn't save it either; the transcript is kept until Ray quits."
+                )),
+            },
         }
+        let warned = !notes.is_empty();
+        let warning = notes.join(" ");
         for note in notes {
             self.notify_main(note);
         }
 
-        self.emit_bar(json!({ "phase": "done" }));
-        tokio::time::sleep(Duration::from_millis(520)).await;
+        if warned {
+            // Reuse the bar's existing error look so a failed paste, a mic
+            // problem, or a lost History save is visible even when the main
+            // window is in the tray. The explanation is buffered by
+            // `notify_main` until that window is opened.
+            self.emit_bar(json!({ "phase": "error", "message": warning }));
+            tokio::time::sleep(Duration::from_millis(1_600)).await;
+        } else {
+            self.emit_bar(json!({ "phase": "done" }));
+            tokio::time::sleep(Duration::from_millis(520)).await;
+        }
         self.hide_bar();
     }
 
@@ -641,7 +697,49 @@ impl Dictation {
 
     fn notify_main(&self, message: String) {
         eprintln!("[ray] {message}");
-        let _ = self.app.emit_to("main", "notice", message);
+        if main_window_visible(&self.app) {
+            let _ = self.app.emit_to("main", "notice", message);
+            return;
+        }
+        // The main window normally sits hidden in the tray, where an emitted
+        // toast runs its timer unseen. Keep the recent messages (one stop can
+        // produce several); the window's focus event calls `deliver_notice`
+        // once it is actually on screen.
+        let mut buffered = self
+            .buffered_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if buffered.last() != Some(&message) {
+            buffered.push(message);
+        }
+        let excess = buffered.len().saturating_sub(MAX_BUFFERED_NOTICES);
+        buffered.drain(..excess);
+    }
+
+    /// Shows the notices that arrived while the main window was hidden, as
+    /// one toast. Called from the main window's focus handler.
+    pub fn deliver_notice(&self) {
+        if !main_window_visible(&self.app) {
+            return;
+        }
+        let messages = std::mem::take(
+            &mut *self
+                .buffered_notices
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        if !messages.is_empty() {
+            let _ = self.app.emit_to("main", "notice", messages.join(" "));
+        }
+    }
+
+    /// The last transcript whose History write failed, if any. Exposed so it
+    /// can be copied even when neither History nor the clipboard has it.
+    pub fn unsaved_text(&self) -> Option<String> {
+        self.unsaved_text
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     pub fn bar_payload(&self) -> serde_json::Value {
@@ -689,6 +787,18 @@ impl Dictation {
             }
         }
     }
+}
+
+/// Older notices are dropped beyond this; the newest explain the current state.
+const MAX_BUFFERED_NOTICES: usize = 4;
+
+/// True when the main window is on screen rather than hidden in the tray or
+/// minimized. A toast shown while minimized also expires before the user can
+/// see it, so both count as "not visible".
+fn main_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("main").is_some_and(|window| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+    })
 }
 
 /// Clears the processing flag and closes the stale-press window on every exit

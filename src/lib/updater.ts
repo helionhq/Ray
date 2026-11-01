@@ -59,8 +59,13 @@ export function useUpdater(): Updater {
 
   const checkNow = useCallback(async (): Promise<UpdateCheck> => {
     if (!updatesSupported()) return { status: "unavailable" };
-    if (updateRef.current) {
-      return { status: "available", version: updateRef.current.version };
+    // An install owns the cached update until it finishes; replacing it then
+    // would make a retry install something other than what the UI shows.
+    if (busyRef.current) {
+      const current = updateRef.current;
+      return current
+        ? { status: "available", version: current.version }
+        : { status: "current" };
     }
     // Share one in-flight request between the automatic timer, the focus
     // check, and the Settings button instead of asking GitHub twice.
@@ -72,13 +77,37 @@ export function useUpdater(): Updater {
     const pending = (async (): Promise<UpdateCheck> => {
       try {
         const update = await check({ timeout: CHECK_TIMEOUT_MS });
-        if (!update) return { status: "current" };
+        // An install may have started while the feed was being queried. It
+        // already captured the previous update, so keep that one on screen
+        // and release the answer we no longer need.
+        if (busyRef.current) {
+          if (update) void update.close().catch(() => {});
+          const current = updateRef.current;
+          return current
+            ? { status: "available", version: current.version }
+            : { status: "current" };
+        }
+        // A tray app can run for days, so every completed check replaces the
+        // cached answer (or clears it) instead of holding the first one.
+        const previous = updateRef.current;
         updateRef.current = update;
-        setState((current) => ({ ...current, version: update.version }));
-        return { status: "available", version: update.version };
+        if (previous && previous !== update) {
+          void previous.close().catch(() => {});
+        }
+        setState((current) => ({
+          ...current,
+          version: update?.version ?? null,
+          // A successful check supersedes a stale install failure; the card
+          // then offers the fresh update (or nothing) instead of "Retry".
+          error: null,
+        }));
+        return update
+          ? { status: "available", version: update.version }
+          : { status: "current" };
       } catch (error) {
         // Offline, rate-limited, or no release published yet. The caller
         // decides whether to surface this; the automatic pass stays quiet.
+        // Keep any cached update: a failed check is not proof it is gone.
         console.warn("[updater] check failed", error);
         return { status: "error", message: String(error) };
       } finally {

@@ -468,7 +468,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
           <div className="select">
             <select
               value={selectedDevice ?? ""}
-              disabled={busy === "mic"}
+              disabled={busy !== null}
               onChange={(event) =>
                 void update(
                   { input_device: event.target.value || null },

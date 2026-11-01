@@ -75,24 +75,89 @@ pub struct StoreData {
 pub struct Store {
     path: PathBuf,
     data: Mutex<StoreData>,
+    /// Set when the existing store could not be read and could not be
+    /// preserved. `persist` refuses to write until the file is dealt with, so
+    /// a failed load can never overwrite history or the dictionary.
+    load_error: Option<String>,
+    /// Non-fatal load note the UI can surface, e.g. a corrupt store that was
+    /// preserved as a backup before new writes were allowed.
+    #[allow(dead_code)] // Exposed for the frontend; no caller yet.
+    load_warning: Option<String>,
 }
 
 impl Store {
     pub fn load(app_data: &Path) -> Self {
         let path = app_data.join(FILE_NAME);
+        let mut load_error = None;
+        let mut load_warning = None;
         let data = match fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str::<StoreData>(&text).unwrap_or_else(|error| {
-                eprintln!("[ray] could not parse {}: {error}", path.display());
+            Ok(text) => match serde_json::from_str::<StoreData>(&text) {
+                Ok(data) => data,
+                Err(error) => {
+                    // Keep the unreadable bytes before anything can replace
+                    // them. If the copy fails, writes stay blocked instead.
+                    eprintln!("[ray] could not parse {}: {error}", path.display());
+                    match back_up_unreadable(&path) {
+                        Ok(backup) => {
+                            let note = format!(
+                                "Local state could not be parsed; the original was preserved at {}",
+                                backup.display()
+                            );
+                            eprintln!("[ray] {note}");
+                            load_warning = Some(note);
+                        }
+                        Err(backup_error) => {
+                            let message = format!(
+                                "Local state could not be parsed ({error}) and could not be \
+                                 backed up ({backup_error}); refusing to overwrite {}",
+                                path.display()
+                            );
+                            eprintln!("[ray] {message}");
+                            load_error = Some(message);
+                        }
+                    }
+                    StoreData::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // First run: there is nothing to load or preserve.
                 StoreData::default()
-            }),
-            Err(_) => StoreData::default(),
+            }
+            Err(error) => {
+                // The file exists but could not be read. Do not replace it
+                // with defaults, since that would destroy the user's state.
+                let message = format!(
+                    "Local state could not be read ({}: {error}); refusing to overwrite it",
+                    path.display()
+                );
+                eprintln!("[ray] {message}");
+                load_error = Some(message);
+                StoreData::default()
+            }
         };
         let store = Self {
             path,
             data: Mutex::new(data),
+            load_error,
+            load_warning,
         };
         store.normalize();
         store
+    }
+
+    /// Why the store is refusing all writes, if it is. A non-`None` value
+    /// means the on-disk file could not be loaded or preserved and every
+    /// mutation will return this message without touching the file.
+    #[allow(dead_code)] // Exposed for the frontend; no caller yet.
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
+    /// A non-fatal note from `load`, such as a corrupt store that was backed
+    /// up. The UI can show this to explain why history looks empty.
+    #[allow(dead_code)] // Exposed for the frontend; no caller yet.
+    pub fn load_warning(&self) -> Option<&str> {
+        self.load_warning.as_deref()
     }
 
     fn normalize(&self) {
@@ -113,6 +178,9 @@ impl Store {
     }
 
     fn persist(&self, data: &StoreData) -> Result<(), String> {
+        if let Some(error) = &self.load_error {
+            return Err(error.clone());
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("Create app data dir: {error}"))?;
         }
@@ -278,6 +346,20 @@ impl Store {
     }
 }
 
+/// Copy a store that failed to parse next to the original, so the first new
+/// write cannot destroy it, and return where it was preserved.
+fn back_up_unreadable(path: &Path) -> Result<PathBuf, String> {
+    let millis = now_millis();
+    let mut backup = path.with_file_name(format!("{FILE_NAME}.corrupt-{millis}"));
+    let mut suffix = 1;
+    while backup.exists() {
+        backup = path.with_file_name(format!("{FILE_NAME}.corrupt-{millis}-{suffix}"));
+        suffix += 1;
+    }
+    fs::copy(path, &backup).map_err(|error| error.to_string())?;
+    Ok(backup)
+}
+
 pub fn new_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -377,6 +459,92 @@ mod tests {
         assert!(store.dictionary().is_empty());
         assert!(store.delete_history("a").is_err());
         assert!(store.clear_history().is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_store_loads_defaults_and_allows_writes() {
+        let store = temp_store();
+        assert!(store.load_error().is_none());
+        assert!(store.load_warning().is_none());
+        store.add_dictionary("Helion").unwrap();
+        assert_eq!(store.dictionary(), vec!["Helion".to_string()]);
+    }
+
+    #[test]
+    fn a_corrupt_store_is_backed_up_before_writes_replace_it() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Truncated JSON: the read succeeds but parsing does not.
+        let original = r#"{"history":[{"id":"keep-me","created_at":1,"text":"old","dictionary":["Helion"#;
+        std::fs::write(dir.join(FILE_NAME), original).unwrap();
+
+        let store = Store::load(&dir);
+        assert!(store.load_error().is_none());
+        let warning = store
+            .load_warning()
+            .expect("a corrupt store should be reported");
+        assert!(warning.contains("preserved"), "warning was: {warning}");
+
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("ray.json.corrupt-"))
+            })
+            .expect("the unreadable store was copied aside");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+
+        // The original is safe, so new writes may proceed.
+        store.add_dictionary("Kubernetes").unwrap();
+        assert_eq!(store.dictionary(), vec!["Kubernetes".to_string()]);
+        let saved: StoreData =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(saved.dictionary, vec!["Kubernetes".to_string()]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_store_blocks_writes_and_is_left_in_place() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory cannot be read as a file (and is not NotFound), which
+        // simulates a store that exists but cannot be loaded.
+        let path = dir.join(FILE_NAME);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep").unwrap();
+
+        let store = Store::load(&dir);
+        let error = store
+            .load_error()
+            .expect("an unreadable store must block writes");
+        assert!(
+            error.contains("refusing to overwrite"),
+            "error was: {error}"
+        );
+        assert!(store.load_warning().is_none());
+
+        let entry = HistoryEntry {
+            id: "a".into(),
+            created_at: 1,
+            text: "text".into(),
+            raw: None,
+            app: None,
+            duration_ms: 10,
+        };
+        assert!(store.add_history(entry).is_err());
+        assert!(store.add_dictionary("Helion").is_err());
+        assert!(store.update_settings(Settings::default()).is_err());
+
+        // The unreadable original and its contents are untouched.
+        assert!(path.is_dir());
+        assert!(path.join("sentinel").exists());
+        assert!(!dir.join("ray.json.tmp").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }

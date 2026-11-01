@@ -7,6 +7,13 @@
 //! replayed with Right Alt down, so AltGr characters and Alt+Tab behave
 //! normally instead of arriving as bare keys.
 //!
+//! While recording, a Right Alt press only *defers* the stop until the key is
+//! released without a chord. The receiver handles events one at a time and a
+//! stop-and-paste takes seconds, so a Toggle sent on the press would be
+//! awaited before the chord's Cancel was even read; the recording would be
+//! pasted rather than cancelled. A press while idle still starts immediately,
+//! because latency matters there and Cancel-after-start already works.
+//!
 //! Nothing is ever injected from inside the hook itself: a slow callback
 //! makes Windows silently remove a low-level hook. Replays go through a
 //! dedicated worker thread. A thread timer re-installs the hook every few
@@ -36,7 +43,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Clone, Copy, Debug)]
 pub enum HotkeyEvent {
     /// `at` lets the pipeline drop presses that arrived while it was still
-    /// finishing the previous dictation.
+    /// finishing the previous dictation. For a stop deferred to the Right Alt
+    /// release this is the release time, so a recording ended during the hold
+    /// counts as stale rather than starting a new one.
     Toggle(Instant),
     Cancel,
 }
@@ -53,6 +62,9 @@ static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
 static HOOK_JOIN: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static ALT_CHORD: AtomicBool = AtomicBool::new(false);
+/// A recording was in progress when Right Alt went down, so the stop waits for
+/// the release: a chord key arriving first cancels instead.
+static PENDING_STOP: AtomicBool = AtomicBool::new(false);
 /// A key that was swallowed without a replay (Escape during a held Right Alt);
 /// its release is swallowed too.
 static SWALLOW_VK: AtomicU32 = AtomicU32::new(0);
@@ -205,6 +217,11 @@ unsafe fn hook_thread(ready_tx: mpsc::Sender<Result<(), String>>) {
             ALT_DOWN.store(false, Ordering::SeqCst);
             ALT_CHORD.store(false, Ordering::SeqCst);
             SWALLOW_VK.store(0, Ordering::SeqCst);
+            // The matching release can no longer be recognised, so a deferred
+            // stop is dropped rather than fired: firing here would stop and
+            // paste a recording while the user still holds the key, possibly
+            // mid-chord.
+            PENDING_STOP.store(false, Ordering::SeqCst);
             send_replay(Replay::MenuUp);
             match unsafe { install_hook() } {
                 Ok(next) => {
@@ -243,14 +260,34 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             }
             ALT_CHORD.store(false, Ordering::SeqCst);
             SWALLOW_VK.store(0, Ordering::SeqCst);
-            send(HotkeyEvent::Toggle(Instant::now()));
+            if CAPTURING.load(Ordering::SeqCst) {
+                // Recording: wait for the release. A chord key that follows
+                // cancels the dictation, and no stop is ever sent, so the
+                // receiver never starts a stop-and-paste it would finish
+                // before reading that Cancel.
+                PENDING_STOP.store(true, Ordering::SeqCst);
+            } else {
+                // Idle: start on the press. Cancel-after-start already works
+                // here because the receiver runs the queued Cancel once the
+                // (fast) start has finished.
+                PENDING_STOP.store(false, Ordering::SeqCst);
+                send(HotkeyEvent::Toggle(Instant::now()));
+            }
             return LRESULT(1);
         }
         if up {
             let chord = ALT_CHORD.swap(false, Ordering::SeqCst);
+            let pending = PENDING_STOP.swap(false, Ordering::SeqCst);
             ALT_DOWN.store(false, Ordering::SeqCst);
             if chord {
                 send_replay(Replay::MenuUp);
+            } else if commit_deferred_stop(pending, CAPTURING.load(Ordering::SeqCst)) {
+                // Timestamp the release, not the press: if the duration limit
+                // (or a UI stop) ended the recording while Alt was held, the
+                // release falls inside the new processing window and the
+                // toggle is dropped as stale instead of starting a new
+                // recording.
+                send(HotkeyEvent::Toggle(Instant::now()));
             }
             return LRESULT(1);
         }
@@ -271,6 +308,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             ALT_CHORD.store(true, Ordering::SeqCst);
             SWALLOW_VK.store(vk, Ordering::SeqCst);
         }
+        // The dictation is being cancelled, so a stop deferred by a held
+        // Right Alt must not fire when it is released later.
+        PENDING_STOP.store(false, Ordering::SeqCst);
         send(HotkeyEvent::Cancel);
         return LRESULT(1);
     }
@@ -288,8 +328,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             }
         } else if down {
             // First key of a chord. Cancel dictation, then replay the chord
-            // with Right Alt down so AltGr/@ and Alt+Tab still work.
+            // with Right Alt down so AltGr/@ and Alt+Tab still work. The
+            // deferred stop is dropped: this is a chord, not a bare press.
             ALT_CHORD.store(true, Ordering::SeqCst);
+            PENDING_STOP.store(false, Ordering::SeqCst);
             let key = chord_key(event);
             send_replay(Replay::MenuDown);
             send_replay(Replay::KeyDown(key));
@@ -299,6 +341,14 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// A stop deferred by a Right Alt press during a recording commits only for a
+/// bare release while the dictation is still capturing. Escape, the duration
+/// limit, or a UI stop may have ended it during the hold; the release must
+/// then not toggle a new recording.
+fn commit_deferred_stop(pending: bool, capturing: bool) -> bool {
+    pending && capturing
 }
 
 fn chord_key(event: &KBDLLHOOKSTRUCT) -> ChordKey {
@@ -396,5 +446,29 @@ fn inject_key(vk: u16, scan: u16, extended: bool, up: bool) {
     };
     unsafe {
         let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::commit_deferred_stop;
+
+    #[test]
+    fn bare_press_commits_the_deferred_stop() {
+        assert!(commit_deferred_stop(true, true));
+    }
+
+    #[test]
+    fn stop_is_dropped_when_the_recording_already_ended() {
+        // Escape, the duration limit, or the UI ended it during the hold.
+        assert!(!commit_deferred_stop(true, false));
+    }
+
+    #[test]
+    fn release_without_a_pending_stop_does_nothing() {
+        // An idle press starts immediately, and a chord clears the pending
+        // stop before the release arrives.
+        assert!(!commit_deferred_stop(false, true));
+        assert!(!commit_deferred_stop(false, false));
     }
 }

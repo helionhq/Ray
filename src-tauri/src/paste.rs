@@ -20,12 +20,15 @@ use std::time::Duration;
 
 use arboard::{Clipboard, ImageData};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
+use windows::Win32::Graphics::Gdi::{BITMAPV5HEADER, BI_BITFIELDS, LCS_GM_IMAGES};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardSequenceNumber,
-    OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData,
+    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL, VK_LMENU, VK_MENU, VK_RMENU,
@@ -35,6 +38,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use crate::windows_util;
 
 const CF_UNICODETEXT: u32 = 13;
+const CF_DIBV5: u32 = 17;
 
 /// How long the transcript stays on the clipboard before the previous content
 /// is put back. Electron/Office/browser targets are given more time; they
@@ -132,28 +136,51 @@ fn save_clipboard() -> Saved {
 }
 
 fn restore_clipboard(saved: Saved) {
+    if open_clipboard().is_err() {
+        return;
+    }
+    let result = restore_clipboard_locked(saved);
+    unsafe {
+        let _ = CloseClipboard();
+    };
+    if let Err(error) = result {
+        eprintln!("[ray] could not restore the clipboard: {error}");
+    }
+}
+
+/// Restores `saved` on an already-open clipboard.
+fn restore_clipboard_locked(saved: Saved) -> Result<(), String> {
     match saved {
         Saved::Text(text) => {
             // Excluding the restore from history avoids adding a duplicate of
             // content that was already in clipboard history.
-            let _ = set_clipboard_text(&text, true);
+            write_clipboard_text_locked(&text, true)
         }
-        Saved::Image(image) => {
-            let _ = with_clipboard(move |clipboard| clipboard.set_image(image.clone()));
-        }
-        Saved::Empty => {
-            let _ = clear_clipboard();
-        }
+        Saved::Image(image) => write_clipboard_image_locked(&image),
+        Saved::Empty => unsafe { EmptyClipboard() }.map_err(|error| format!("Clipboard: {error}")),
         // Unknown content cannot be restored; leave the transcript in place
         // rather than destroying it with a half-restore.
-        Saved::Unknown => {}
+        Saved::Unknown => Ok(()),
     }
 }
 
 /// Puts `text` on the clipboard without losing the original if this fails.
 fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, String> {
+    open_clipboard()?;
+    let result = write_clipboard_text_locked(text, exclude_from_history);
+    unsafe {
+        let _ = CloseClipboard();
+    };
+    result?;
+    Ok(unsafe { GetClipboardSequenceNumber() })
+}
+
+/// Empties the clipboard and puts `text` there. The caller must hold the
+/// clipboard open: the deferred restore checks ownership and writes under one
+/// lock so another app cannot copy in between.
+fn write_clipboard_text_locked(text: &str, exclude_from_history: bool) -> Result<(), String> {
     if text.is_empty() {
-        return clear_clipboard().map(|()| unsafe { GetClipboardSequenceNumber() });
+        return unsafe { EmptyClipboard() }.map_err(|error| format!("Clipboard: {error}"));
     }
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = unsafe {
@@ -169,20 +196,7 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
         Vec::new()
     };
 
-    if let Err(error) = open_clipboard() {
-        unsafe {
-            let _ = windows::Win32::Foundation::GlobalFree(Some(text_handle));
-            for (_, handle) in markers {
-                let _ = windows::Win32::Foundation::GlobalFree(Some(handle));
-            }
-        }
-        return Err(error);
-    }
-
     if let Err(error) = unsafe { EmptyClipboard() } {
-        unsafe {
-            let _ = CloseClipboard();
-        };
         unsafe {
             let _ = windows::Win32::Foundation::GlobalFree(Some(text_handle));
             for (_, handle) in markers {
@@ -193,9 +207,6 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
     }
 
     if let Err(error) = unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(text_handle.0))) } {
-        unsafe {
-            let _ = CloseClipboard();
-        };
         unsafe {
             let _ = windows::Win32::Foundation::GlobalFree(Some(text_handle));
             for (_, handle) in markers {
@@ -216,10 +227,89 @@ fn set_clipboard_text(text: &str, exclude_from_history: bool) -> Result<u32, Str
             };
         }
     }
-    unsafe {
-        let _ = CloseClipboard();
+    Ok(())
+}
+
+/// Restores a saved image on an already-open clipboard.
+///
+/// arboard's `set_image` opens the clipboard itself, so it cannot be used
+/// without dropping the lock between the ownership check and the write. Write
+/// the same CF_DIBV5 payload arboard produces instead (32-bit BGR(A),
+/// bottom-up rows, sRGB), which is what the clipboard reported when it was
+/// saved. Word/WordPad reject a negative (top-down) height.
+fn write_clipboard_image_locked(image: &ImageData<'static>) -> Result<(), String> {
+    let Some(pixels) = image
+        .width
+        .checked_mul(image.height)
+        .and_then(|count| count.checked_mul(4))
+    else {
+        return Err("Clipboard image dimensions are too large".into());
     };
-    Ok(unsafe { GetClipboardSequenceNumber() })
+    if image.bytes.len() < pixels {
+        return Err("Clipboard image data is incomplete".into());
+    }
+    let header_size = std::mem::size_of::<BITMAPV5HEADER>();
+    let Some(total) = header_size.checked_add(pixels) else {
+        return Err("Clipboard image dimensions are too large".into());
+    };
+    let mut data = vec![0u8; total];
+    // constants::LCS_sRGB is not exposed by the windows crate.
+    #[allow(non_upper_case_globals)]
+    const LCS_sRGB: u32 = 0x7352_4742;
+    let header = BITMAPV5HEADER {
+        bV5Size: header_size as u32,
+        bV5Width: image.width as i32,
+        bV5Height: image.height as i32,
+        bV5Planes: 1,
+        bV5BitCount: 32,
+        bV5Compression: BI_BITFIELDS,
+        bV5SizeImage: pixels as u32,
+        bV5RedMask: 0x00ff_0000,
+        bV5GreenMask: 0x0000_ff00,
+        bV5BlueMask: 0x0000_00ff,
+        bV5AlphaMask: 0xff00_0000,
+        bV5CSType: LCS_sRGB,
+        bV5Intent: LCS_GM_IMAGES as u32,
+        ..Default::default()
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&header as *const BITMAPV5HEADER).cast::<u8>(),
+            data.as_mut_ptr(),
+            header_size,
+        );
+    }
+    // arboard hands back top-down RGBA; DIB rows are bottom-up and the masks
+    // above put the channels in B, G, R, A order in memory.
+    let row = image.width * 4;
+    for y in 0..image.height {
+        let source = &image.bytes[y * row..y * row + row];
+        let target = header_size + (image.height - 1 - y) * row;
+        for x in 0..image.width {
+            let from = x * 4;
+            let to = target + from;
+            data[to] = source[from + 2];
+            data[to + 1] = source[from + 1];
+            data[to + 2] = source[from];
+            data[to + 3] = source[from + 3];
+        }
+    }
+    let handle = unsafe { alloc_bytes(&data) }?;
+    // The transcript is still on the clipboard; clear it so the image is the
+    // only thing the target can paste.
+    if let Err(error) = unsafe { EmptyClipboard() } {
+        unsafe {
+            let _ = windows::Win32::Foundation::GlobalFree(Some(handle));
+        }
+        return Err(format!("Could not clear the clipboard: {error}"));
+    }
+    if let Err(error) = unsafe { SetClipboardData(CF_DIBV5, Some(HANDLE(handle.0))) } {
+        unsafe {
+            let _ = windows::Win32::Foundation::GlobalFree(Some(handle));
+        }
+        return Err(format!("Could not restore the clipboard image: {error}"));
+    }
+    Ok(())
 }
 
 /// Allocates the three clipboard formats Windows uses to keep transient
@@ -261,9 +351,15 @@ unsafe fn alloc_bytes(bytes: &[u8]) -> Result<HGLOBAL, String> {
 }
 
 fn open_clipboard() -> Result<(), String> {
+    // EmptyClipboard associates the clipboard with the window passed to
+    // OpenClipboard. With NULL, Windows sets the owner to NULL and every
+    // following SetClipboardData fails, so always open on Ray's window.
+    let owner = windows_util::clipboard_owner()
+        .map(|hwnd| HWND(hwnd as *mut std::ffi::c_void))
+        .ok_or_else(|| "Could not create Ray's clipboard window".to_string())?;
     let mut last = String::new();
     for attempt in 0..6 {
-        match unsafe { OpenClipboard(None) } {
+        match unsafe { OpenClipboard(Some(owner)) } {
             Ok(()) => return Ok(()),
             Err(error) => last = error.to_string(),
         }
@@ -289,15 +385,6 @@ fn clipboard_is_empty() -> bool {
     count_clipboard_formats() == Some(0)
 }
 
-fn clear_clipboard() -> Result<(), String> {
-    open_clipboard()?;
-    let result = unsafe { EmptyClipboard() }.map_err(|error| format!("Clipboard: {error}"));
-    unsafe {
-        let _ = CloseClipboard();
-    };
-    result
-}
-
 /// Public entry point for the history page's copy button.
 pub fn copy_text(text: &str) -> Result<(), String> {
     // A pending dictation restore must not undo the user's deliberate copy.
@@ -314,7 +401,20 @@ pub struct PasteOutcome {
 
 /// Pastes `text` into the focused window. Returns once Ctrl+V has been sent;
 /// the previous clipboard is restored afterwards on a background thread.
-pub fn paste_text(text: &str) -> Result<PasteOutcome, String> {
+///
+/// `target` is the window the dictation started in (`None` when Ray could not
+/// identify one). Ray refuses to type into a different window: the caller
+/// gets an error and keeps the text instead, so a window switch during
+/// transcription never inserts the transcript into the wrong app.
+///
+/// `keep_on_clipboard` leaves the transcript on the clipboard instead of
+/// restoring the previous content. Used when History could not save it and the
+/// clipboard is the user's remaining copy.
+pub fn paste_text(
+    text: &str,
+    target: Option<isize>,
+    keep_on_clipboard: bool,
+) -> Result<PasteOutcome, String> {
     if text.trim().is_empty() {
         return Ok(PasteOutcome::default());
     }
@@ -335,9 +435,25 @@ pub fn paste_text(text: &str) -> Result<PasteOutcome, String> {
 
     // Give the clipboard owner a beat to publish before the target reads it.
     sleep(Duration::from_millis(45));
+    // Check as late as possible: cleanup can take seconds, and the user may
+    // have switched windows or closed the one they started in. With no known
+    // target, pasting into whatever is focused is the only option (the
+    // blocker check above still rules out windows that cannot receive input).
+    if let Some(target) = target {
+        if windows_util::foreground_hwnd() != Some(target) {
+            restore_clipboard(saved);
+            return Err("the window you started dictating in is no longer focused".into());
+        }
+    }
     if let Err(error) = send_ctrl_v() {
         restore_clipboard(saved);
         return Err(error);
+    }
+
+    if keep_on_clipboard {
+        return Ok(PasteOutcome {
+            previous_clipboard_lost,
+        });
     }
 
     let sequence = unsafe { GetClipboardSequenceNumber() };
@@ -396,24 +512,65 @@ fn take_and_restore(expected_sequence: Option<u32>) {
     let Some(current) = slot.take() else {
         return;
     };
-    // Hold the lock through the restore so a new paste cannot read our
+    // Hold the PENDING lock through the restore so a new paste cannot read our
     // transient transcript as the previous clipboard.
-    if clipboard_still_holds(&current) {
-        restore_clipboard(current.saved);
+    //
+    // The Win32 clipboard lock spans the ownership check and the write too.
+    // Checking with arboard and then reopening would let another app copy in
+    // between (the open retries make that window wider), and Ray would then
+    // overwrite the newer copy with the old one.
+    if open_clipboard().is_err() {
+        // Could not take the lock; leave the transcript where it is rather
+        // than risk clobbering content we did not inspect, and keep the saved
+        // clipboard so a later flush (or quit) can try again.
+        *slot = Some(current);
+        return;
+    }
+    let still_ours = clipboard_still_holds_locked(&current);
+    let result = if still_ours {
+        restore_clipboard_locked(current.saved)
+    } else {
+        Ok(())
+    };
+    unsafe {
+        let _ = CloseClipboard();
+    };
+    if let Err(error) = result {
+        eprintln!("[ray] could not restore the clipboard: {error}");
     }
 }
 
-fn clipboard_still_holds(pending: &PendingRestore) -> bool {
+/// Must be called with the clipboard open. The sequence check catches another
+/// app copying; the text check catches apps that rewrite the same content
+/// without (or before) bumping the counter.
+fn clipboard_still_holds_locked(pending: &PendingRestore) -> bool {
     let sequence = unsafe { GetClipboardSequenceNumber() };
     if pending.sequence != 0 && sequence != pending.sequence {
         return false;
     }
-    // The sequence check is enough in practice; the text check catches apps
-    // that rewrite the same content without (or before) bumping the counter.
-    matches!(
-        with_clipboard(|clipboard| clipboard.get_text()),
-        Ok(text) if text == pending.text
-    )
+    matches!(clipboard_text_locked(), Some(text) if text == pending.text)
+}
+
+/// Reads CF_UNICODETEXT from the already-open clipboard.
+fn clipboard_text_locked() -> Option<String> {
+    unsafe {
+        let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+        let pointer = GlobalLock(HGLOBAL(handle.0));
+        if pointer.is_null() {
+            return None;
+        }
+        let wide = pointer as *const u16;
+        // Another app's CF_UNICODETEXT may be malformed; never read past the
+        // allocation looking for the terminator.
+        let limit = GlobalSize(HGLOBAL(handle.0)) / std::mem::size_of::<u16>();
+        let mut length = 0usize;
+        while length < limit && *wide.add(length) != 0 {
+            length += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, length));
+        let _ = GlobalUnlock(HGLOBAL(handle.0));
+        Some(text)
+    }
 }
 
 /// Puts the previous clipboard back right away. Used before a new paste, a

@@ -231,8 +231,11 @@ pub fn start(
                 .unwrap_or_else(|| "The audio capture stopped unexpectedly".into()))
         }
         Err(_) => {
+            // A driver stuck opening the device cannot be interrupted, so do
+            // not wait for it: dropping the handle detaches the worker, which
+            // sees `stop` and exits on its own if it ever gets that far.
             stop.store(true, Ordering::SeqCst);
-            let _ = thread.join();
+            drop(thread);
             Err("The microphone did not start in time".into())
         }
     }

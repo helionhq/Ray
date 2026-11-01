@@ -32,11 +32,29 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      base: ${{ steps.base.outputs.sha }}
     steps:
+      # Build the current tip of main, not the sha that triggered the run.
+      # Runs are serialized by the concurrency group, so a queued run starts
+      # after an earlier run may already have pushed a version bump; pinning
+      # github.sha would rebuild the same version and lose the push race.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: main
           persist-credentials: false
+
+      - name: Record the release base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(git rev-parse HEAD)"
+          if [ "$BASE_SHA" != "$(git rev-parse origin/main)" ]; then
+            echo "Checkout is not at the tip of main." >&2
+            exit 1
+          fi
+          echo "sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release base: $BASE_SHA"
 
       - uses: pnpm/action-setup@v4
         with:
@@ -130,10 +148,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Check out the tip of main and require it to be the exact commit the
+      # build used. If main advanced during the build, these artifacts belong
+      # to an older commit and must not be committed, tagged, or published.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: main
           persist-credentials: false
+
+      - name: Verify the release base is still current
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.build.outputs.base }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA="$(git rev-parse HEAD)"
+          if [ "$CURRENT_SHA" != "$BASE_SHA" ]; then
+            echo "main moved from $BASE_SHA to $CURRENT_SHA while the release was building." >&2
+            echo "These artifacts belong to the old commit, so nothing will be committed or published." >&2
+            echo "A push to main queues a fresh run; otherwise re-run the Release workflow." >&2
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@v4
         with:
@@ -218,22 +253,34 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ needs.build.outputs.base }}
         run: |
           set -euo pipefail
           auth_remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           public_remote="https://github.com/${GITHUB_REPOSITORY}.git"
           git remote set-url origin "$auth_remote"
           trap 'git remote set-url origin "$public_remote"' EXIT
+          # Signing took time too; re-check the tip right before pushing so a
+          # push that landed meanwhile can never be raced or overwritten, and
+          # the failure names the exact problem instead of a bare rejection.
+          git fetch --no-tags --depth=1 origin main
+          CURRENT_SHA="$(git rev-parse FETCH_HEAD)"
+          if [ "$CURRENT_SHA" != "$BASE_SHA" ]; then
+            echo "main moved from $BASE_SHA to $CURRENT_SHA after the build; these artifacts are stale." >&2
+            echo "Nothing was pushed. A push to main queues a fresh run; otherwise re-run the Release workflow." >&2
+            exit 1
+          fi
           git push origin HEAD:main
           git remote set-url origin "$public_remote"
           trap - EXIT
 
-      # Tag the bump commit itself, not github.sha (the pre-bump checkout).
+      # Tag the bump commit itself, not the pre-bump checkout base.
       - name: Publish the GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
+          COMMIT_SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -euo pipefail
           TAG="v${VERSION}"
@@ -243,12 +290,20 @@ jobs:
           NOTES="Ray ${VERSION} for Windows.
 
           Press Right Alt, speak, press it again. Ray updates itself; run the setup file below for a fresh install."
+          # The push step ran first, so COMMIT_SHA is on main. Attach assets
+          # only to a tag that names that same commit: the installer, the
+          # version commit, the tag, and the release must agree.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha 2>/dev/null || true)"
+            if [ "$TAG_SHA" != "$COMMIT_SHA" ]; then
+              echo "Release $TAG points at ${TAG_SHA:-an unknown commit}, not at ${COMMIT_SHA}; refusing to upload mismatched artifacts." >&2
+              exit 1
+            fi
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
               "$INSTALLER" "${INSTALLER}.sig" latest.json
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --target "${{ steps.commit.outputs.sha }}" \
+              --target "$COMMIT_SHA" \
               --title "Ray $VERSION" \
               --notes "$NOTES" \
               "$INSTALLER" "${INSTALLER}.sig" latest.json

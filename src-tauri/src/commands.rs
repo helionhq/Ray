@@ -248,6 +248,22 @@ pub fn copy_text(text: String) -> Result<(), String> {
     crate::paste::copy_text(&text)
 }
 
+/// The most recent transcript whose History save failed. It is kept in memory
+/// so the text is still recoverable when History and the clipboard both miss
+/// it.
+#[tauri::command]
+pub fn get_unsaved_text(dictation: State<'_, Arc<Dictation>>) -> Option<String> {
+    dictation.unsaved_text()
+}
+
+#[tauri::command]
+pub fn copy_unsaved_text(dictation: State<'_, Arc<Dictation>>) -> Result<bool, String> {
+    match dictation.unsaved_text() {
+        Some(text) => crate::paste::copy_text(&text).map(|()| true),
+        None => Ok(false),
+    }
+}
+
 /// The bar webview may finish loading after the first state event; it asks for
 /// the current state on mount.
 #[tauri::command]

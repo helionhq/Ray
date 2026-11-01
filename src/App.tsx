@@ -82,22 +82,39 @@ export default function App() {
 
   if (error) {
     return (
-      <div className="boot">
-        <RayLogo />
-        <p>Ray could not load its local state.</p>
-        <span>{error}</span>
-        <button className="btn" onClick={() => void refresh()}>
-          Try again
-        </button>
+      // The boot screens keep the caption mounted too: the window has no
+      // native decorations, so without it a failed start cannot be moved,
+      // minimised, or closed.
+      <div className="boot-screen">
+        <TitleBar />
+        <div
+          className="boot"
+          onMouseDown={startDrag}
+          onDoubleClick={toggleOnDoubleClick}
+        >
+          <RayLogo />
+          <p>Ray could not load its local state.</p>
+          <span>{error}</span>
+          <button className="btn" onClick={() => void refresh()}>
+            Try again
+          </button>
+        </div>
       </div>
     );
   }
 
   if (!snapshot) {
     return (
-      <div className="boot">
-        <RayLogo />
-        <span className="boot-wait">Loading Ray…</span>
+      <div className="boot-screen">
+        <TitleBar />
+        <div
+          className="boot"
+          onMouseDown={startDrag}
+          onDoubleClick={toggleOnDoubleClick}
+        >
+          <RayLogo />
+          <span className="boot-wait">Loading Ray…</span>
+        </div>
       </div>
     );
   }

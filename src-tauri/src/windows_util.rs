@@ -4,24 +4,29 @@
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, MAX_PATH, RECT};
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, MAX_PATH, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetForegroundWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, SetWindowLongPtrW, SetWindowPos, ShowWindow, GA_ROOT, GA_ROOTOWNER,
-    GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetAncestor, GetForegroundWindow,
+    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    RegisterClassW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GA_ROOT,
+    GA_ROOTOWNER, GWL_EXSTYLE, HWND_MESSAGE, HWND_TOPMOST, MSG, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
@@ -208,6 +213,106 @@ pub fn foreground_process_name() -> Option<String> {
             return None;
         }
         window_process_name(hwnd)
+    }
+}
+
+/// The foreground window's handle, without the process/title lookups. Used to
+/// confirm the window the user started dictating in is still the one focused
+/// right before Ray sends Ctrl+V.
+pub fn foreground_hwnd() -> Option<isize> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        (!hwnd.0.is_null()).then_some(hwnd.0 as isize)
+    }
+}
+
+/// Ray's clipboard owner window, created lazily on first use.
+///
+/// `OpenClipboard(NULL)` is documented to make the following `EmptyClipboard`
+/// leave the clipboard owner NULL, which in turn makes every
+/// `SetClipboardData` call fail. Opening on a real window avoids that. The
+/// window must outlive the writes, and Windows destroys a window when the
+/// thread that created it exits, so it lives on a dedicated thread that pumps
+/// messages for the rest of the process. Data written with SetClipboardData
+/// (no delayed rendering) belongs to the system and survives the owner, but
+/// the process keeps using the handle for every write and restore.
+/// Stored as `isize` because raw window handles are not `Send`/`Sync`; the
+/// value is never dereferenced across threads.
+static CLIPBOARD_OWNER: OnceLock<Option<isize>> = OnceLock::new();
+
+pub fn clipboard_owner() -> Option<isize> {
+    *CLIPBOARD_OWNER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("ray-clipboard-owner".into())
+            .spawn(move || {
+                let hwnd = unsafe { create_clipboard_window() };
+                let _ = tx.send(hwnd.map(|hwnd| hwnd.0 as isize));
+                if hwnd.is_some() {
+                    unsafe { clipboard_message_loop() };
+                }
+            });
+        if spawned.is_err() {
+            return None;
+        }
+        // The window is small and cheap; if setup somehow stalls, fail the
+        // clipboard write rather than hanging the pipeline.
+        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
+    })
+}
+
+unsafe fn create_clipboard_window() -> Option<HWND> {
+    let instance = unsafe { GetModuleHandleW(None) }.ok()?;
+    let class_name = wide("RayClipboardOwner");
+    let class = WNDCLASSW {
+        lpfnWndProc: Some(clipboard_window_proc),
+        hInstance: HINSTANCE::from(instance),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+    // A zero return means registration failed; CreateWindowEx below decides
+    // whether that matters (it still works if the class already exists).
+    unsafe { RegisterClassW(&class) };
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            PCWSTR(class_name.as_ptr()),
+            PCWSTR(class_name.as_ptr()),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            Some(HINSTANCE::from(instance)),
+            None,
+        )
+    }
+    .ok()
+}
+
+unsafe extern "system" fn clipboard_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+unsafe fn clipboard_message_loop() {
+    let mut message = MSG::default();
+    loop {
+        // 0 means WM_QUIT and -1 means an error; either way there is nothing
+        // left to pump.
+        if unsafe { GetMessageW(&mut message, None, 0, 0) }.0 <= 0 {
+            break;
+        }
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
 }
 

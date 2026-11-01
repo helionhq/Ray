@@ -81,6 +81,16 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
+                if let WindowEvent::Focused(true) = event {
+                    // Notices that arrived while the window was in the tray
+                    // waited for it to be opened; show them now.
+                    let dictation = window
+                        .app_handle()
+                        .state::<Arc<Dictation>>()
+                        .inner()
+                        .clone();
+                    dictation.deliver_notice();
+                }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
@@ -98,6 +108,8 @@ pub fn run() {
             commands::delete_history,
             commands::clear_history,
             commands::copy_text,
+            commands::get_unsaved_text,
+            commands::copy_unsaved_text,
             commands::copy_history_entry,
             commands::get_bar_state,
             commands::start_dictation,

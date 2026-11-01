@@ -244,7 +244,10 @@ async fn run_sync_live(
         if !transcript.is_empty() {
             transcripts.push(transcript.to_string());
         }
-        if stopped || *stop_rx.borrow() {
+        // Only finish when the pump itself saw the stop. If the stop arrived
+        // while this segment was waiting for its response, `pending` and the
+        // queued audio still have to go out in another segment.
+        if stopped {
             break;
         }
         // The segment hit the audio cap; start a fresh request and carry on.
@@ -516,37 +519,30 @@ async fn run_stream(
             message = socket.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
+                        // The user is still speaking, so any end of the stream
+                        // here loses the rest of the recording. Fail, whatever
+                        // was recognised so far, and let batch transcribe the
+                        // full buffer.
                         if matches!(
                             handle_text(text.as_str(), &mut finals, &mut partial)?,
                             MessageEffect::Ended
                         ) {
-                            let text = join_transcript(&finals, &partial);
-                            return if text.is_empty() {
-                                Err("AssemblyAI ended the stream without a transcript".into())
-                            } else {
-                                Ok(text)
-                            };
+                            return Err(
+                                "AssemblyAI ended the stream before recording stopped".into()
+                            );
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         let _ = socket.send(Message::Pong(payload)).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        let text = join_transcript(&finals, &partial);
-                        return if text.is_empty() {
-                            Err("AssemblyAI closed the stream without a transcript".into())
-                        } else {
-                            Ok(text)
-                        };
+                        return Err(
+                            "AssemblyAI closed the stream before recording stopped".into()
+                        );
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
-                        let text = join_transcript(&finals, &partial);
-                        return if text.is_empty() {
-                            Err(format!("AssemblyAI streaming error: {error}"))
-                        } else {
-                            Ok(text)
-                        };
+                        return Err(format!("AssemblyAI streaming error: {error}"));
                     }
                 }
             }
@@ -769,6 +765,28 @@ struct TranscriptResponse {
     text: Option<String>,
     error: Option<String>,
 }
+/// Per-request limits of the v2 fallback, outside its polling deadline.
+const V2_UPLOAD_TIMEOUT_MS: u64 = 60_000;
+const V2_CREATE_TIMEOUT_MS: u64 = 30_000;
+const V2_POLL_REQUEST_TIMEOUT_MS: u64 = 20_000;
+
+/// The longest `transcribe_wav` can legitimately take: the Sync batch request,
+/// then (if enabled) the v2 upload, transcript creation, and polling up to its
+/// own deadline plus one last interval and poll request.
+pub fn batch_time_budget(config: &SttConfig) -> Duration {
+    let batch = &config.batch;
+    let mut total = batch.timeout_ms;
+    if batch.v2_fallback {
+        total = total
+            .saturating_add(V2_UPLOAD_TIMEOUT_MS)
+            .saturating_add(V2_CREATE_TIMEOUT_MS)
+            .saturating_add(batch.timeout_ms)
+            .saturating_add(batch.poll_interval_ms.max(250))
+            .saturating_add(V2_POLL_REQUEST_TIMEOUT_MS);
+    }
+    Duration::from_millis(total)
+}
+
 /// Sync batch first (fast, single multipart request), then the older
 /// asynchronous v2 API if configured.
 pub async fn transcribe_wav(
@@ -859,7 +877,7 @@ async fn transcribe_v2(
         .header("authorization", api_key)
         .header("content-type", "application/octet-stream")
         .body(wav)
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_millis(V2_UPLOAD_TIMEOUT_MS))
         .send()
         .await
         .map_err(|error| format!("Upload audio: {error}"))?
@@ -882,7 +900,7 @@ async fn transcribe_v2(
         .post(format!("{V2_URL}/transcript"))
         .header("authorization", api_key)
         .json(&body)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_millis(V2_CREATE_TIMEOUT_MS))
         .send()
         .await
         .map_err(|error| format!("Create transcript: {error}"))?
@@ -930,7 +948,7 @@ async fn poll_transcript(
         current = http
             .get(format!("{V2_URL}/transcript/{}", created.id))
             .header("authorization", api_key)
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_millis(V2_POLL_REQUEST_TIMEOUT_MS))
             .send()
             .await
             .map_err(|error| format!("Poll transcript: {error}"))?

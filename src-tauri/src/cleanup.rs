@@ -29,6 +29,10 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ChatMessage,
+    /// Open-ended (`null`) is normal for some gateways; only an explicit
+    /// truncation sentinel is treated as a failed answer.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -342,21 +346,48 @@ async fn call_provider(
             return Err(format!("HTTP {status}: {message}"));
         }
 
-        let parsed: ChatResponse = serde_json::from_str(&text)
-            .map_err(|error| format!("invalid response JSON: {error}"))?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content)
-            .ok_or_else(|| "the model returned no text".to_string())?;
-        let cleaned = sanitize(&content);
-        if cleaned.is_empty() {
-            return Err("the model returned an empty answer".into());
-        }
+        let cleaned = extract_answer(&text)?;
         return Ok(cleaned);
     }
     Err("no attempt succeeded".into())
+}
+
+/// Pull the cleaned text out of a chat-completions response. A response that
+/// stopped because it hit the token budget is rejected outright: it is only a
+/// prefix of the cleanup, so pasting it would silently drop the rest of what
+/// the user said. The error falls through to the next provider and ultimately
+/// to the raw transcript.
+fn extract_answer(text: &str) -> Result<String, String> {
+    let parsed: ChatResponse =
+        serde_json::from_str(text).map_err(|error| format!("invalid response JSON: {error}"))?;
+    let choice = parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the model returned no text".to_string())?;
+    if let Some(reason) = choice.finish_reason.as_deref() {
+        // OpenAI-compatible providers say "length"; some gateways pass the
+        // request field through as "max_tokens" (Anthropic's stop reason).
+        let normalized = reason.trim().to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "length" | "max_tokens" | "max_output_tokens"
+        ) {
+            return Err(format!(
+                "the model output was truncated (finish_reason: {})",
+                reason.trim()
+            ));
+        }
+    }
+    let content = choice
+        .message
+        .content
+        .ok_or_else(|| "the model returned no text".to_string())?;
+    let cleaned = sanitize(&content);
+    if cleaned.is_empty() {
+        return Err("the model returned an empty answer".into());
+    }
+    Ok(cleaned)
 }
 
 fn api_message(text: &str) -> String {
@@ -1314,6 +1345,33 @@ mod tests {
         );
         assert_eq!(prompt, "You are the cleanup stage.");
         assert!(!prompt.contains("system prompt v4"));
+    }
+
+    #[test]
+    fn rejects_a_completion_truncated_at_the_token_limit() {
+        // A long recording can exhaust max_tokens before the cleanup finishes.
+        // The partial answer must not be accepted as a successful cleanup.
+        for reason in ["length", "max_tokens", "MAX_OUTPUT_TOKENS"] {
+            let response = format!(
+                r#"{{"choices":[{{"message":{{"content":"The first half of the"}},"finish_reason":"{reason}"}}]}}"#
+            );
+            let error = extract_answer(&response).unwrap_err();
+            assert!(
+                error.contains("truncated"),
+                "finish_reason {reason} should be rejected, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_completion_that_finished_normally() {
+        let response = r#"{"choices":[{"message":{"content":"Ship it Friday."},"finish_reason":"stop"}]}"#;
+        assert_eq!(extract_answer(response).unwrap(), "Ship it Friday.");
+        // Gateways that omit the field, or send null, are still accepted.
+        let response = r#"{"choices":[{"message":{"content":"Ship it Friday."},"finish_reason":null}]}"#;
+        assert_eq!(extract_answer(response).unwrap(), "Ship it Friday.");
+        let response = r#"{"choices":[{"message":{"content":"Ship it Friday."}}]}"#;
+        assert_eq!(extract_answer(response).unwrap(), "Ship it Friday.");
     }
 
     #[test]
