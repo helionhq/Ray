@@ -3,8 +3,9 @@
 Usage (from the repo root):
     python scripts/make_icon.py            # writes src-tauri/icons/*
 Requires Pillow. Large sizes draw the full 7x7 plate (unlit dots faintly
-visible, soft phosphor glow); 32 px drops the unlit dots; 16/24 px switch to a
-5x5 pulse so the shape stays legible in the tray and taskbar.
+visible, soft phosphor glow); 30-44 px drop the unlit dots; 16/24 px switch to
+a 5x5 pulse. Small sizes snap dots to whole pixels and keep the same margin
+as the large sizes so the mark never touches the tile edge.
 """
 from __future__ import annotations
 
@@ -18,9 +19,16 @@ ICONS = ROOT / "src-tauri" / "icons"
 TILE_TOP = (31, 31, 34)
 TILE_BOTTOM = (17, 17, 19)
 DOT = (242, 242, 240)
-SS = 8  # supersampling factor
+SS = 8  # supersampling factor for small and medium icons
+MAX_CANVAS = 4096  # cap the supersampled canvas so 1024 px renders stay cheap
 # size -> (dots per side, pitch px, dot px) for pixel-snapped small icons.
-PIXEL_GRID = {16: (5, 3, 2), 24: (5, 4, 3), 30: (7, 4, 3), 32: (7, 4, 3), 44: (7, 5, 4)}
+# The mark keeps ~60% of the tile like the large sizes, so it never touches
+# the tile edge in the taskbar or tray.
+PIXEL_GRID = {16: (5, 2, 2), 24: (5, 3, 2), 30: (7, 3, 2), 32: (7, 3, 2), 44: (7, 4, 3)}
+
+
+def supersample(size: int) -> int:
+    return max(1, min(SS, MAX_CANVAS // size))
 
 
 def heights(n: int) -> list[int]:
@@ -31,7 +39,8 @@ def render(size: int) -> Image.Image:
     n = 7 if size >= 32 else 5
     plate = size >= 48
     glow = size >= 128
-    big = size * SS
+    ss = supersample(size)
+    big = size * ss
     img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
 
     # Rounded tile with a gentle top-to-bottom gradient, like the bar's plate.
@@ -56,9 +65,9 @@ def render(size: int) -> Image.Image:
         n, pitch_px, dot_px = snapped
         extent = n * pitch_px - (pitch_px - dot_px)
         start = (size - extent) // 2
-        pitch = pitch_px * SS
-        radius_dot = dot_px * SS / 2
-        origin = start * SS + radius_dot
+        pitch = pitch_px * ss
+        radius_dot = dot_px * ss / 2
+        origin = start * ss + radius_dot
         span = n * pitch
     else:
         span = (big - 2 * margin) * 0.58

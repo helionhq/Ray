@@ -391,6 +391,12 @@ fn run_capture(
     let err_fn = {
         let error = error.clone();
         move |err: cpal::Error| {
+            // A buffer underrun/overrun is a momentary glitch; WASAPI keeps
+            // the stream running, so it must not be reported as the
+            // microphone stopping.
+            if err.kind() == cpal::ErrorKind::Xrun {
+                return;
+            }
             let mut slot = error
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());

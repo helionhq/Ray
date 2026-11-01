@@ -190,10 +190,26 @@ pub async fn test_secret(
 
 #[tauri::command]
 pub fn save_settings(settings: Settings, store: State<'_, Arc<Store>>) -> Result<Settings, String> {
-    if windows_util::launch_at_login() != settings.launch_at_login {
+    let previous = windows_util::launch_at_login();
+    let changed = previous != settings.launch_at_login;
+    if changed {
         windows_util::set_launch_at_login(settings.launch_at_login)?;
     }
-    store.update_settings(settings)
+    match store.update_settings(settings) {
+        Ok(saved) => Ok(saved),
+        Err(error) => {
+            // The store and the Run key must not disagree: put the registry
+            // back, and keep the store error as the one the user sees.
+            if changed {
+                if let Err(rollback) = windows_util::set_launch_at_login(previous) {
+                    return Err(format!(
+                        "{error} (launch at login could not be restored: {rollback})"
+                    ));
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]

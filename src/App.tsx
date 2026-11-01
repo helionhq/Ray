@@ -122,6 +122,8 @@ export default function App() {
               type="button"
               className={`nav-item${page === id ? " is-active" : ""}`}
               onClick={() => setPage(id)}
+              aria-label={label}
+              title={label}
               aria-current={page === id ? "page" : undefined}
             >
               <Icon size={15} />

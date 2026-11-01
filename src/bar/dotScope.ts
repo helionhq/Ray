@@ -729,7 +729,7 @@ export class DotScope {
     this.raf = 0;
     const dt = Math.max(0, Math.min(0.05, (now - this.last) / 1000 || 0));
     this.last = now;
-    const running = !this.settled || this.visible || this.windowVisible();
+    const running = !this.settled || this.visible;
     if (running) {
       this.pending += dt;
       while (this.pending >= STEP) {
@@ -741,7 +741,7 @@ export class DotScope {
         this.settled = true;
       }
     }
-    if (!this.settled || this.visible || this.windowVisible()) {
+    if (!this.settled || this.visible) {
       this.raf = requestAnimationFrame(this.frame);
     }
   };
@@ -757,10 +757,6 @@ export class DotScope {
       this.last = performance.now();
       this.raf = requestAnimationFrame(this.frame);
     }
-  }
-
-  private windowVisible() {
-    return this.phase === "processing" || this.phase === "done" || this.phase === "error";
   }
 
   private draw() {

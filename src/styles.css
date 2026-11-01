@@ -1510,9 +1510,13 @@ kbd {
     scroll-behavior: auto !important;
   }
 
-  .actions,
-  .toast {
+  .actions {
     transform: none !important;
+  }
+
+  .toast,
+  .toast.is-visible {
+    transform: translateX(-50%) !important;
   }
 
   .brand:hover .logo .on {

@@ -50,6 +50,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
     try {
       await api.saveSecret(provider, value);
       setDrafts((current) => ({ ...current, [provider]: "" }));
+      setReveals((current) => ({ ...current, [provider]: false }));
       setReplacing((current) => ({ ...current, [provider]: false }));
       setConnected((current) => ({ ...current, [provider]: false }));
       await refresh();
@@ -67,6 +68,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
       if (drafts[provider].trim()) {
         await api.saveSecret(provider, drafts[provider].trim());
         setDrafts((current) => ({ ...current, [provider]: "" }));
+        setReveals((current) => ({ ...current, [provider]: false }));
         setReplacing((current) => ({ ...current, [provider]: false }));
       }
       const message = await api.testSecret(provider);
@@ -88,6 +90,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
       setConnected((current) => ({ ...current, [provider]: false }));
       setReplacing((current) => ({ ...current, [provider]: false }));
       setDrafts((current) => ({ ...current, [provider]: "" }));
+      setReveals((current) => ({ ...current, [provider]: false }));
       await refresh();
       notify("Key removed");
     } catch (error) {
@@ -277,6 +280,7 @@ export function SettingsPage({ snapshot, refresh, notify }: Props) {
                     [provider]: false,
                   }));
                   setDrafts((current) => ({ ...current, [provider]: "" }));
+                  setReveals((current) => ({ ...current, [provider]: false }));
                 }}
                 disabled={isBusy}
               >
