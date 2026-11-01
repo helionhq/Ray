@@ -9,7 +9,6 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { isDeepStrictEqual } from "node:util";
 
 const expected = process.argv[2];
 
@@ -29,11 +28,12 @@ function fail(file, reason) {
 }
 
 for (const file of ["package.json", "src-tauri/tauri.conf.json"]) {
-  let headJson;
+  const headText = head(file);
+  const workingText = working(file);
   let workingJson;
   try {
-    headJson = JSON.parse(head(file));
-    workingJson = JSON.parse(working(file));
+    JSON.parse(headText);
+    workingJson = JSON.parse(workingText);
   } catch (error) {
     fail(file, `could not parse JSON: ${error.message}`);
   }
@@ -43,8 +43,18 @@ for (const file of ["package.json", "src-tauri/tauri.conf.json"]) {
       `working version is ${workingJson.version ?? "missing"}, expected ${expected}`,
     );
   }
-  headJson.version = expected;
-  if (!isDeepStrictEqual(headJson, workingJson)) {
+  // Compare the text, not the parsed value: a reformatted file would pass a
+  // deep-equal check but break the next bump script, which expects the version
+  // declaration on its own line.
+  const versionLine = /^(\s*)"version":\s*"[^"]+"/m;
+  if (!versionLine.test(headText)) {
+    fail(file, "could not find the version declaration in HEAD");
+  }
+  const expectedText = headText.replace(
+    versionLine,
+    `$1"version": "${expected}"`,
+  );
+  if (expectedText !== workingText) {
     fail(file, "differs from HEAD beyond the version field");
   }
 }
