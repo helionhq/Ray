@@ -372,6 +372,11 @@ Measured cleanup latency (same 29-clip regression corpus):
 | Medium transcript, 20 warm repeats | 20 | 1,813 ms | 2,497 ms | 2,669 ms | `latency_long` (`long-rambling`) |
 | Long 161 s transcript, 20 warm repeats | 20 | 2,904 ms | 3,574 ms | 4,049 ms | `latency_monologue`; hedge fires, but gemma usually still wins |
 
+p50/p95 in this table use `summary.py`'s index percentile (`sorted[round(f*n)-1]`), not
+`statistics.median` or interpolated quantiles; Table 9.2 uses `statistics.median`, so the
+same `app_v8_final`/`hard_v8_final` `total_ms` samples read 857/781 ms here and 879/796 ms
+there.
+
 The 2,500 ms hedge sits almost exactly on the medium-transcript p95 (2,497 ms). On the 161 s
 monologue most repeats cross it, but gemma still returns before the Groq fallback, so all 20
 repeats stayed on the primary; the tail is bounded at 4.0 s instead of the old 7.8 s / 15 s
@@ -507,9 +512,11 @@ Table 9.1 — final prompt (v11):
 | Hard | 18 | 98.3 | 9.78 (18) | 9.78 | 10.0 | 9.89 | 10.0 | 900 ms | 2,033 ms | 3,228 ms |
 | **Held-out (out-of-sample)** | 20 | **98.7** | **9.95 (20)** | 9.95 | 10.0 | 9.95 | 10.0 | 953 ms | 2,197 ms | 2,837 ms |
 
-Table 9.2 — round-2 and round-3 comparison. p50 is the median; p95 is linear interpolation
-(`statistics.quantiles(..., method="inclusive")`); max is the slowest cleanup call. The
-round-2 report used a different p95 index, so compare p50/max and the §9 rows.
+Table 9.2 — round-2 and round-3 comparison. p50 is `statistics.median`; p95 is linear
+interpolation (`statistics.quantiles(..., method="inclusive")`); max is the slowest cleanup
+call. The round-2 report used `summary.py`'s index percentile for both p50 and p95, so the
+same round-2 samples read 857/781 ms there (§8.2/§8.3) and 879/796 ms here; compare p50/max
+and the §9 rows.
 
 | Run | Corpus | n | Auto | Judge overall | p50 | p95 | max |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -605,7 +612,9 @@ The remaining cleanup misses are reported rather than patched: `hard-monologue` 
 superseded "50 or 100" after the correction (and still turns "Actually, wait..." into
 "but..."), `hard-like-content` drops a content "you know?", and `hard-restart-topic` keeps
 "wait"; the first two also failed under the corrected ideals in round 2. The held-out
-monologue's "Porta" is an ASR error for a proper noun outside the reference data.
+monologue's "Porta" is an ASR error for a proper noun outside the reference data. A later
+cleanup-only run (§9.6) added a narrow scratch-that rule that fixes the monologue's
+superseded batch size.
 
 ### 9.5 Spend
 
@@ -613,5 +622,40 @@ Round 3 used ~53.6 AssemblyAI audio-minutes (~$0.45 including the pre-fix, broad
 final suites plus two single-clip retries), ~$0.11 of Deepgram TTS and an estimated ~$0.11
 of gateway tokens. Artifact-backed AssemblyAI spend is ~$1.30; total spend is well under
 the $10 cap. See `SPEND.md` for the per-run table.
+
+### 9.6 Scratch-that alternatives (round 3b, cleanup only)
+
+Reviewer feedback corrected the `hard-monologue` ideal again: "scratch that, let's do 150 the
+first week" corrects the batch **size**, not the decision to batch or its reason. The ideal
+now keeps "we should probably onboard them in batches so support doesn't get overwhelmed.
+Let's do 150 the first week and see how it goes." The self-correction rule in both prompt
+files gained one sentence plus one example: a scratch-that cue replaces only the old numbers
+or choices, deleting the cue (even a whole sentence) and those values but keeping the rest of
+the clause, including a following "so ..." reason. The two prompt files are byte-identical
+(`cmp`; md5 `2556a554ff4fb3b8e4b07bd5294675cb`).
+
+This is a cleanup-only run on the saved v11 STT transcripts: gemma-4-31b on the AssemblyAI
+gateway, temperature 0 / max_tokens 3,000, no judge, no audio (`sweep.py` with `--tag
+hard_v12 --hard-source hard_v11.json --split hard`, and `--tag heldout_v12 --corpus
+../corpus/heldout_scripts.json --hard-source heldout_v11.json`, `--sleep 2.1`). Scored with
+`score.py` against the updated ideals (the hard v11 row is rescored under them; Tables
+9.1/9.2 show 98.3 under the earlier ideal).
+
+| Corpus | v11 auto | v12 auto | Clips that moved |
+|---|---:|---:|---|
+| Hard | 98.4 (18) | 99.1 (18) | `hard-monologue` 81 -> 93 |
+| Held-out (out-of-sample) | 98.7 (20) | 98.7 (20) | none |
+
+Before: "...we should probably onboard them in batches of 50 or 100, so support doesn't get
+overwhelmed. Actually, let's do 150 the first week and see how it goes."
+
+After: "...we should probably onboard them in batches. Let's do 150 the first week and see
+how it goes, so support doesn't get overwhelmed."
+
+The cue and the superseded "50 or 100" are gone; the batching plan, the reason and 150 stay.
+Residual: the model moves "so support doesn't get overwhelmed" to the end of the final
+sentence instead of leaving it after "batches" (reason kept, order shifted), so
+`hard-monologue` scores 93, not 100. Every other hard and held-out clip is unchanged, so the
+change is accepted. Held-out remains out-of-sample and unchanged.
 
 

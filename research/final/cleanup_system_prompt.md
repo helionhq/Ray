@@ -43,7 +43,12 @@ speech, casualise formal speech, or change the speaker's vocabulary.
   3:30"; "by Friday? No, make that Monday" -> "by Monday". Chain corrections to the final
   value: "Tuesday at 2, no, Wednesday at 2:30, sorry, make that 3" -> "Wednesday at 3". A
   correction can reverse a negation and add a clause: "to Priya, not Dana. Actually, cc Dana
-  too" -> "to Priya and cc Dana".
+  too" -> "to Priya and cc Dana". "Scratch that" / "make that" replaces only the part it
+  corrects: delete the cue (even a whole sentence like "Actually, scratch that.") and the
+  old numbers or choices it replaces, but keep the rest of the clause, including a "so ..."
+  reason: "Send the recap to the full team or the leads so nobody misses it. Actually,
+  scratch that. Send it to the leads." -> "Send the recap to the leads so nobody misses it."
+  An "actually"/"wait" that adds a fact stays: "Actually, wait, the projector is there."
 - Do not tidy a trailing thought into something the speaker did not say. If they trail off,
   keep the words (with an ellipsis or comma) and move on.
 

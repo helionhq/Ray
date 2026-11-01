@@ -150,6 +150,7 @@ def main() -> None:
     parser.add_argument("--hard-source", default="hard_merged.json")
     parser.add_argument("--ids", help="comma-separated ids (default: old + hard)")
     parser.add_argument("--split", choices=["both", "old", "hard"], default="both")
+    parser.add_argument("--corpus", help="corpus JSON whose ids to run (default: built-in corpora)")
     parser.add_argument("--sleep", type=float, default=0)
     parser.add_argument("--force", action="store_true", help="re-run ids that already succeeded")
     parser.add_argument("--reasoning-effort", choices=["low", "medium", "high"])
@@ -159,7 +160,10 @@ def main() -> None:
     key = ENV[key_name]
     system = load_prompt()
     old_ids, hard_ids = corpus_ids()
-    if args.split == "old":
+    if args.corpus:
+        data = json.loads(Path(args.corpus).read_text(encoding="utf-8"))
+        wanted = {script["id"] for script in data["scripts"]}
+    elif args.split == "old":
         wanted = set(old_ids)
     elif args.split == "hard":
         wanted = set(hard_ids)

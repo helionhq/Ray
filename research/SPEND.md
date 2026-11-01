@@ -71,3 +71,7 @@ generation plus 175 characters to regenerate `ho-bullets` with a different voice
 Gateway cleanup and judge calls are not token-recorded by the app path or `judge.py`; at
 roughly 185 cleanup calls and 265 judge calls (including the corrected-ideal hard re-judge)
 they are about **$0.11** at list rates. Total spend remains well under the $10 cap.
+
+Round 3b (cleanup-only prompt iteration, §9.6 in `RESULTS.md`): 97 gemma-4-31b gateway calls
+(three hard runs, two held-out runs and three single-clip probes), roughly 0.25M tokens,
+about **$0.02-0.03** at list rates. No STT, TTS or judge calls.
