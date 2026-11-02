@@ -86,6 +86,14 @@ export const ArrowRightIcon = (props: IconProps) => (
   </Icon>
 );
 
+export const MoreIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
+    <circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none" />
+  </Icon>
+);
+
 export const ReturnIcon = (props: IconProps) => (
   <Icon {...props}>
     <path d="M20 5v7a3 3 0 0 1-3 3H5M9 11l-4 4 4 4" />

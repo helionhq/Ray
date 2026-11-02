@@ -333,9 +333,6 @@ pub struct RuntimeConfig {
     pub pipeline: PipelineConfig,
     pub prompt: String,
     pub structured_prompt: String,
-    pub pipeline_source: String,
-    pub prompt_source: String,
-    pub structured_prompt_source: String,
 }
 
 /// Whether a raw `pipeline.json` document explicitly contains `cleanup.modes`.
@@ -358,7 +355,7 @@ impl RuntimeConfig {
         let prompt_override = app_data.join("cleanup.md");
         let structured_override = app_data.join("structured.md");
 
-        let (pipeline, pipeline_source) = match std::fs::read_to_string(&pipeline_override) {
+        let pipeline = match std::fs::read_to_string(&pipeline_override) {
             Ok(text) => match serde_json::from_str::<PipelineConfig>(&text) {
                 Ok(mut config) => {
                     // Overrides written before Structured existed have no
@@ -375,36 +372,30 @@ impl RuntimeConfig {
                             },
                         };
                     }
-                    (config, format!("{}", pipeline_override.display()))
+                    config
                 }
                 Err(error) => {
                     eprintln!("[ray] ignoring invalid pipeline.json override: {error}");
-                    (PipelineConfig::default(), "embedded".into())
+                    PipelineConfig::default()
                 }
             },
-            Err(_) => (PipelineConfig::default(), "embedded".into()),
+            Err(_) => PipelineConfig::default(),
         };
 
-        let (prompt, prompt_source) = match std::fs::read_to_string(&prompt_override) {
-            Ok(text) if !text.trim().is_empty() => (text, format!("{}", prompt_override.display())),
-            _ => (EMBEDDED_PROMPT.to_string(), "embedded".into()),
+        let prompt = match std::fs::read_to_string(&prompt_override) {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => EMBEDDED_PROMPT.to_string(),
         };
 
-        let (structured_prompt, structured_prompt_source) =
-            match std::fs::read_to_string(&structured_override) {
-                Ok(text) if !text.trim().is_empty() => {
-                    (text, format!("{}", structured_override.display()))
-                }
-                _ => (EMBEDDED_STRUCTURED_PROMPT.to_string(), "embedded".into()),
-            };
+        let structured_prompt = match std::fs::read_to_string(&structured_override) {
+            Ok(text) if !text.trim().is_empty() => text,
+            _ => EMBEDDED_STRUCTURED_PROMPT.to_string(),
+        };
 
         Self {
             pipeline,
             prompt,
             structured_prompt,
-            pipeline_source,
-            prompt_source,
-            structured_prompt_source,
         }
     }
 }
@@ -546,16 +537,12 @@ mod tests {
             runtime.structured_prompt,
             "# Structured\n\nSTRUCTURED PROMPT"
         );
-        assert!(runtime.prompt_source.ends_with("cleanup.md"));
-        assert!(runtime.structured_prompt_source.ends_with("structured.md"));
         std::fs::remove_dir_all(&dir).ok();
 
         // With no overrides both fall back to the embedded prompts.
         let runtime = RuntimeConfig::load(&dir);
         assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
         assert_eq!(runtime.structured_prompt, EMBEDDED_STRUCTURED_PROMPT);
-        assert_eq!(runtime.prompt_source, "embedded");
-        assert_eq!(runtime.structured_prompt_source, "embedded");
     }
 
     #[test]

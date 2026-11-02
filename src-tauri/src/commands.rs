@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::audio::{self, InputDevice};
 use crate::config::CleanupMode;
 use crate::hotkey;
-use crate::pipeline::{ConfigSummary, Dictation};
+use crate::pipeline::Dictation;
 use crate::secrets;
 use crate::store::{self, HistoryEntry, Settings, Store};
 use crate::windows_util;
@@ -28,7 +28,6 @@ pub struct Snapshot {
     pub settings: Settings,
     pub keys: KeyStatus,
     pub devices: Vec<InputDevice>,
-    pub config: ConfigSummary,
     pub launch_at_login: bool,
     /// `None` when the Right Alt hook is healthy.
     pub hotkey_error: Option<String>,
@@ -36,12 +35,8 @@ pub struct Snapshot {
 }
 
 #[tauri::command]
-pub async fn get_snapshot(
-    store: State<'_, Arc<Store>>,
-    dictation: State<'_, Arc<Dictation>>,
-) -> Result<Snapshot, String> {
+pub async fn get_snapshot(store: State<'_, Arc<Store>>) -> Result<Snapshot, String> {
     let data = store.snapshot();
-    let cleanup_mode = CleanupMode::from_id(&data.settings.cleanup_mode).unwrap_or_default();
     Ok(Snapshot {
         history: data.history,
         dictionary: data.dictionary,
@@ -51,7 +46,6 @@ pub async fn get_snapshot(
             vercel: secrets::has(secrets::VERCEL),
         },
         devices: audio::list_input_devices().unwrap_or_default(),
-        config: dictation.config_summary(cleanup_mode),
         launch_at_login: windows_util::launch_at_login(),
         hotkey_error: hotkey::status(),
         version: env!("CARGO_PKG_VERSION").to_string(),

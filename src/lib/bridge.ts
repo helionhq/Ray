@@ -35,22 +35,12 @@ export interface KeyStatus {
   vercel: boolean;
 }
 
-export interface ConfigSummary {
-  pipeline_source: string;
-  prompt_source: string;
-  structured_prompt_source: string;
-  speech_model: string;
-  streaming: boolean;
-  cleanup_models: string[];
-}
-
 export interface Snapshot {
   history: HistoryEntry[];
   dictionary: string[];
   settings: Settings;
   keys: KeyStatus;
   devices: InputDevice[];
-  config: ConfigSummary;
   launch_at_login: boolean;
   hotkey_error: string | null;
   version: string;
