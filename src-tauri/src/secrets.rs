@@ -6,13 +6,11 @@
 const SERVICE: &str = "ray";
 
 pub const ASSEMBLYAI: &str = "assemblyai";
-pub const GROQ: &str = "groq";
 pub const VERCEL: &str = "vercel";
 
 pub fn env_names(secret: &str) -> &'static [&'static str] {
     match secret {
         ASSEMBLYAI => &["ASSEMBLYAI_API_KEY", "RAY_ASSEMBLYAI_API_KEY"],
-        GROQ => &["GROQ_API_KEY", "RAY_GROQ_API_KEY"],
         VERCEL => &[
             "VERCEL_AI_GATEWAY_KEY",
             "AI_GATEWAY_API_KEY",
@@ -85,8 +83,8 @@ mod tests {
 
     #[test]
     fn credential_manager_round_trip() {
-        // A dedicated entry so the user's real AssemblyAI/Groq keys are never
-        // touched.
+        // A dedicated entry so the user's real AssemblyAI/Vercel keys are
+        // never touched.
         let name = "ray-selftest-roundtrip";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
         entry

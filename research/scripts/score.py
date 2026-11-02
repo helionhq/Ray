@@ -1,6 +1,6 @@
 """Automatic scoring of cleanup outputs against reference ideals.
 
-Usage: python score.py --tags groq_v1,g120
+Usage: python score.py --tags v11__gemma-4-31b
 """
 from __future__ import annotations
 

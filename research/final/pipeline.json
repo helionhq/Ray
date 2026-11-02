@@ -1,7 +1,7 @@
 {
   "schema": "ray.dictation.pipeline.v1",
-  "generated": "2026-11-01",
-  "recommendation": "AssemblyAI Sync live STT (Universal-3.5 Pro) + our own LLM cleanup pass (Gemma 4 31B on AssemblyAI LLM Gateway, Groq gpt-oss-120b fallback), hedged after 2.5 s so the slow primary tail is bounded",
+  "generated": "2026-11-02",
+  "recommendation": "AssemblyAI Sync live STT (Universal-3.5 Pro) + our own LLM cleanup pass (Gemma 4 31B on AssemblyAI LLM Gateway), hedged after 2.5 s so the slow primary tail is bounded",
   "audio_capture": {
     "format": "pcm_s16le",
     "sample_rate_hz": 16000,
@@ -116,11 +116,24 @@
       "user_message_template": "<transcript>\n{{TRANSCRIPT}}\n</transcript>",
       "temperature": 0,
       "max_tokens": 3000,
-      "max_tokens_note": "3000 leaves room for gpt-oss reasoning tokens plus the answer; 1500 was consumed entirely by reasoning on the 2-minute monologue.",
+      "max_tokens_note": "3000 leaves room for the answer plus a reasoning model's internal tokens; 1500 was consumed entirely by reasoning on the 2-minute monologue.",
       "stream": true,
       "timeout_ms": 6000,
       "hedge_after_ms": 2500,
-      "hedging": "Start the fallback in parallel if the primary has not produced a valid answer after hedge_after_ms (or has already failed). First valid answer wins; the loser is cancelled. Chosen from the measured primary p95 (~2.6-2.8 s cold); warm calls are usually under 0.8 s."
+      "hedging": "The app may start a second provider in parallel if the primary has not produced a valid answer after hedge_after_ms (or has already failed). First valid answer wins; the loser is cancelled. Chosen from the measured primary p95 (~2.6-2.8 s cold); warm calls are usually under 0.8 s. This research artifact measures the primary only.",
+      "structured_mode": {
+        "system_prompt_file": "research/final/structured_system_prompt.md",
+        "provider": "assemblyai_llm_gateway",
+        "base_url": "https://llm-gateway.assemblyai.com/v1",
+        "model": "gemma-4-31b",
+        "temperature": 0,
+        "max_tokens": 3000,
+        "timeout_ms": 8000,
+        "hedge_after_ms": 4000,
+        "fallback": "none; the raw transcript is the last resort",
+        "guard": "rejects added causal/inferential connectives (because, since, therefore, thus, hence, so that, which means, as a result, consequently) with token-sequence matching",
+        "reference": "research/STRUCTURED_RESULTS.md"
+      }
     },
     "primary": {
       "provider": "assemblyai_llm_gateway",
@@ -139,34 +152,18 @@
       },
       "quality": "best: contextual Grok/Groq, paragraphing, lists, instruction preservation"
     },
-    "fallback": {
-      "provider": "groq",
-      "base_url": "https://api.groq.com/openai/v1",
-      "model": "openai/gpt-oss-120b",
-      "auth_header": "Authorization: Bearer <GROQ_API_KEY>",
-      "extra_params": {
-        "reasoning_effort": "low"
-      },
-      "pricing": "free tier",
-      "rate_limit_observed": {
-        "requests_per_day": 1000,
-        "tokens_per_minute": 8000,
-        "tokens_per_day": 200000
-      },
-      "measured_latency_ms": {
-        "p50": 476,
-        "p95": 890,
-        "max": 1108
-      },
-      "when": "gateway 429/5xx/timeout, or if lowest latency is required",
-      "capacity_note": "Free tier TPD (~200k) limits a heavy user to ~150 dictations/day at ~1.35k tokens each. Use as fallback/fast mode, not primary."
-    },
     "last_resort": {
       "behavior": "insert the raw STT transcript",
       "note": "Always better than dropping the dictation; raw text is punctuated and readable."
     },
     "model_sweep_2026-11-01": {
-      "groq_catalog_observed": [
+      "aai_gateway_accessible": [
+        "gemma-4-31b",
+        "qwen3.5-4b-32k-fast"
+      ],
+      "aai_gateway_listed_but_not_accessible": "gemini, claude, gpt-5, deepseek, kimi, grok, glm, nemotron, minimax and muse return 'Your account does not have access to this LLM Gateway model'",
+      "outcome": "gemma-4-31b stays primary for quality. The gateway exposes only gemma-4-31b and qwen3.5-4b-32k-fast to this account. qwen3.5-4b-32k-fast scored lower and produced 98 s timeout tails. The historical second-provider models are no longer part of the pipeline.",
+      "historical_second_provider_catalog": [
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
         "openai/gpt-oss-safeguard-20b",
@@ -174,13 +171,7 @@
         "allam-2-7b",
         "whisper-large-v3",
         "whisper-large-v3-turbo"
-      ],
-      "aai_gateway_accessible": [
-        "gemma-4-31b",
-        "qwen3.5-4b-32k-fast"
-      ],
-      "aai_gateway_listed_but_not_accessible": "gemini, claude, gpt-5, deepseek, kimi, grok, glm, nemotron, minimax and muse return 'Your account does not have access to this LLM Gateway model'",
-      "outcome": "gemma-4-31b stays primary for quality. openai/gpt-oss-120b stays fallback: it matched gemma on the hard corpus, resolves chained corrections, and is ~1 s warm. gpt-oss-20b is faster but kept a chained correction in the old set and once spent the whole 1500-token budget on reasoning; max_tokens is now 3000. qwen3.8-27b is fast but its 1000 output-tokens/minute cap makes it unusable for long dictations. qwen3.5-4b-32k-fast scored lower and produced 98 s timeout tails."
+      ]
     },
     "retry_policy": {
       "retries": 2,
@@ -195,8 +186,8 @@
         503,
         504
       ],
-      "then": "switch to fallback model once, then raw transcript",
-      "context": "The primary is hedged rather than retried on the tail: the fallback starts at hedge_after_ms and the first valid answer wins. A Groq 429 can only fail the fallback request; it never delays or cancels the primary."
+      "then": "retry the primary, then use the raw transcript",
+      "context": "The primary is hedged rather than retried on the tail: a second provider may start at hedge_after_ms and the first valid answer wins."
     }
   },
   "pipeline": {
@@ -209,7 +200,6 @@
     ],
     "end_to_end_latency_ms_estimate": {
       "typical_10s_dictation_with_gemma": 2100,
-      "typical_10s_dictation_with_gpt_oss_120b": 1000,
       "long_60s_dictation_with_gemma": 3400
     },
     "cost_estimate_per_1000_dictations_15s": {

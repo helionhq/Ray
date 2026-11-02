@@ -8,7 +8,7 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar
 
 - **Right Alt toggles recording.** A low-level keyboard hook swallows both edges of the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held cancels the recording and replays the chord with Right Alt down, so AltGr characters (`@`, `€`) and Alt+Tab still work. **Esc** cancels.
 - **AssemblyAI Sync live** streams 16 kHz mono PCM while you talk. Stopping leaves only the tail and final decode (~0.5 s typical). If live fails, Ray falls back to Sync batch, then the asynchronous v2 batch API, using the locally buffered WAV.
-- **Cleanup** sends the transcript through an OpenAI-compatible chat endpoint. Default chain: `gemma-4-31b` on the AssemblyAI LLM Gateway (same key as STT) → `openai/gpt-oss-120b` on Groq → Vercel AI Gateway if you add a key. If every provider fails, the raw transcript is pasted rather than lost.
+- **Cleanup** sends the transcript through an OpenAI-compatible chat endpoint on the AssemblyAI LLM Gateway (same key as STT). Pick a mode in Settings: **Clean** removes fillers and fixes grammar without reordering, while **Structured** rephrases for flow and can add paragraphs and lists. If cleanup fails, the raw transcript is pasted rather than lost.
 - **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard. Restore timing is adaptive (longer for Electron, Office, and browsers) and is skipped if anything else changed the clipboard meanwhile, so slow targets never paste the old contents. Transient dictation text is excluded from Win+V clipboard history and cloud clipboard. If the focused window is elevated, Ray says so instead of silently failing.
 - **History**, a **dictionary** of preferred spellings, and **keys/settings** live in a monochrome Notion/Linear-style window. Closing it hides it; Ray stays in the tray.
 - The bar is always-on-top, click-through, non-focusable, hidden from the taskbar, and sits above the taskbar of the monitor with the focused window.
@@ -46,20 +46,38 @@ Enter keys in **Settings → Transcription / Cleanup**. They are stored in **Win
 For development and headless tests, the app also accepts environment variables when no stored key exists:
 
 - `ASSEMBLYAI_API_KEY`
-- `GROQ_API_KEY`
 
-Put them in a local `.env` (gitignored) and export it before launching, or set them in the shell. The AssemblyAI key powers both STT and the primary cleanup model.
+Put it in a local `.env` (gitignored) and export it before launching, or set it in the shell. The AssemblyAI key powers both STT and the cleanup model.
 
 ## Swapping the prompt or models
 
-Everything lives in two files:
+Everything lives in these files:
 
-- `src-tauri/prompts/cleanup.md` — the cleanup system prompt. Supports `{{DICTIONARY}}`, `{{KNOWN_NAMES}}`, `{{APP_NAME}}`, and `{{TRANSCRIPT}}`.
-- `src-tauri/config/pipeline.json` — STT mode/model/endpoints, cleanup provider order, models, temperature, retries, timeouts, and the built-in known-names list.
+- `src-tauri/prompts/cleanup.md` — the Clean mode system prompt. Supports `{{DICTIONARY}}`, `{{KNOWN_NAMES}}`, `{{APP_NAME}}`, and `{{TRANSCRIPT}}`.
+- `src-tauri/prompts/structured.md` — the Structured mode system prompt, with the same placeholders.
+- `src-tauri/config/pipeline.json` — STT mode/model/endpoints, cleanup provider order, models, temperature, retries, timeouts, per-mode overrides, and the built-in known-names list.
 
-Rebuild after editing them, or override at runtime without a rebuild by placing `cleanup.md` and/or `pipeline.json` in `%APPDATA%\com.helion.ray\` and pressing **Settings → About → Reload config**. Runtime overrides use the same schema as the checked-in files.
+Rebuild after editing them, or override at runtime without a rebuild by placing `cleanup.md`, `structured.md`, and/or `pipeline.json` in `%APPDATA%\com.helion.ray\` and pressing **Settings → About → Reload config**. Runtime overrides use the same schema as the checked-in files.
 
-To use a different STT protocol, set `stt.mode` to `sync_live` (default) or `websocket`. To add an LLM provider, add an entry to `cleanup.providers` with an OpenAI-compatible `base_url`, `model`, and one of the `api_key_secret` values (`assemblyai`, `groq`, `vercel`).
+To use a different STT protocol, set `stt.mode` to `sync_live` (default) or `websocket`. To add an LLM provider, add an entry to `cleanup.providers` with an OpenAI-compatible `base_url`, `model`, and one of the `api_key_secret` values (`assemblyai`, `vercel`) and the matching key in Settings.
+
+Structured can override any of the base cleanup fields without touching Clean:
+
+```json
+"cleanup": {
+  "modes": {
+    "structured": {
+      "model": "gemma-4-31b",
+      "temperature": 0.2,
+      "max_tokens": 4000,
+      "timeout_ms": 8000,
+      "hedge_after_ms": 2500
+    }
+  }
+}
+```
+
+Unset fields inherit the base `cleanup` config, and `model` is passed through verbatim to the primary provider (the AssemblyAI gateway also serves non-Gemma ids).
 
 ## Headless verification
 
@@ -72,20 +90,23 @@ cargo run --manifest-path src-tauri/Cargo.toml -- --selftest path/to/16k-mono.wa
 # Live STT (Sync live by default) + cleanup
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-stream path/to/16k-mono.wav
 
+# Run the same clip through the Structured cleanup mode
+cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-stream path/to/16k-mono.wav --mode structured
+
 # Any-rate audio: run it through the real capture resampler, then live STT + cleanup
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-resample path/to/48k-mono.wav
 
 # Force the WebSocket STT implementation instead
 RAY_STT_MODE=websocket cargo run ... -- --selftest-stream ...
 
-# Force the primary cleanup endpoint to fail, to exercise the fallback chain
+# Force cleanup to fail, exercising the raw-transcript fallback
 RAY_TEST_FORCE_FALLBACK=1 cargo run ... --selftest ...
 
 # Real microphone capture for ~2.5 seconds (sample count + ambient level)
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-mic
 ```
 
-The selftest prints `stop_to_transcript_ms` and `cleanup_ms`, and falls back to batch if the live request fails, exactly like the app. Set `RAY_TEST_WARM=1` to pre-warm the cleanup connection before STT (simulating a recording), and `RAY_TEST_REPEAT_CLEANUP=1` to measure a second, already-warm cleanup call.
+The selftest prints `stop_to_transcript_ms` and `cleanup_ms`, and falls back to batch if the live request fails, exactly like the app. `--mode structured` (or `RAY_CLEANUP_MODE=structured`) selects the Structured mode; it defaults to Clean. Set `RAY_TEST_WARM=1` to pre-warm the cleanup connection before STT (simulating a recording), and `RAY_TEST_REPEAT_CLEANUP=1` to measure a second, already-warm cleanup call.
 
 A 16 kHz mono WAV can be generated with Deepgram:
 
@@ -125,5 +146,4 @@ The bar window is a separate Tauri window (`bar.html`). It is styled with `WS_EX
 - A single recording stops automatically at 5 minutes, the size of the local batch-fallback buffer. The bar tells you when that happens.
 - Pasting into elevated (admin) windows is blocked by Windows UIPI. Ray detects this and copies the text to the clipboard with a clear message instead of silently doing nothing.
 - On layouts where Right Alt is AltGr, typing an AltGr character starts and immediately cancels a dictation (a brief bar flicker), but the character itself is replayed correctly. A bare Right Alt is still the dictation toggle.
-- Groq's free tier has a daily token cap; the app falls back to the next provider or raw text.
 - Multi-monitor placement is implemented but only verified on a single monitor.

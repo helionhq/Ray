@@ -1,5 +1,11 @@
 import { Fragment, useState } from "react";
-import type { Provider, Settings, Snapshot, Theme } from "../lib/bridge";
+import type {
+  CleanupMode,
+  Provider,
+  Settings,
+  Snapshot,
+  Theme,
+} from "../lib/bridge";
 import { api } from "../lib/bridge";
 import { applyTheme } from "../lib/theme";
 import { hotkeyLabel } from "../lib/format";
@@ -27,12 +33,16 @@ type Drafts = Record<Provider, string>;
 type Reveals = Record<Provider, boolean>;
 type ProviderFlags = Record<Provider, boolean>;
 
-const emptyDrafts: Drafts = { assemblyai: "", groq: "", vercel: "" };
-const hidden: Reveals = { assemblyai: false, groq: false, vercel: false };
+const emptyDrafts: Drafts = { assemblyai: "", vercel: "" };
+const hidden: Reveals = { assemblyai: false, vercel: false };
 const unflagged: ProviderFlags = {
   assemblyai: false,
-  groq: false,
   vercel: false,
+};
+
+const cleanupModeHelp: Record<CleanupMode, string> = {
+  clean: "Removes fillers and fixes grammar, keeping your wording and order.",
+  structured: "Rephrases for flow, adds paragraphs and lists, and may reorder.",
 };
 
 /** "gemma-4-31b (assemblyai)" reads as "gemma-4-31b" in the chain. */
@@ -404,10 +414,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
         <div className="row">
           <div className="row-copy">
             <div className="label">Clean up transcripts</div>
-            <div className="help">
-              Removes fillers and stutters, fixes punctuation, applies your
-              dictionary.
-            </div>
+            <div className="help">Turns raw speech into ready-to-send text.</div>
           </div>
           <button
             type="button"
@@ -424,12 +431,30 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
             }
           />
         </div>
-        {keyRow(
-          "groq",
-          "Groq",
-          "Fallback when the gateway is slow or busy.",
-          "Paste your Groq key",
-        )}
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Mode</div>
+            <div className="help">
+              Clean removes fillers and fixes grammar without reordering.
+              Structured rephrases for flow, adds paragraphs and lists, and may
+              reorder.
+            </div>
+          </div>
+          <div className="segmented" role="group" aria-label="Cleanup mode">
+            {(["clean", "structured"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={snapshot.settings.cleanup_mode === mode}
+                disabled={busy !== null || !snapshot.settings.cleanup_enabled}
+                title={cleanupModeHelp[mode]}
+                onClick={() => void update({ cleanup_mode: mode }, "mode")}
+              >
+                {mode === "clean" ? "Clean" : "Structured"}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="row sub-row">
           <div className="chain">
             {snapshot.config.cleanup_models.map((model, index) => (
@@ -617,6 +642,10 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
             <dd className="mono">{snapshot.config.prompt_source}</dd>
           </div>
           <div>
+            <dt>Structured prompt</dt>
+            <dd className="mono">{snapshot.config.structured_prompt_source}</dd>
+          </div>
+          <div>
             <dt>Pipeline</dt>
             <dd className="mono">{snapshot.config.pipeline_source}</dd>
           </div>
@@ -625,7 +654,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
           <button
             type="button"
             className="btn btn-ghost"
-            title="Reload pipeline.json and cleanup.md overrides"
+            title="Reload pipeline.json, cleanup.md and structured.md overrides"
             onClick={async () => {
               try {
                 await api.reloadConfig();

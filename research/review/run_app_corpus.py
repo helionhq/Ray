@@ -12,6 +12,8 @@ Outputs are written in the shapes the existing score.py / judge.py read:
 Usage:
   python research/review/run_app_corpus.py --tag app_sync_live
   python research/review/run_app_corpus.py --tag app_sync_live --ids long-rambling,names-tech
+  python research/review/run_app_corpus.py --tag app_structured --mode structured \
+      --corpus research/corpus/structured_scripts.json
 """
 from __future__ import annotations
 
@@ -98,6 +100,11 @@ def main() -> None:
     )
     ap.add_argument("--ids", help="comma-separated script ids")
     ap.add_argument("--batch", action="store_true", help="use --selftest (batch) instead of live")
+    ap.add_argument(
+        "--mode",
+        choices=("clean", "structured"),
+        help="cleanup mode (default: the app's/default clean mode)",
+    )
     ap.add_argument("--dictionary", default="Arham,Helion,Ray")
     ap.add_argument("--app", default="Notepad")
     ap.add_argument("--force-fallback", action="store_true")
@@ -116,6 +123,8 @@ def main() -> None:
     env.update({k: v for k, v in load_env().items() if k not in env})
     env["RAY_TEST_DICTIONARY"] = args.dictionary
     env["RAY_TEST_APP_NAME"] = args.app
+    if args.mode:
+        env["RAY_CLEANUP_MODE"] = args.mode
     if args.force_fallback:
         env["RAY_TEST_FORCE_FALLBACK"] = "1"
     if args.warm:

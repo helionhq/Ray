@@ -1,6 +1,6 @@
 """LLM judge for cleanup outputs. Scores fidelity, names, formatting and no-answer behaviour.
 
-Usage: python judge.py --tags groq_v1__openai_gpt-oss-120b --judge gemini-3.5-flash
+Usage: python judge.py --tags v11__gemma-4-31b --judge qwen3.5-4b-32k-fast
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 
 from common import ENV, OUT, corpus
 
-PROVIDERS = {"groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"), "aai": ("https://llm-gateway.assemblyai.com/v1", "ASSEMBLYAI_API_KEY")}
+PROVIDERS = {"aai": ("https://llm-gateway.assemblyai.com/v1", "ASSEMBLYAI_API_KEY")}
 BASE, KEY = "", ""
 
 JUDGE_SYSTEM = """You are a strict evaluator of a dictation-cleanup output. You are given the
@@ -48,9 +48,6 @@ No markdown fences."""
 def call(model: str, system: str, user: str) -> dict:
     payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                "temperature": 0, "max_tokens": 700}
-    # gpt-oss accepts reasoning_effort; most gateway models reject it.
-    if model.startswith("openai/gpt-oss"):
-        payload["reasoning_effort"] = "low"
     req = urllib.request.Request(BASE + "/chat/completions", data=json.dumps(payload).encode(),
                                  headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json",
                                           "User-Agent": "RayDictationResearch/1.0"}, method="POST")
@@ -81,8 +78,8 @@ def parse(text: str) -> dict | None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tags", required=True)
-    ap.add_argument("--judge", default="openai/gpt-oss-120b")
-    ap.add_argument("--provider", default="groq", choices=PROVIDERS)
+    ap.add_argument("--judge", default="qwen3.5-4b-32k-fast")
+    ap.add_argument("--provider", default="aai", choices=PROVIDERS)
     ap.add_argument("--source", default="sync_raw")
     ap.add_argument("--corpus", default=None, help="corpus JSON (default: scripts.json)")
     ap.add_argument("--ids")

@@ -1,11 +1,10 @@
-"""Run raw transcripts through cleanup models (Groq and AssemblyAI LLM Gateway).
+"""Run raw transcripts through cleanup models on the AssemblyAI LLM Gateway.
 
 OpenAI-compatible. Measures time-to-first-token (streaming) and total latency,
 saves per-model outputs.
 
 Usage:
-  python llm_eval.py --provider groq --models openai/gpt-oss-120b --tag g120
-  python llm_eval.py --provider aai  --models gemini-3.5-flash-lite --tag ...
+  python llm_eval.py --provider aai --models gemma-4-31b --tag v4
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from pathlib import Path
 from common import ENV, FINAL, OUT, corpus
 
 PROVIDERS = {
-    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
     "aai": ("https://llm-gateway.assemblyai.com/v1", "ASSEMBLYAI_API_KEY"),
 }
 

@@ -1,10 +1,10 @@
-//! Pipeline configuration and the cleanup prompt.
+//! Pipeline configuration and the cleanup prompts.
 //!
 //! Both are embedded in the binary but can be overridden at runtime by files in
-//! the app-data directory (`pipeline.json`, `cleanup.md`). This is the one place
-//! where models, endpoints, and STT options live. The defaults are the result of
-//! `research/final/`: AssemblyAI Sync live STT + a Gemma cleanup pass on the
-//! AssemblyAI LLM Gateway, with a Groq fallback.
+//! the app-data directory (`pipeline.json`, `cleanup.md`, `structured.md`). This
+//! is the one place where models, endpoints, and STT options live. The defaults
+//! are the result of `research/final/`: AssemblyAI Sync live STT + a Gemma
+//! cleanup pass on the AssemblyAI LLM Gateway.
 
 use std::path::Path;
 
@@ -12,6 +12,36 @@ use serde::{Deserialize, Serialize};
 
 pub const EMBEDDED_PIPELINE: &str = include_str!("../config/pipeline.json");
 pub const EMBEDDED_PROMPT: &str = include_str!("../prompts/cleanup.md");
+pub const EMBEDDED_STRUCTURED_PROMPT: &str = include_str!("../prompts/structured.md");
+
+/// The cleanup pass the user selected. `Clean` is a strict editor; `Structured`
+/// may reorder and rephrase so the result reads as finished prose or a list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CleanupMode {
+    #[default]
+    Clean,
+    Structured,
+}
+
+impl CleanupMode {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Structured => "structured",
+        }
+    }
+
+    /// Unknown or malformed values fall back to `None`; callers use the
+    /// default mode so an old or hand-edited settings file never breaks.
+    pub fn from_id(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "clean" => Some(Self::Clean),
+            "structured" => Some(Self::Structured),
+            _ => None,
+        }
+    }
+}
 
 pub fn default_known_names() -> Vec<String> {
     [
@@ -191,6 +221,60 @@ pub struct CleanupConfig {
     pub retries: u32,
     pub backoff_ms: Vec<u64>,
     pub providers: Vec<CleanupProvider>,
+    /// Per-mode overrides. Unset fields inherit the base cleanup config above.
+    #[serde(default)]
+    pub modes: CleanupModes,
+}
+
+/// Optional overrides for the Structured cleanup mode. The manager/research
+/// agent can tune Structured without touching Clean's settings.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupModes {
+    pub structured: CleanupModeOverride,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupModeOverride {
+    /// Model id passed through verbatim to the first provider (the primary).
+    pub model: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub timeout_ms: Option<u64>,
+    pub hedge_after_ms: Option<u64>,
+}
+
+impl CleanupConfig {
+    /// The effective config for `mode`. Clean returns an exact clone, so its
+    /// request body, limits and timing are byte-for-byte unchanged.
+    pub fn for_mode(&self, mode: CleanupMode) -> Self {
+        let mut config = self.clone();
+        if mode != CleanupMode::Structured {
+            return config;
+        }
+        let overrides = &self.modes.structured;
+        if let Some(model) = &overrides.model {
+            if let Some(primary) = config.providers.first_mut() {
+                // Pass the id through as-is: the AssemblyAI LLM Gateway accepts
+                // non-Gemma ids (Claude/GPT/Gemini) on the same endpoint.
+                primary.model = model.clone();
+            }
+        }
+        if let Some(temperature) = overrides.temperature {
+            config.temperature = temperature;
+        }
+        if let Some(max_tokens) = overrides.max_tokens {
+            config.max_tokens = max_tokens;
+        }
+        if let Some(timeout_ms) = overrides.timeout_ms {
+            config.timeout_ms = timeout_ms;
+        }
+        if let Some(hedge_after_ms) = overrides.hedge_after_ms {
+            config.hedge_after_ms = hedge_after_ms;
+        }
+        config
+    }
 }
 
 pub fn default_cleanup_timeout_ms() -> u64 {
@@ -211,22 +295,14 @@ impl Default for CleanupConfig {
             hedge_after_ms: default_hedge_after_ms(),
             retries: 2,
             backoff_ms: vec![300, 900],
-            providers: vec![
-                CleanupProvider {
-                    id: "assemblyai".into(),
-                    base_url: "https://llm-gateway.assemblyai.com/v1".into(),
-                    model: "gemma-4-31b".into(),
-                    api_key_secret: "assemblyai".into(),
-                    extra_body: None,
-                },
-                CleanupProvider {
-                    id: "groq".into(),
-                    base_url: "https://api.groq.com/openai/v1".into(),
-                    model: "openai/gpt-oss-120b".into(),
-                    api_key_secret: "groq".into(),
-                    extra_body: Some(serde_json::json!({ "reasoning_effort": "low" })),
-                },
-            ],
+            providers: vec![CleanupProvider {
+                id: "assemblyai".into(),
+                base_url: "https://llm-gateway.assemblyai.com/v1".into(),
+                model: "gemma-4-31b".into(),
+                api_key_secret: "assemblyai".into(),
+                extra_body: None,
+            }],
+            modes: CleanupModes::default(),
         }
     }
 }
@@ -241,20 +317,32 @@ pub struct CleanupProvider {
     pub extra_body: Option<serde_json::Value>,
 }
 
+/// The prompt template that belongs to `mode`. Clean keeps using `cleanup.md`;
+/// Structured uses `structured.md`.
+pub fn prompt_for<'a>(clean: &'a str, structured: &'a str, mode: CleanupMode) -> &'a str {
+    match mode {
+        CleanupMode::Clean => clean,
+        CleanupMode::Structured => structured,
+    }
+}
+
 /// Files a user (or the research agent) can drop into the app-data directory to
 /// override the embedded pipeline without a rebuild.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub pipeline: PipelineConfig,
     pub prompt: String,
+    pub structured_prompt: String,
     pub pipeline_source: String,
     pub prompt_source: String,
+    pub structured_prompt_source: String,
 }
 
 impl RuntimeConfig {
     pub fn load(app_data: &Path) -> Self {
         let pipeline_override = app_data.join("pipeline.json");
         let prompt_override = app_data.join("cleanup.md");
+        let structured_override = app_data.join("structured.md");
 
         let (pipeline, pipeline_source) = match std::fs::read_to_string(&pipeline_override) {
             Ok(text) => match serde_json::from_str::<PipelineConfig>(&text) {
@@ -272,11 +360,21 @@ impl RuntimeConfig {
             _ => (EMBEDDED_PROMPT.to_string(), "embedded".into()),
         };
 
+        let (structured_prompt, structured_prompt_source) =
+            match std::fs::read_to_string(&structured_override) {
+                Ok(text) if !text.trim().is_empty() => {
+                    (text, format!("{}", structured_override.display()))
+                }
+                _ => (EMBEDDED_STRUCTURED_PROMPT.to_string(), "embedded".into()),
+            };
+
         Self {
             pipeline,
             prompt,
+            structured_prompt,
             pipeline_source,
             prompt_source,
+            structured_prompt_source,
         }
     }
 }
@@ -291,16 +389,143 @@ mod tests {
         assert_eq!(config.stt.mode, "sync_live");
         assert_eq!(config.stt.sync_live.model, "universal-3-5-pro");
         assert_eq!(config.cleanup.providers[0].model, "gemma-4-31b");
-        assert_eq!(config.cleanup.providers[1].model, "openai/gpt-oss-120b");
-        assert_eq!(config.cleanup.providers.len(), 2);
+        assert_eq!(config.cleanup.providers.len(), 1);
         assert!(config.cleanup.providers.iter().all(|p| p.id != "vercel"));
         assert!(config.known_names.iter().any(|name| name == "Helion"));
         assert!(config.known_names.iter().any(|name| name == "GPT-5"));
         assert_eq!(config.cleanup.max_tokens, 3_000);
         assert_eq!(config.cleanup.timeout_ms, 6_000);
         assert_eq!(config.cleanup.hedge_after_ms, 2_500);
+        // Structured's researched overrides are in the embedded config, while
+        // Clean's effective config stays exactly the base values.
+        let structured = config.cleanup.for_mode(CleanupMode::Structured);
+        assert_eq!(structured.providers[0].model, "gemma-4-31b");
+        assert_eq!(structured.temperature, 0.0);
+        assert_eq!(structured.max_tokens, 3_000);
+        assert_eq!(structured.timeout_ms, 8_000);
+        assert_eq!(structured.hedge_after_ms, 4_000);
+        let clean = config.cleanup.for_mode(CleanupMode::Clean);
+        assert_eq!(clean.timeout_ms, 6_000);
+        assert_eq!(clean.hedge_after_ms, 2_500);
         assert!(config.known_names.iter().any(|name| name == "gpt-oss"));
         assert!(!EMBEDDED_PROMPT.trim().is_empty());
+        assert!(!EMBEDDED_STRUCTURED_PROMPT.trim().is_empty());
+    }
+
+    #[test]
+    fn cleanup_mode_defaults_to_clean_and_parses_known_ids() {
+        assert_eq!(CleanupMode::default(), CleanupMode::Clean);
+        assert_eq!(CleanupMode::from_id(" Clean "), Some(CleanupMode::Clean));
+        assert_eq!(
+            CleanupMode::from_id("STRUCTURED"),
+            Some(CleanupMode::Structured)
+        );
+        assert_eq!(CleanupMode::from_id("rewrite"), None);
+        assert_eq!(CleanupMode::Clean.id(), "clean");
+        assert_eq!(CleanupMode::Structured.id(), "structured");
+    }
+
+    #[test]
+    fn structured_overrides_inherit_unset_fields() {
+        let cleanup: CleanupConfig = serde_json::from_str(
+            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"timeout_ms":6000,
+                "hedge_after_ms":2500,"retries":2,"backoff_ms":[300,900],
+                "providers":[{"id":"assemblyai",
+                    "base_url":"https://llm-gateway.assemblyai.com/v1",
+                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
+                "modes":{"structured":{"max_tokens":4200}}}"#,
+        )
+        .unwrap();
+
+        // Clean is an exact clone: no override may leak into it.
+        let clean = cleanup.for_mode(CleanupMode::Clean);
+        assert_eq!(clean.temperature, 0.0);
+        assert_eq!(clean.max_tokens, 3_000);
+        assert_eq!(clean.providers[0].model, "gemma-4-31b");
+        assert_eq!(clean.timeout_ms, 6_000);
+        assert_eq!(clean.hedge_after_ms, 2_500);
+
+        // Only the field the override names changes; everything else inherits.
+        let structured = cleanup.for_mode(CleanupMode::Structured);
+        assert_eq!(structured.temperature, 0.0);
+        assert_eq!(structured.max_tokens, 4_200);
+        assert_eq!(structured.providers[0].model, "gemma-4-31b");
+        assert_eq!(structured.timeout_ms, 6_000);
+        assert_eq!(structured.hedge_after_ms, 2_500);
+    }
+
+    #[test]
+    fn structured_model_override_is_passed_through_verbatim() {
+        let cleanup: CleanupConfig = serde_json::from_str(
+            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"retries":2,
+                "backoff_ms":[300,900],
+                "providers":[{"id":"assemblyai",
+                    "base_url":"https://llm-gateway.assemblyai.com/v1",
+                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
+                "modes":{"structured":{"model":"claude-sonnet-4-5",
+                    "temperature":0.2,"timeout_ms":9000,"hedge_after_ms":3000}}}"#,
+        )
+        .unwrap();
+        let structured = cleanup.for_mode(CleanupMode::Structured);
+        // Non-Gemma gateway ids are not rewritten or rejected.
+        assert_eq!(structured.providers[0].model, "claude-sonnet-4-5");
+        assert_eq!(structured.temperature, 0.2);
+        assert_eq!(structured.timeout_ms, 9_000);
+        assert_eq!(structured.hedge_after_ms, 3_000);
+        assert_eq!(structured.max_tokens, 3_000);
+    }
+
+    #[test]
+    fn clean_selects_the_clean_prompt_and_structured_the_other() {
+        // Clean's prompt source must be exactly the old one.
+        assert_eq!(
+            prompt_for("clean prompt", "structured prompt", CleanupMode::Clean),
+            "clean prompt"
+        );
+        assert_eq!(
+            prompt_for(
+                EMBEDDED_PROMPT,
+                EMBEDDED_STRUCTURED_PROMPT,
+                CleanupMode::Clean
+            ),
+            EMBEDDED_PROMPT
+        );
+        assert_eq!(
+            prompt_for(
+                EMBEDDED_PROMPT,
+                EMBEDDED_STRUCTURED_PROMPT,
+                CleanupMode::Structured
+            ),
+            EMBEDDED_STRUCTURED_PROMPT
+        );
+    }
+
+    #[test]
+    fn runtime_overrides_load_each_prompt_independently() {
+        let dir = std::env::temp_dir().join(format!("ray-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cleanup.md"), "# Clean\n\nCLEAN PROMPT").unwrap();
+        std::fs::write(
+            dir.join("structured.md"),
+            "# Structured\n\nSTRUCTURED PROMPT",
+        )
+        .unwrap();
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.prompt, "# Clean\n\nCLEAN PROMPT");
+        assert_eq!(
+            runtime.structured_prompt,
+            "# Structured\n\nSTRUCTURED PROMPT"
+        );
+        assert!(runtime.prompt_source.ends_with("cleanup.md"));
+        assert!(runtime.structured_prompt_source.ends_with("structured.md"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // With no overrides both fall back to the embedded prompts.
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
+        assert_eq!(runtime.structured_prompt, EMBEDDED_STRUCTURED_PROMPT);
+        assert_eq!(runtime.prompt_source, "embedded");
+        assert_eq!(runtime.structured_prompt_source, "embedded");
     }
 
     #[test]
@@ -314,5 +539,7 @@ mod tests {
         .unwrap();
         assert_eq!(cleanup.timeout_ms, 6_000);
         assert_eq!(cleanup.hedge_after_ms, 2_500);
+        // A document written before modes existed still loads.
+        assert_eq!(cleanup.modes.structured.model, None);
     }
 }

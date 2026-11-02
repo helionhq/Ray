@@ -14,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio::{self, Capture};
 use crate::cleanup;
-use crate::config::RuntimeConfig;
+use crate::config::{prompt_for, CleanupMode, RuntimeConfig};
 use crate::hotkey;
 use crate::paste;
 use crate::secrets;
@@ -26,6 +26,7 @@ use crate::windows_util;
 pub struct ConfigSummary {
     pub pipeline_source: String,
     pub prompt_source: String,
+    pub structured_prompt_source: String,
     pub speech_model: String,
     pub streaming: bool,
     pub cleanup_models: Vec<String>,
@@ -38,6 +39,9 @@ struct Session {
     target: Option<windows_util::Foreground>,
     keyterms: Vec<String>,
     cleanup_enabled: bool,
+    /// Captured when the recording starts, so changing the setting mid-flight
+    /// cannot change the dictation already being processed.
+    cleanup_mode: CleanupMode,
     level_task: tokio::task::JoinHandle<()>,
     limit_task: tokio::task::JoinHandle<()>,
 }
@@ -187,6 +191,7 @@ impl Dictation {
         ConfigSummary {
             pipeline_source: config.pipeline_source.clone(),
             prompt_source: config.prompt_source.clone(),
+            structured_prompt_source: config.structured_prompt_source.clone(),
             speech_model,
             streaming: config.pipeline.stt.streaming,
             cleanup_models: config
@@ -248,6 +253,7 @@ impl Dictation {
             }
         }
         let target = windows_util::foreground();
+        let cleanup_mode = CleanupMode::from_id(&settings.cleanup_mode).unwrap_or_default();
 
         // Show the bar before the microphone opens; it should feel instant.
         self.emit_bar(json!({ "phase": "recording" }));
@@ -269,7 +275,7 @@ impl Dictation {
         // does not pay a cold TLS handshake after the hotkey is released.
         if settings.cleanup_enabled && pipeline.cleanup.enabled {
             let http = self.http.clone();
-            let cleanup_config = pipeline.cleanup.clone();
+            let cleanup_config = pipeline.cleanup.for_mode(cleanup_mode);
             tokio::spawn(async move {
                 cleanup::warm_connection(&http, &cleanup_config).await;
             });
@@ -349,6 +355,7 @@ impl Dictation {
             target,
             keyterms,
             cleanup_enabled: settings.cleanup_enabled,
+            cleanup_mode,
             level_task,
             limit_task,
         });
@@ -378,6 +385,7 @@ impl Dictation {
             target,
             keyterms,
             cleanup_enabled,
+            cleanup_mode,
             level_task,
             limit_task,
         } = session;
@@ -425,12 +433,16 @@ impl Dictation {
             ));
         }
 
-        let (pipeline, cleanup_prompt) = {
+        let (pipeline, cleanup_prompt, structured_prompt) = {
             let config = self
                 .config
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            (config.pipeline.clone(), config.prompt.clone())
+            (
+                config.pipeline.clone(),
+                config.prompt.clone(),
+                config.structured_prompt.clone(),
+            )
         };
         let wav = stt::wav_from_pcm16(&samples, audio::TARGET_RATE);
         let mut raw: Option<String> = None;
@@ -514,6 +526,10 @@ impl Dictation {
         };
 
         let settings = self.store.settings();
+        // Resolve the session's mode once: Clean returns an exact clone of the
+        // base config, Structured applies its pipeline.json overrides.
+        let cleanup_config = pipeline.cleanup.for_mode(cleanup_mode);
+        let cleanup_prompt = prompt_for(&cleanup_prompt, &structured_prompt, cleanup_mode);
         let mut text = raw_text.clone();
         let mut note: Option<String> = None;
         if cleanup_enabled && pipeline.cleanup.enabled {
@@ -522,13 +538,16 @@ impl Dictation {
                 .as_ref()
                 .and_then(|target| target.app.clone())
                 .unwrap_or_else(|| "Unknown app".into());
-            let timeout = Duration::from_millis(pipeline.cleanup.timeout_ms + 6_000);
+            let timeout = Duration::from_millis(cleanup_config.timeout_ms + 6_000);
             match tokio::time::timeout(
                 timeout,
                 cleanup::cleanup(
                     &self.http,
-                    &pipeline.cleanup,
-                    &cleanup_prompt,
+                    &cleanup_config,
+                    cleanup::CleanupPrompt {
+                        mode: cleanup_mode,
+                        template: cleanup_prompt,
+                    },
                     &raw_text,
                     &dictionary,
                     &pipeline.known_names,
@@ -556,6 +575,8 @@ impl Dictation {
             raw: raw_for_history,
             app: target.as_ref().and_then(|target| target.app.clone()),
             duration_ms,
+            mode: (cleanup_enabled && pipeline.cleanup.enabled)
+                .then(|| cleanup_mode.id().to_string()),
         };
         let history_saved = match self.store.add_history(entry) {
             Ok(()) => true,
@@ -576,13 +597,26 @@ impl Dictation {
             eprintln!("[ray] {note}");
         }
 
+        // Structured output is multi-line (paragraphs and list markers). The
+        // Windows clipboard convention for CF_UNICODETEXT is CRLF; Clean keeps
+        // its existing bytes because its guard and formatting are untouched.
+        let line_endings = if cleanup_mode == CleanupMode::Structured
+            && cleanup_enabled
+            && pipeline.cleanup.enabled
+        {
+            paste::LineEndings::CrLf
+        } else {
+            paste::LineEndings::Preserve
+        };
         let pasted = {
             let text = text.clone();
             let target = target.as_ref().map(|target| target.hwnd);
             // Without History, the clipboard is the only durable copy left.
             let keep_on_clipboard = !history_saved;
-            tokio::task::spawn_blocking(move || paste::paste_text(&text, target, keep_on_clipboard))
-                .await
+            tokio::task::spawn_blocking(move || {
+                paste::paste_text(&text, target, keep_on_clipboard, line_endings)
+            })
+            .await
         };
         match pasted {
             Ok(Ok(outcome)) => {
@@ -599,7 +633,7 @@ impl Dictation {
                     );
                 }
             }
-            Ok(Err(error)) => match paste::copy_text(&text) {
+            Ok(Err(error)) => match paste::copy_text_with(&text, line_endings) {
                 Ok(()) if history_saved => notes.push(format!(
                     "Couldn't paste automatically ({error}). The text is copied to your clipboard and saved in History."
                 )),
@@ -613,7 +647,7 @@ impl Dictation {
                     "Couldn't paste ({error}) or copy the text ({copy_error}). History couldn't save it either; the transcript is kept until Ray quits."
                 )),
             },
-            Err(error) => match paste::copy_text(&text) {
+            Err(error) => match paste::copy_text_with(&text, line_endings) {
                 Ok(()) if history_saved => notes.push(format!(
                     "The paste task failed ({error}). The text is copied to your clipboard and saved in History."
                 )),

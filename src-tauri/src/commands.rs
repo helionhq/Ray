@@ -17,7 +17,6 @@ use crate::windows_util;
 #[derive(Serialize)]
 pub struct KeyStatus {
     pub assemblyai: bool,
-    pub groq: bool,
     pub vercel: bool,
 }
 
@@ -47,7 +46,6 @@ pub async fn get_snapshot(
         settings: data.settings,
         keys: KeyStatus {
             assemblyai: secrets::has(secrets::ASSEMBLYAI),
-            groq: secrets::has(secrets::GROQ),
             vercel: secrets::has(secrets::VERCEL),
         },
         devices: audio::list_input_devices().unwrap_or_default(),
@@ -72,7 +70,7 @@ pub fn clear_secret(provider: String) -> Result<(), String> {
 
 fn validate_provider(provider: &str) -> Result<(), String> {
     match provider {
-        secrets::ASSEMBLYAI | secrets::GROQ | secrets::VERCEL => Ok(()),
+        secrets::ASSEMBLYAI | secrets::VERCEL => Ok(()),
         other => Err(format!("Unknown provider: {other}")),
     }
 }
@@ -126,10 +124,10 @@ pub async fn test_secret(
                     provider.model
                 ),
                 Ok(response) => format!(
-                    "Speech connected; the LLM Gateway returned HTTP {} (Groq fallback still works)",
+                    "Speech connected; the LLM Gateway returned HTTP {} (cleanup will use the raw transcript)",
                     response.status()
                 ),
-                Err(_) => "Speech connected; the LLM Gateway was unreachable (Groq fallback still works)".into(),
+                Err(_) => "Speech connected; the LLM Gateway was unreachable (cleanup will use the raw transcript)".into(),
             });
         }
         return Ok("AssemblyAI connected".into());

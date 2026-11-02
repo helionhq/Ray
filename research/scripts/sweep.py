@@ -1,13 +1,11 @@
 """Compare cleanup models on the regression corpus + the round-2 hard corpus.
 
 Uses the final prompt, non-streaming (the shipping app does not stream), and
-records total latency, token usage and errors. Requests are paced per provider
-because Groq's free tier is 8k tokens/minute and the AssemblyAI gateway is
-30 requests/minute/model.
+records total latency, token usage and errors. Requests are paced for the
+AssemblyAI gateway's 30 requests/minute/model limit.
 
 Usage:
   python sweep.py --provider aai --tag v7 --models gemma-4-31b,qwen3.5-4b-32k-fast --sleep 2.2
-  python sweep.py --provider groq --tag v7 --models openai/gpt-oss-120b --sleep 13
 """
 from __future__ import annotations
 
@@ -22,7 +20,6 @@ from pathlib import Path
 from common import ENV, FINAL, OUT
 
 PROVIDERS = {
-    "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
     "aai": ("https://llm-gateway.assemblyai.com/v1", "ASSEMBLYAI_API_KEY"),
 }
 MAX_TOKENS = 3000

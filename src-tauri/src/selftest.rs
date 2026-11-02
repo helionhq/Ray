@@ -4,10 +4,16 @@
 //! 16 kHz mono PCM16 WAV, transcribes it through the shipping code path, runs
 //! cleanup, and prints both results. Keys come from Windows Credential Manager
 //! or the environment; nothing is compiled in.
+//!
+//! Cleanup mode: pass `--mode clean|structured` (handled in `main.rs`, which
+//! sets `RAY_CLEANUP_MODE`) or set `RAY_CLEANUP_MODE` directly. The default is
+//! `clean`, matching the app. The output header stays `--- CLEAN (...) ---`
+//! for both modes so the research corpus parser keeps working; the
+//! `[selftest] cleanup_mode=...` line states which one ran.
 
 use std::time::{Duration, Instant};
 
-use crate::config::{self, PipelineConfig};
+use crate::config::{self, CleanupMode, PipelineConfig};
 use crate::{audio, cleanup, secrets, stt};
 
 pub fn run_selftest(path: &str, streaming: bool) -> i32 {
@@ -65,6 +71,16 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             provider.base_url = "https://127.0.0.1:9/v1".into();
         }
     }
+    let cleanup_mode = std::env::var("RAY_CLEANUP_MODE")
+        .ok()
+        .and_then(|value| CleanupMode::from_id(&value))
+        .unwrap_or_default();
+    let cleanup_config = config.cleanup.for_mode(cleanup_mode);
+    let cleanup_prompt = config::prompt_for(
+        config::EMBEDDED_PROMPT,
+        config::EMBEDDED_STRUCTURED_PROMPT,
+        cleanup_mode,
+    );
     let dictionary: Vec<String> = std::env::var("RAY_TEST_DICTIONARY")
         .ok()
         .map(|value| {
@@ -111,12 +127,22 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             // Simulates the app opening the cleanup connection while the user
             // is speaking: the request finishes long before the hotkey is up.
             let warm_started = Instant::now();
-            cleanup::warm_connection(&http, &config.cleanup).await;
+            cleanup::warm_connection(&http, &cleanup_config).await;
             println!(
                 "[selftest] timing prewarm_ms={}",
                 warm_started.elapsed().as_millis()
             );
         }
+
+        println!(
+            "[selftest] cleanup_mode={} model={}",
+            cleanup_mode.id(),
+            cleanup_config
+                .providers
+                .first()
+                .map(|provider| provider.model.as_str())
+                .unwrap_or("-")
+        );
 
         println!(
             "[selftest] {} · {:.1}s · model {} · {}",
@@ -215,8 +241,11 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         let cleanup_started = Instant::now();
         let result = cleanup::cleanup(
             &http,
-            &config.cleanup,
-            config::EMBEDDED_PROMPT,
+            &cleanup_config,
+            cleanup::CleanupPrompt {
+                mode: cleanup_mode,
+                template: cleanup_prompt,
+            },
             &raw,
             &dictionary,
             &config.known_names,
@@ -242,8 +271,11 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             let warm_started = Instant::now();
             let warm = cleanup::cleanup(
                 &http,
-                &config.cleanup,
-                config::EMBEDDED_PROMPT,
+                &cleanup_config,
+                cleanup::CleanupPrompt {
+                    mode: cleanup_mode,
+                    template: cleanup_prompt,
+                },
                 &raw,
                 &dictionary,
                 &config.known_names,
@@ -264,8 +296,11 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                     let started = Instant::now();
                     let repeated = cleanup::cleanup(
                         &http,
-                        &config.cleanup,
-                        config::EMBEDDED_PROMPT,
+                        &cleanup_config,
+                        cleanup::CleanupPrompt {
+                            mode: cleanup_mode,
+                            template: cleanup_prompt,
+                        },
                         &raw,
                         &dictionary,
                         &config.known_names,
