@@ -1,6 +1,6 @@
 [package]
 name = "ray"
-version = "0.1.0"
+version = "0.1.1"
 description = "Ray: fast, clean dictation for Windows"
 authors = ["Helion"]
 edition = "2021"
