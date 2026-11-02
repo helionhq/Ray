@@ -139,7 +139,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
 
   async function copy(entry: HistoryEntry) {
     try {
-      await api.copyText(entry.text);
+      await api.copyText(entry.text, entry.mode);
       notify("Copied to clipboard");
     } catch (error) {
       notify(String(error));

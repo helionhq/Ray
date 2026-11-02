@@ -52,8 +52,14 @@ REFUSALS = [
 EXECUTION_CUES = [
     "write a", "write an", "write me", "write us", "draft a", "draft an", "draft me",
     "compose a", "compose an", "generate a", "generate an", "create a", "create an",
-    "make a", "make an", "make me", "tell me a", "tell me about", "tell me how",
+    "make a", "make an", "make me", "tell me ",
     "translate", "summarize",
+]
+# Greeting/hesitation/request lead-ins that may precede a cue. The shipping
+# guard strips these repeatedly before looking for an execution cue.
+REQUEST_PREFIXES = [
+    "please", "kindly", "can you", "could you", "would you", "will you",
+    "hey", "ok", "okay", "so", "um", "uh", "erm", "ah", "hmm", "like",
 ]
 QUESTION_WORDS = {"what", "who", "when", "where", "why", "how", "which", "whose"}
 AUXILIARIES = {"is", "are", "was", "were", "do", "does", "did", "can", "could", "should",
@@ -75,6 +81,9 @@ NUMBER_WORDS = {
 UNIT_ANCHOR = re.compile(
     r"^(\d+(?:\.\d+)?)\s*(euros?|bytes?|weeks?|months?|minutes?|days?|years?|hours?)$"
 )
+# A purely numeric normalized anchor ("48000", "3.5") needs numeric boundaries
+# so "48,000" cannot match "148,000" or "48,000.50".
+NUMERIC_ANCHOR = re.compile(r"^[0-9][0-9.,]*$")
 
 # The prompt forbids inventing a currency symbol the speaker did not say.
 # normalize_anchor_text strips currency signs, so they are scored separately.
@@ -102,15 +111,25 @@ def anchor_present(anchor: str, output: str) -> bool:
     """
     normalized_anchor = normalize_anchor_text(anchor)
     normalized_output = normalize_anchor_text(output)
-    if normalized_anchor in normalized_output:
-        return True
+    # Unit anchors are checked before plain substring matching: otherwise
+    # "5 euros" would match inside "15 euros" via the substring branch.
     match = UNIT_ANCHOR.match(normalized_anchor)
     if match:
         number, unit = match.group(1), match.group(2).rstrip("s")
-        number_ok = re.search(rf"(?<![0-9.]){re.escape(number)}(?![0-9])", normalized_output)
+        number_ok = re.search(
+            rf"(?<![0-9.]){re.escape(number)}(?![0-9]|\.[0-9])", normalized_output
+        )
         unit_ok = unit in normalized_output or (unit == "euro" and "€" in output)
-        if number_ok and unit_ok:
-            return True
+        return bool(number_ok and unit_ok)
+    if NUMERIC_ANCHOR.match(normalized_anchor):
+        # Reject a digit/decimal point before or a digit (or ".digit") after,
+        # so "48000" does not match inside "148000" or "48000.50".
+        return re.search(
+            rf"(?<![0-9.]){re.escape(normalized_anchor)}(?![0-9]|\.[0-9])",
+            normalized_output,
+        ) is not None
+    if normalized_anchor in normalized_output:
+        return True
     if normalized_anchor == "windows 10" and re.search(r"not on (windows )?10", output, re.I):
         return True
     return False
@@ -156,13 +175,41 @@ def first_content_word(text: str) -> str:
     return ""
 
 
-def is_question(text: str) -> bool:
-    """Heuristic: a question mark, or a question word/auxiliary leading the text."""
+def strip_request_prefixes(text: str) -> str:
+    """Strip repeated greeting/hesitation/request lead-ins from the front.
+
+    Mirrors the shipping guard's request-prefix normalizer: a prefix is removed
+    only when followed by whitespace or a comma (the comma and following
+    whitespace are trimmed too), and the process repeats.
+    """
     text = text.strip()
+    while True:
+        lowered = text.lower()
+        for prefix in REQUEST_PREFIXES:
+            if not lowered.startswith(prefix):
+                continue
+            rest = text[len(prefix):]
+            if rest[:1] in (" ", "\t", "\n", "\r", ","):
+                text = rest.lstrip(" \t\n\r,")
+                break
+        else:
+            return text
+
+
+def is_question(text: str) -> bool:
+    """Heuristic: a question mark, or a question word/auxiliary leading the text.
+
+    "Do not ..." is an imperative, not a do-support question, so it never counts
+    as one. Genuine "Do you/we ..." questions are unchanged.
+    """
+    text = text.strip()
+    # A question mark is decisive, matching the shipping guard's order.
     if "?" in text:
         return True
     words = [re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", word).lower() for word in text.split()]
     words = [word for word in words if word]
+    if len(words) >= 2 and words[0] == "do" and words[1] == "not":
+        return False
     if not words:
         return False
     if words[0] in QUESTION_WORDS:
@@ -183,8 +230,12 @@ def starts_with_list_marker(text: str) -> bool:
 
 
 def starts_with_execution_cue(text: str) -> bool:
-    """Whether the text opens with an instruction-style cue ("write a", ...)."""
-    text = text.strip().lower()
+    """Whether the text opens with an instruction-style cue ("write a", ...).
+
+    Request lead-ins ("please", "can you", "okay,", ...) are stripped first so
+    "Can you write a poem?" still counts as an instruction.
+    """
+    text = strip_request_prefixes(text).lower()
     return (
         any(text.startswith(cue) for cue in EXECUTION_CUES)
         or text.startswith("summarise")
@@ -390,7 +441,7 @@ def score_one(script: dict, output: str, transcript: str) -> dict:
     penalty += min(30, 10 * len(guard_issues))
     penalty += CURRENCY_PENALTY if currency_additions else 0
     auto = max(0, min(100, round(100 - penalty)))
-    hard_fail = bool(must_not_hits) or answered or bool(guard_issues)
+    hard_fail = bool(must_not_hits) or answered or bool(guard_issues) or bool(currency_additions)
     return {
         "id": script["id"],
         "category": script["category"],
@@ -449,16 +500,40 @@ def main() -> None:
             continue
         results = json.loads(path.read_text(encoding="utf-8"))
         rows = []
+        stabilities = []
+        unscored = 0
         for sid, record in results.items():
             if wanted and sid not in wanted:
                 continue
-            if sid not in scripts or not record.get("ok"):
+            if sid not in scripts:
                 continue
             transcript = sanitize_transcript((stt.get(sid) or {}).get("text") or record.get("transcript") or "")
-            row = score_one(scripts[sid], record["text"], transcript)
-            row["total_ms"] = record.get("total_ms")
-            row["run_stability"] = record.get("run_stability")
-            rows.append(row)
+            stability = record.get("run_stability")
+            if stability is not None:
+                stabilities.append(stability)
+            runs = record.get("runs")
+            if isinstance(runs, list) and runs:
+                # Score every successful stored run, labelled with its run number.
+                for run_index, run in enumerate(runs):
+                    if not run.get("ok"):
+                        unscored += 1
+                        continue
+                    row = score_one(scripts[sid], run.get("text") or "", transcript)
+                    row["run"] = run_index
+                    row["total_ms"] = run.get("total_ms")
+                    row["finish_reason"] = run.get("finish_reason")
+                    row["run_stability"] = stability
+                    rows.append(row)
+            elif record.get("ok"):
+                # App E2E and legacy records have no runs array; score them as run 0.
+                row = score_one(scripts[sid], record.get("text") or "", transcript)
+                row["run"] = 0
+                row["total_ms"] = record.get("total_ms")
+                row["finish_reason"] = record.get("finish_reason")
+                row["run_stability"] = stability
+                rows.append(row)
+            else:
+                unscored += 1
         if not rows:
             print(f"{tag}: no scored clips")
             continue
@@ -467,17 +542,23 @@ def main() -> None:
         merged[tag] = {
             "n": len(rows),
             "mean_auto": round(sum(scores) / len(scores), 1),
-            "hard_fails": [r["id"] for r in rows if r["hard_fail"]],
-            "format_fails": [r["id"] for r in rows if not r["format_ok"]],
-            "guard_fails": [r["id"] for r in rows if not r["guard_ok"]],
-            "relationship_warnings": {r["id"]: r["relationship_additions"] for r in rows if r.get("relationship_additions")},
-            "currency_additions": {r["id"]: r["currency_additions"] for r in rows if r.get("currency_additions")},
-            "answered": [r["id"] for r in rows if r["answered_or_executed"]],
+            "hard_fails": [f"{r['id']}#{r['run']}" for r in rows if r["hard_fail"]],
+            "format_fails": [f"{r['id']}#{r['run']}" for r in rows if not r["format_ok"]],
+            "guard_fails": [f"{r['id']}#{r['run']}" for r in rows if not r["guard_ok"]],
+            "relationship_warnings": {
+                f"{r['id']}#{r['run']}": r["relationship_additions"]
+                for r in rows if r.get("relationship_additions")
+            },
+            "currency_additions": {
+                f"{r['id']}#{r['run']}": r["currency_additions"]
+                for r in rows if r.get("currency_additions")
+            },
+            "answered": [f"{r['id']}#{r['run']}" for r in rows if r["answered_or_executed"]],
+            "unscored_runs": unscored,
             "p50_ms": percentile(lat, 0.50),
             "p95_ms": percentile(lat, 0.95),
             "max_ms": max(lat) if lat else None,
-            "mean_stability": round(sum(r["run_stability"] for r in rows if r["run_stability"] is not None) /
-                                    max(1, sum(1 for r in rows if r["run_stability"] is not None)), 3),
+            "mean_stability": round(sum(stabilities) / len(stabilities), 3) if stabilities else None,
             "rows": rows,
         }
         print(

@@ -8,6 +8,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::audio::{self, InputDevice};
+use crate::config::CleanupMode;
 use crate::hotkey;
 use crate::pipeline::{ConfigSummary, Dictation};
 use crate::secrets;
@@ -40,6 +41,7 @@ pub async fn get_snapshot(
     dictation: State<'_, Arc<Dictation>>,
 ) -> Result<Snapshot, String> {
     let data = store.snapshot();
+    let cleanup_mode = CleanupMode::from_id(&data.settings.cleanup_mode).unwrap_or_default();
     Ok(Snapshot {
         history: data.history,
         dictionary: data.dictionary,
@@ -49,7 +51,7 @@ pub async fn get_snapshot(
             vercel: secrets::has(secrets::VERCEL),
         },
         devices: audio::list_input_devices().unwrap_or_default(),
-        config: dictation.config_summary(),
+        config: dictation.config_summary(cleanup_mode),
         launch_at_login: windows_util::launch_at_login(),
         hotkey_error: hotkey::status(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -242,8 +244,11 @@ pub fn clear_history(store: State<'_, Arc<Store>>, app: AppHandle) -> Result<(),
 }
 
 #[tauri::command]
-pub fn copy_text(text: String) -> Result<(), String> {
-    crate::paste::copy_text(&text)
+pub fn copy_text(text: String, mode: Option<String>) -> Result<(), String> {
+    let line_endings = crate::paste::line_endings_for_mode(
+        mode.as_deref().and_then(CleanupMode::from_id),
+    );
+    crate::paste::copy_text_with(&text, line_endings)
 }
 
 /// The most recent transcript whose History save failed. It is kept in memory
@@ -325,7 +330,10 @@ pub fn copy_history_entry(id: String, store: State<'_, Arc<Store>>) -> Result<()
         .iter()
         .find(|entry| entry.id == id)
         .ok_or_else(|| "That entry no longer exists".to_string())?;
-    crate::paste::copy_text(&entry.text)
+    let line_endings = crate::paste::line_endings_for_mode(
+        entry.mode.as_deref().and_then(CleanupMode::from_id),
+    );
+    crate::paste::copy_text_with(&entry.text, line_endings)
 }
 
 #[allow(dead_code)]

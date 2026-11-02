@@ -22,6 +22,9 @@ from common import ENV, FINAL, OUT, sanitize_transcript
 
 GATEWAY = "https://llm-gateway.assemblyai.com/v1"
 
+# The app's extract_answer rejects these normalized finish reasons.
+TRUNCATED_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
+
 
 def load_prompt(path: Path, data: dict, app_name: str) -> str:
     """Load the Structured prompt and fill it the way build_system_prompt does.
@@ -85,14 +88,27 @@ def call(model: str, system: str, user: str, temperature: float, max_tokens: int
             choice = (body.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             content = message.get("content") or ""
+            finish_reason = choice.get("finish_reason")
+            # Match the app's extract_answer: a truncated answer is a failure even
+            # when the partial content is nonempty. Keep the partial text so a
+            # failed run can still be inspected.
+            normalized_reason = (finish_reason or "").strip().lower()
+            truncated = normalized_reason in TRUNCATED_FINISH_REASONS
+            has_content = bool(content.strip())
+            if truncated:
+                error = f"truncated (finish_reason: {(finish_reason or '').strip()})"
+            elif not has_content:
+                error = f"empty content (finish_reason={finish_reason})"
+            else:
+                error = None
             return {
-                "ok": bool(content.strip()),
+                "ok": has_content and not truncated,
                 "text": content.strip(),
                 "total_ms": round((time.perf_counter() - started) * 1000, 1),
-                "finish_reason": choice.get("finish_reason"),
+                "finish_reason": finish_reason,
                 "usage": body.get("usage") or {},
                 "attempts": attempt + 1,
-                "error": None if content.strip() else f"empty content (finish_reason={choice.get('finish_reason')})",
+                "error": error,
             }
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")

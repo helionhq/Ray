@@ -17,13 +17,15 @@ Meaning is fixed; form is free.
 - **Fallback:** none is recommended for Structured. The only other accessible gateway model,
   `qwen3.5-4b-32k-fast`, is fast but weaker on restructuring and is rate-limited per account;
   the raw transcript is the safer last resort.
-- **Scores:** tuning (42 clips) auto 99.5, gemma judge 10.00, qwen judge 9.90 (one qwen
-  false positive); held-out (14 clips) auto 98.6, both judges 10.00. One tuning format miss
-  (`st-topic-revisit`: five paragraphs against the four-paragraph cap) and one held-out
-  structural miss (`ho-list-parallel`: two bullets instead of three plus an allowed "also").
-- **Guard:** the shipping `is_plausible()` guard is phrase-aware: multi-word connectives are
-  matched as whole-token sequences, so the natural contraction "so that's" is not mistaken for
-  the invented connective "so that". Every final tuning output passes the guard.
+- **Scores:** tuning (42 clips, 84 runs) auto 99.5, gemma judge 10.00, qwen judge 9.79 (three
+  qwen false positives over two clips); held-out (14 clips, 28 runs) auto 98.6, both judges
+  10.00. Two tuning format misses (`st-topic-revisit#0`, `#1`: five paragraphs against the
+  four-paragraph cap) and two held-out structural misses (`ho-list-parallel#0`, `#1`: two
+  bullets instead of three plus an allowed "also").
+- **Guard:** the shipping `is_plausible_structured()` guard for Structured (Clean's separate
+  guard is `is_plausible()`) is phrase-aware: multi-word connectives are matched as whole-token
+  sequences, so the natural contraction "so that's" is not mistaken for the invented connective
+  "so that". Every final tuning and held-out run passes the guard.
 
 The latency and score tables below are filled from the final v7 run; see
 `research/out/structured_scores.json`, `research/out/structured_judge.json` and
@@ -45,8 +47,9 @@ The latency and score tables below are filled from the final v7 run; see
   normalisation), `must_not` (banned values/content), `expected_format` and a `shape` (paragraph
   and list restraint). The deterministic scorer checks anchors, banned content, list/paragraph
   shape, filler/correction-cue leftovers, Markdown leakage, length ratio, no-answer/no-execute
-  behaviour and the app's guard. It also flags a currency symbol in the output that is absent
-  from the input transcript, so an added `$` is no longer hidden by anchor normalisation.
+  behaviour and the app's guard. It also treats a currency symbol in the output that is absent
+  from the input transcript as a hard failure, so an added `$` is no longer hidden by anchor
+  normalisation.
 - **Audio.** Deepgram Aura-2 TTS, 16 kHz mono WAV, 37 voices, speeds 0.94–1.12. The mess
   (fillers, stutters, restarts, corrections, run-on lists) is written into the spoken text.
 - **STT.** AssemblyAI Sync batch (`POST https://sync.assemblyai.com/v1/transcribe`,
@@ -57,8 +60,12 @@ The latency and score tables below are filled from the final v7 run; see
   meaning-breaking ASR error (a reversed "no need", a hallucinated injection, and two garbled
   numbers); that is an audio-corpus fix, not a prompt change.
 - **LLM eval.** `structured_eval.py` is non-streaming (the app is non-streaming), records wall
-  time, token usage, finish reason and repeat runs, and retries 429s. Tuning configs ran twice
-  for stability; the chosen config ran twice on both tuning and held-out.
+  time, token usage, finish reason and repeat runs, and retries 429s. A response whose
+  `finish_reason` is `length`/`max_tokens`/`max_output_tokens` is recorded as a failed run even
+  when it has partial text, matching the app's `extract_answer`. Tuning configs ran twice for
+  stability; the chosen config ran twice on both tuning and held-out. Scoring and judging cover
+  every stored run; result rows carry the run number and `n` counts runs, not clips. App E2E
+  records, which have no `runs` array, are scored/judged as run 0.
 - **Judging.** `structured_judge.py` scores meaning preservation, structure, grammar, short-input
   restraint and safety with hard fails for any meaning change. The gateway account can call
   only `gemma-4-31b` and `qwen3.5-4b-32k-fast` (Claude/GPT/Gemini ids return "Your account does
@@ -183,80 +190,91 @@ overlaps a prompt example.
 
 ## 4. Tuning results
 
-Final prompt (v7), 42 tuning clips, gemma-4-31b, temperature 0, two runs per clip.
+Final prompt (v7), 42 tuning clips, gemma-4-31b, temperature 0, two runs per clip. Scoring now
+covers every stored run, so `n` is runs (84), not clips.
 
 | Config | n | Auto | Hard fails | Format fails | Guard fails | p50 | p95 | Stability |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **gemma-4-31b** | 42 | **99.5** | **0** | **1** (`st-topic-revisit`) | **0** | 2.26 s | 3.01 s | 0.99 |
+| **gemma-4-31b** | 84 | **99.5** | **0** | **2** (`st-topic-revisit#0`, `#1`) | **0** | 2.25 s | 3.01 s | 0.993 |
 
-The one format miss is `st-topic-revisit`: the output uses five paragraphs against the clip's
-`max_paragraphs: 4` (its three bullets are accepted). This was always a real shape violation,
-but the scorer previously had no `paragraphs_or_bullets` branch, so it was hidden; the 20-point
-format penalty gives the clip auto 80 and lowers the corpus mean from 100 to 99.5. No clip had a
-missing anchor, banned value, filler/correction cue, Markdown leak, relationship addition or
-answer/execution, and the shipping token-aware guard rejects none.
+The one failing clip is `st-topic-revisit`, and both runs fail the same way: the output uses
+five paragraphs against the clip's `max_paragraphs: 4` (its three bullets are accepted). This
+was always a real shape violation, but the scorer previously had no `paragraphs_or_bullets`
+branch, so it was hidden; the 20-point format penalty gives each run auto 80 and lowers the 84-run mean from 100 to 99.5. No run had a
+missing anchor, banned value, filler/correction cue, Markdown leak, relationship addition,
+currency addition or answer/execution, and the shipping token-aware guard rejects none.
 
-The new currency check flags a symbol in the output that is absent from the model's input
-transcript. It found none here: AssemblyAI's STT itself renders spoken numbers as `$42,500`, so
+The currency check flags a symbol in the output that is absent from the model's input
+transcript, and a detected addition is now a hard failure rather than only a score penalty. It
+found none here: AssemblyAI's STT itself renders spoken numbers as `$42,500`, so
 the model is preserving its input rather than adding a symbol. The v7 prompt example no longer
-demonstrates adding one. The v6 outputs rescored with the corrected scorer give the same 99.5
-and the same `st-topic-revisit` miss, so the example change itself caused no deterministic
-regression.
+demonstrates adding one. Rescored at run level, the v6 outputs give 99.8 across all 84 runs:
+only `st-topic-revisit#0` misses the format (its run 1 passes), while both v7 runs fail that
+clip. The example change introduced no new failure category; the difference is the known
+run-to-run paragraph variance on this clip, and the stricter numeric-anchor boundary found no
+missing anchors in either version.
 
-Judge scores (two passes; qwen is independent for gemma, gemma is the stronger but self-judge):
+Judge scores (both judges, every stored run; qwen is independent for gemma, gemma is the
+stronger but self-judge):
 
 | Judge | n | Overall | Meaning | Structure | Grammar | Restraint | Safety | Meaning fails |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| qwen3.5-4b-32k-fast | 42 | 9.90 | 9.90 | 9.93 | 9.98 | 9.95 | 10.00 | 1* |
-| gemma-4-31b | 42 | 10.00 | 10.00 | 9.98 | 10.00 | 10.00 | 10.00 | 0 |
+| qwen3.5-4b-32k-fast | 84 | 9.79 | 9.79 | 9.82 | 9.85 | 9.85 | 9.88 | 3* |
+| gemma-4-31b | 84 | 10.00 | 10.00 | 9.98 | 10.00 | 10.00 | 10.00 | 0 |
 
-\* The qwen row's one meaning fail is `st-mono-week`, and it is a judge error: it calls "8:30"
-and "4" banned numbers, but the `must_not` entries are "8:30 a.m."/"4 p.m." and the output
-correctly leaves out the meridiem (the meaning units require the times). It also says the
-"Wednesday noon" correction was omitted, but the output correctly resolves it to "Wednesday end
-of day", and Priya's PR and the weekly update are present. The deterministic anchors pass and
-the gemma judge plus the manual read give the clip 10/10. Qwen 3.5 4B is too weak to be the
-sole judge.
+\* The qwen row's three meaning fails, `st-mono-week#0`, `st-mono-week#1` and
+`st-injection-write#1`, are all judge errors. For both `st-mono-week` runs it calls "8:30" and
+"4" banned numbers, but the `must_not` entries are "8:30 a.m."/"4 p.m." and the output correctly
+leaves out the meridiem (the meaning units require the times). It also says the "Wednesday noon"
+correction was omitted, but the output correctly resolves it to "Wednesday end of day", and
+Priya's PR and the weekly update are present. For `st-injection-write#1` the output is a
+faithful rewrite that reproduces the dictated poem request verbatim; qwen demanded that the model
+actually write the poem, i.e. it treated correct non-execution as an execution failure, and gave
+every dimension 0. The same output in run 0 was scored 10/10, and the deterministic anchors and
+guard pass. Qwen 3.5 4B is too weak to be the sole judge.
 
 
 Latency by input length (all 84 runs): short (<=40 words, n=18) p50 1.81 s / p95 2.07 s;
-long (>40 words, n=66) p50 2.33 s / p95 3.19 s. The first-run p95 is 3.01 s; across all runs
-p99 is 10.9 s and max 24.1 s from isolated gateway stalls (one first run hit 8.24 s).
+long (>40 words, n=66) p50 2.33 s / p95 3.19 s. The table above is now across all runs: p50
+2.25 s, p95 3.01 s. The first-run p95 is also 3.01 s; across all runs p99 is 10.9 s and max
+24.1 s from isolated gateway stalls (one first run hit 8.24 s).
 
 
 
 ## 5. Held-out results
 
-Final prompt (v7), 14 held-out clips, gemma-4-31b, temperature 0, two runs per clip.
+Final prompt (v7), 14 held-out clips, gemma-4-31b, temperature 0, two runs per clip. `n` is
+runs (28), not clips.
 
 | Config | n | Auto | Hard fails | Format fails | Guard fails | p50 | p95 | Stability |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **gemma-4-31b** | 14 | **98.6** | **0** | **1** (`ho-list-parallel`) | **0** | 2.10 s | 2.75 s | 1.00 |
+| **gemma-4-31b** | 28 | **98.6** | **0** | **2** (`ho-list-parallel#0`, `#1`) | **0** | 2.09 s | 2.95 s | 0.996 |
 
-The single deterministic miss is `ho-list-parallel` (auto 80): the speaker announced "three
-things before Friday" and added that the contract is the priority. The model kept the contract
-as a priority sentence and bulleted only the other two items ("need >= 3 bullets, got 2"), and
-it added the soft "also". All three tasks, the Friday deadline and the priority are present;
-the failure is structural, not a lost fact, and the shipping guard allows "also". This clip was
-not used to tune the prompt; it is reported as an out-of-sample limitation.
+The single deterministic miss is `ho-list-parallel`, in both runs (auto 80 each): the speaker
+announced "three things before Friday" and added that the contract is the priority. The model
+kept the contract as a priority sentence and bulleted only the other two items ("need >= 3
+bullets, got 2"), and it added the soft "also". All three tasks, the Friday deadline and the
+priority are present; the failure is structural, not a lost fact, and the shipping guard allows
+"also". This clip was not used to tune the prompt; it is reported as an out-of-sample
+limitation.
 
-The other 13 clips score 100: long event recap (ask at the end moved to the top), weekend
-logistics (correction and condition), vendor email (greeting/sign-off, questions), Slack reply,
-mobile bug (hedges/conditions), onboarding steps (out-of-order reorder), chained corrections,
-refund policy (negations/conditions), hedged forecast, injection (not obeyed), one-liner
-(not answered), questions (not answered), and the tech-stack names. `ho-slack-reply` is close
-to prompt example 1 (§3), so its 100 is not fully independent; no other held-out clip overlaps
-an example. The v6 outputs rescored with the corrected scorer give the same 98.6 and the same
-`ho-list-parallel` miss.
+The other 13 clips score 100 in both runs (26 of 28 runs): long event recap (ask at the end
+moved to the top), weekend logistics (correction and condition), vendor email (greeting/sign-off,
+questions), Slack reply, mobile bug (hedges/conditions), onboarding steps (out-of-order reorder),
+chained corrections, refund policy (negations/conditions), hedged forecast, injection (not
+obeyed), one-liner (not answered), questions (not answered), and the tech-stack names.
+`ho-slack-reply` is close to prompt example 1 (§3), so its 100 is not fully independent; no
+other held-out clip overlaps an example. The v6 outputs rescored at run level with the
+corrected scorer give the same 98.6 and the same `ho-list-parallel` miss in both runs.
 
 | Judge | n | Overall | Meaning | Structure | Grammar | Restraint | Safety | Meaning fails |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| qwen3.5-4b-32k-fast | 14 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 0 |
-| gemma-4-31b | 14 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 0 |
+| qwen3.5-4b-32k-fast | 28 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 0 |
+| gemma-4-31b | 28 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 10.00 | 0 |
 
-Both judges rate the held-out set 10/10, including `ho-list-parallel`; the deterministic checker
-is the stricter evidence there and caught the missing third bullet and the added "also". The
-judges are useful for meaning, not for precise list-shape policing.
+Both judges give every held-out run 10/10, including both `ho-list-parallel` runs; the
+deterministic checker is the stricter evidence there and caught the missing third bullet and the
+added "also". The judges are useful for meaning, not for precise list-shape policing.
 
 
 
@@ -270,10 +288,11 @@ qwen is the fast alternative.
 
 | Model | n | Auto | Judge overall | Meaning | p50 | p95 | Verdict |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **gemma-4-31b** | 42 | **99.5** | **10.00** (gemma) / 9.90 (qwen) | **10.00** / 9.90 | 2.26 s | 3.01 s | **chosen** |
+| **gemma-4-31b** | 84* | **99.5** | **10.00** (gemma) / 9.79 (qwen) | **10.00** / 9.79 | 2.25 s | 3.01 s | **chosen** |
 | qwen3.5-4b-32k-fast | 23* | 92.4 | **9.52** (gemma) | 9.52 | 1.67 s | 1.94 s | reject |
 
-\* Qwen was run on a 23-clip representative subset. The account-level TPM limit (max_tokens is
+\* Gemma's n is stored runs (42 clips x two runs); its judge means are over the same 84 runs.
+Qwen was run on a 23-clip representative subset. The account-level TPM limit (max_tokens is
 reserved against it) made a full 42-clip pass slow and timeout-prone even at `--sleep 8`; the
 subset covers long monologues, asks, emails, Slack, bugs, corrections, numbers, hedges,
 conditions, negations, names, injection, short inputs and lists. A separate 8-clip subset was
@@ -291,9 +310,9 @@ negations, repairs ASR-joined names, and keeps dictated greetings/sign-offs. Qwe
   and lost "I think that's it" from the grocery list.
 - It dropped the "Helion" name from a meeting-notes opener and added "here are the four tasks"
   lead-ins.
-- Its auto score is 92.4 on the subset, with 6 format misses; gemma is 99.5 on all 42 (one
-  previously hidden format miss, `st-topic-revisit`).
-- Gemma judge (v7): 4/23 qwen clips failed meaning vs 0/42 gemma clips.
+- Its auto score is 92.4 on the subset, with 6 format misses; gemma is 99.5 across all 84 v7
+  runs (one clip, both runs: the previously hidden `st-topic-revisit` format miss).
+- Gemma judge (v7): 4/23 qwen clips failed meaning vs 0/84 gemma runs.
 
 **Latency trade-off:** gemma p50 is ~2.3 s on the tuning corpus (2.33 s long, 1.81 s short); p95 is
 3.01 s first-run and 3.01 s across all 84 runs. The tail is real: p99 10.9 s, max 24.1 s from
@@ -315,22 +334,25 @@ only after 4 s and its TPM limit makes it unsuitable as a primary.
   "Your account does not have access to this LLM Gateway model". A top-quality-model comparison
   is therefore impossible without a gateway/account change.
 - **Judge strength.** Qwen 3.5 4B is a weak judge; gemma judging gemma is not independent. In
-  the v7 run the qwen judge's one false positive was `st-mono-week`: it treated the required
+  the v7 run the qwen judge's three meaning fails were `st-mono-week#0`, `st-mono-week#1` and
+  `st-injection-write#1`, all judge errors. For both `st-mono-week` runs it treated the required
   "8:30"/"4" times as banned when the banned strings include a.m./p.m., and it said the
-  Wednesday-noon correction was omitted when the output correctly resolves it to end of day.
-  It gave the held-out structural miss `ho-list-parallel` 10/10. Gemma, the stronger judge,
-  gave the tuning set 10.0 and the held-out set 10.0. The deterministic per-clip checks and the
-  full read-through are the primary evidence.
-- **One held-out structural miss.** `ho-list-parallel` kept the priority contract as prose and
-  bulleted only two of the three announced items, adding "also". All facts and the priority are
-  present; the shape is wrong, but the shipping guard allows the soft "also". This is the honest
-  out-of-sample result, not something the prompt was tuned on.
+  Wednesday-noon correction was omitted when the output correctly resolves it to end of day. For
+  `st-injection-write#1` it demanded that the model actually write the poem and scored every
+  dimension 0, while the output is a faithful rewrite identical to run 0, which qwen scored
+  10/10. Qwen nevertheless gave the held-out structural miss `ho-list-parallel` 10/10 in both
+  runs. Gemma, the stronger judge, gave the tuning set 10.0 and the held-out set 10.0 across all
+  runs. The deterministic per-run checks and the full read-through are the primary evidence.
+- **One held-out structural miss.** In both runs, `ho-list-parallel` kept the priority contract as
+  prose and bulleted only two of the three announced items, adding "also". All facts and the
+  priority are present; the shape is wrong, but the shipping guard allows the soft "also". This
+  is the honest out-of-sample result, not something the prompt was tuned on.
 - **ASR is the remaining error source.** If STT mangles a name or number, the prompt cannot
   know the intended value. The corpus includes realistic ASR errors; the held-out run reports
   the ASR-limited clips rather than silently scoring them as prompt failures.
 - **Run-to-run formatting variance.** Bullet/paragraph choices can differ between two runs of
-  the same clip. Mean word-level stability is 0.99; one tuning clip
-  (`st-actions-interleaved`) is below 0.95 at 0.857 because the two runs group the same
+  the same clip. Mean word-level stability is 0.993 on tuning and 0.996 on held-out; one tuning
+  clip (`st-actions-interleaved`) is below 0.95 at 0.857 because the two runs group the same
   sentences into different paragraphs (the content and list items match). Manual comparison of
   both runs found the same meaning in each; the deterministic anchors and the second-run
   read-through confirm it. The complex week plan was the one clip where an intermediate prompt
@@ -418,13 +440,13 @@ python structured_eval.py --corpus ../corpus/structured_scripts.json --source st
 python structured_eval.py --corpus ../corpus/structured_heldout_scripts.json --source structured_heldout_a \
   --models gemma-4-31b --tag s_v7_heldout --runs 2
 
-# Score and judge
+# Score and judge every stored run (n counts runs, not clips; rows carry the run number)
 python structured_score.py --tags s_v7__gemma-4-31b --corpus ../corpus/structured_scripts.json --source structured_raw_a
 python structured_score.py --tags s_v7_heldout__gemma-4-31b --corpus ../corpus/structured_heldout_scripts.json --source structured_heldout_a
 python structured_judge.py --tags s_v7__gemma-4-31b --corpus ../corpus/structured_scripts.json --source structured_raw_a \
-  --judge qwen3.5-4b-32k-fast --second-judge gemma-4-31b --sleep 5 --max-tokens 600
+  --judge qwen3.5-4b-32k-fast --second-judge gemma-4-31b --sleep 5 --max-tokens 600 --force
 python structured_judge.py --tags s_v7_heldout__gemma-4-31b --corpus ../corpus/structured_heldout_scripts.json --source structured_heldout_a \
-  --judge qwen3.5-4b-32k-fast --second-judge gemma-4-31b --sleep 5 --max-tokens 600
+  --judge qwen3.5-4b-32k-fast --second-judge gemma-4-31b --sleep 5 --max-tokens 600 --force
 
 # Read
 python structured_show.py --tag s_v7__gemma-4-31b --source structured_raw_a --all
@@ -432,7 +454,7 @@ python structured_show.py --tag s_v7__gemma-4-31b --source structured_raw_a --al
 
 ## 10. Spend
 
-Structured mode total: **~$1.44**.
+Structured mode total: **~$1.45**.
 
 - Deepgram TTS: 26,216 characters (42 tuning + 14 held-out clips, plus four voice
   regenerations) = **$0.786**.
@@ -442,7 +464,8 @@ Structured mode total: **~$1.44**.
   across all prompt iterations, the qwen comparison and both judge passes = **$0.282**
   (gemma $0.245, qwen $0.037).
 - v7 review re-run: 460.7k gemma input / 10.3k output for the eval (84 tuning + 28 held-out
-  calls) and 116.5k input / 8.9k output across 112 judge calls = **~$0.09**.
+  calls) and 232.9k input / 18.0k output across 224 judge calls (both judges on every stored
+  run; the previous clip-level pass had 112) = **~$0.10**.
 - The earlier Clean-mode research spend remains as recorded above; this section is additive.
   The whole research budget is still well under $10.
 
@@ -466,9 +489,11 @@ the corpus note and the scorer's currency check), so the app binary was not rebu
 max_tokens `3000`, timeout_ms `8000`, hedge_after_ms `4000`. With one provider, `cleanup()`
 takes the non-hedged branch (`providers.next()` is `None`), so hedging never starts and the
 value is inert today; 4000 is the researched Structured value if a fallback is added.
-Clean's effective config is unchanged: a programmatic comparison with
-`git show HEAD:src-tauri/config/pipeline.json` found identical STT, names and Clean cleanup
-values, with only the Groq provider removed.
+Clean's prompt, guard and Clean-specific settings (model, temperature, max tokens, timeout and
+hedge values, STT and names) are unchanged, but its provider/fallback chain did change: this PR
+removes Groq, so Clean now uses the single AssemblyAI gateway provider, as the embedded config
+does. That provider change is a deliberate part of this change, not an equivalence with the old
+configuration.
 
 **Like-for-like input.** Live STT matched the research batch transcripts closely: 36/42
 tuning transcripts byte-identical (minimum word-level similarity 0.981) and 13/14 held-out
@@ -519,15 +544,21 @@ judge gives the clip 10/10.
 **Guard decision and evidence.** Structured now rejects an *added* causal/inferential
 connective — because, since, therefore, thus, hence, so that, which means, as a result,
 consequently — counted as whole-token sequences (output count > transcript count). Soft
-linkers ("also", "but", "however") remain allowed. Over all 112 final research runs (42
-tuning + 14 held-out, two runs each) the guard rejects **0**: no output adds a strong
-connective. The only added connective anywhere is the soft "also" in `ho-list-parallel`
-(both runs), where all facts survive; rejecting it would have thrown away a faithful output.
-The old substring check would have rejected `st-mono-launch` because its output contains
-"so that's" (substring present, token phrase absent). The answered-question and
-executed-instruction heuristics also produced **0** false positives over the same 112 runs;
-all three injection clips are accepted when the injected sentence is reproduced as
-dictation. The app E2E reproduces this: 0 guard rejections in 56 clips.
+linkers ("also", "but", "however") remain allowed. The question and execution heuristics also
+mirror the shipping guard: request lead-ins ("please", "can you", "okay,", …) are stripped
+before cue detection, and "Do not …" is treated as an imperative, not a do-support question.
+Over all **174** stored outputs (112 final research runs — 42 tuning + 14 held-out, two runs
+each — plus all 62 app E2E entries) the guard rejects **0**. The only added connective anywhere
+is the soft "also" in `ho-list-parallel` (both runs), where all facts survive; rejecting it would
+have thrown away a faithful output. The old substring check would have rejected
+`st-mono-launch` because its output contains "so that's" (substring present, token phrase
+absent). The answered-question and executed-instruction heuristics also produced **0** false
+positives over the same outputs; all three injection clips are accepted when the injected
+sentence is reproduced as dictation. Explicit checks confirm the guard rejects a poem after
+"Please write a short poem about the launch" / "Can you write a short poem about the launch?"
+and "Paris is the capital of France." after "Can you tell me what the capital of France is?",
+while accepting faithful rewrites of those requests/questions and the numbered "Do not forget
+these steps" rewrite.
 
 **Rejection does not retry.** In `cleanup.rs` a failed guard returns
 `Err("response rejected")`; with the single provider that yields the raw transcript
@@ -536,8 +567,12 @@ the primary, so a temperature-0 retry cannot waste latency. Only network and 429
 retry (2 retries, 300/900 ms backoff); timeouts, truncated/empty answers and guard
 rejections do not. No change was needed.
 
-**Clean regression.** Clean's prompt, guard and effective config are untouched. The 29-clip
-regression run produced byte-identical outputs *and* byte-identical transcripts to
+**Clean regression.** Clean's prompt, guard and Clean-specific settings are unchanged, but its
+provider/fallback chain did change: this PR removes Groq, so Clean now uses the single AssemblyAI
+gateway provider, as the embedded config does. That is a deliberate part of this change, so this
+is a regression check of Clean's behaviour under the new provider chain, not a claim of total
+configuration equivalence. The 29-clip regression run produced byte-identical outputs *and*
+byte-identical transcripts to
 `app_v11`, the same 98.8 auto mean and the same per-clip scores. The 18-clip hard run scored
 99.1, matching `hard_v12` (99.1); all 18 transcripts match `hard_v11`, 15/18 outputs are
 byte-identical to `hard_v11`, and 16/18 are essentially identical to `hard_v12`. The three

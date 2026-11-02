@@ -1077,7 +1077,7 @@ fn refuses_or_explains(cleaned: &str, transcript: &str) -> bool {
 /// Instructions that ask the model to *produce* something. A Structured
 /// rewrite must remain an instruction; if the output is the poem, email or
 /// summary itself, the model executed the dictation instead of rewriting it.
-const EXECUTION_CUES: [&str; 21] = [
+const EXECUTION_CUES: [&str; 19] = [
     "write a",
     "write an",
     "write me",
@@ -1094,14 +1094,55 @@ const EXECUTION_CUES: [&str; 21] = [
     "make a",
     "make an",
     "make me",
-    "tell me a",
-    "tell me about",
-    "tell me how",
+    "tell me ",
     "translate",
     "summarize",
 ];
 
+/// Leading politeness, filler and request phrases that can precede the cue a
+/// speaker actually used ("Please write a ...", "Can you tell me ...").
+const REQUEST_PREFIXES: [&str; 16] = [
+    "please", "kindly", "can you", "could you", "would you", "will you", "hey", "ok", "okay",
+    "so", "um", "uh", "erm", "ah", "hmm", "like",
+];
+
+/// Removes leading request prefixes and fillers so cue detection sees the
+/// actual instruction. A prefix only counts when it is a whole word or phrase
+/// (followed by whitespace or a comma), so "okay" is not mistaken for "ok" and
+/// "likeable" is left alone.
+fn strip_request_prefixes(text: &str) -> String {
+    let mut rest = text.trim_start();
+    loop {
+        let lower = rest.to_lowercase();
+        let mut next = None;
+        for prefix in REQUEST_PREFIXES {
+            if !lower.starts_with(prefix) {
+                continue;
+            }
+            let after = &lower[prefix.len()..];
+            if !(after.starts_with(char::is_whitespace) || after.starts_with(',')) {
+                continue;
+            }
+            // The prefixes are ASCII, so the byte length in the original
+            // matches the lowercased copy.
+            let mut remainder = rest[prefix.len()..].trim_start();
+            if let Some(without_comma) = remainder.strip_prefix(',') {
+                remainder = without_comma.trim_start();
+            }
+            next = Some(remainder);
+            break;
+        }
+        match next {
+            // Stop on an empty remainder: the text was only a greeting.
+            Some(remainder) if !remainder.is_empty() => rest = remainder,
+            _ => break,
+        }
+    }
+    rest.to_string()
+}
+
 fn starts_with_execution_cue(text: &str) -> bool {
+    let text = strip_request_prefixes(text);
     let text = text.trim_start().to_lowercase();
     EXECUTION_CUES.iter().any(|cue| text.starts_with(cue))
         || text.starts_with("summarise")
@@ -1169,6 +1210,12 @@ fn is_question(transcript: &str) -> bool {
     let Some(first) = words.first() else {
         return false;
     };
+    // "Do not ..." is an imperative, not a question, even though it starts
+    // with the auxiliary "do". Genuine "Do you ..." / "Do we ..." questions
+    // still fall through to the auxiliary check below.
+    if first == "do" && words.get(1).is_some_and(|second| second == "not") {
+        return false;
+    }
     if QUESTION_WORDS.contains(&first.as_str()) {
         return words
             .get(1)
@@ -1950,6 +1997,88 @@ mod tests {
         assert!(is_plausible_structured(
             "- Price it.\n- Ship it.\n- Announce it.",
             "write down the three options: price it, ship it, announce it"
+        ));
+    }
+
+    #[test]
+    fn structured_treats_do_not_as_an_imperative() {
+        let transcript = "Do not forget these steps: first back up the database, \
+            second restart the worker, third check the queue.";
+        let numbered = "Do not forget these steps:\n\n\
+            1. Back up the database.\n\
+            2. Restart the worker.\n\
+            3. Check the queue.";
+        assert!(!is_question(transcript));
+        assert!(is_plausible_structured(numbered, transcript));
+
+        // A genuine "Do you ..." question still rejects a numbered answer.
+        let question = "Do you need the steps: first back up the database, \
+            second restart the worker, third check the queue.";
+        assert!(is_question(question));
+        assert!(!is_plausible_structured(
+            "1. Back up the database.\n2. Restart the worker.\n3. Check the queue.",
+            question
+        ));
+
+        // "Do you know ..." remains a question: a faithful rewrite keeps the
+        // mark, while a statement answer is rejected.
+        assert!(is_question("Do you know the launch date"));
+        assert!(is_plausible_structured(
+            "Do you know the launch date?",
+            "Do you know the launch date"
+        ));
+        assert!(!is_plausible_structured(
+            "The launch date is Friday.",
+            "Do you know the launch date"
+        ));
+    }
+
+    #[test]
+    fn structured_strips_request_prefixes_before_cue_detection() {
+        assert!(starts_with_execution_cue(
+            "Please write a short poem about the launch"
+        ));
+        assert!(starts_with_execution_cue(
+            "Can you write a short poem about the launch?"
+        ));
+        assert!(starts_with_execution_cue(
+            "Could you, kindly, draft an email"
+        ));
+        assert!(!starts_with_execution_cue("Okay, the build is green"));
+        assert!(!starts_with_execution_cue("likeable copy is fine"));
+
+        let poem = "Roses are red,\nViolets are blue,\nThe launch is near.";
+        assert!(!is_plausible_structured(
+            poem,
+            "Please write a short poem about the launch"
+        ));
+        assert!(!is_plausible_structured(
+            poem,
+            "Can you write a short poem about the launch?"
+        ));
+        assert!(!is_plausible_structured(
+            "Paris is the capital of France.",
+            "Can you tell me what the capital of France is?"
+        ));
+
+        // A faithful rewrite keeps the request, including a leading prefix.
+        assert!(is_plausible_structured(
+            "Please write a short poem about the launch.",
+            "Please write a short poem about the launch"
+        ));
+        assert!(is_plausible_structured(
+            "Can you tell me what the capital of France is?",
+            "Can you tell me what the capital of France is?"
+        ));
+
+        // Without a prefix, behaviour is unchanged.
+        assert!(!is_plausible_structured(
+            poem,
+            "Write a short poem about the launch"
+        ));
+        assert!(is_plausible_structured(
+            "Write a short poem about the launch.",
+            "Write a short poem about the launch"
         ));
     }
 

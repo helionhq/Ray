@@ -14,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio::{self, Capture};
 use crate::cleanup;
-use crate::config::{prompt_for, CleanupMode, RuntimeConfig};
+use crate::config::{prompt_for, CleanupConfig, CleanupMode, RuntimeConfig};
 use crate::hotkey;
 use crate::paste;
 use crate::secrets;
@@ -30,6 +30,17 @@ pub struct ConfigSummary {
     pub speech_model: String,
     pub streaming: bool,
     pub cleanup_models: Vec<String>,
+}
+
+/// The Settings badge chain must name the model the selected mode will
+/// actually call, including any Structured-only model override.
+fn cleanup_model_badges(cleanup: &CleanupConfig, mode: CleanupMode) -> Vec<String> {
+    cleanup
+        .for_mode(mode)
+        .providers
+        .iter()
+        .map(|provider| format!("{} ({})", provider.model, provider.id))
+        .collect()
 }
 
 struct Session {
@@ -178,7 +189,7 @@ impl Dictation {
             .cloned()
     }
 
-    pub fn config_summary(&self) -> ConfigSummary {
+    pub fn config_summary(&self, mode: CleanupMode) -> ConfigSummary {
         let config = self
             .config
             .read()
@@ -194,13 +205,7 @@ impl Dictation {
             structured_prompt_source: config.structured_prompt_source.clone(),
             speech_model,
             streaming: config.pipeline.stt.streaming,
-            cleanup_models: config
-                .pipeline
-                .cleanup
-                .providers
-                .iter()
-                .map(|provider| format!("{} ({})", provider.model, provider.id))
-                .collect(),
+            cleanup_models: cleanup_model_badges(&config.pipeline.cleanup, mode),
         }
     }
 
@@ -888,7 +893,36 @@ fn is_no_speech_error(error: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_no_speech_error, stt_failure_message};
+    use super::{cleanup_model_badges, is_no_speech_error, stt_failure_message};
+    use crate::config::{CleanupConfig, CleanupMode};
+
+    #[test]
+    fn settings_badges_reflect_the_selected_modes_model() {
+        let cleanup: CleanupConfig = serde_json::from_str(
+            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"retries":2,
+                "backoff_ms":[300,900],
+                "providers":[{"id":"assemblyai",
+                    "base_url":"https://llm-gateway.assemblyai.com/v1",
+                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
+                "modes":{"structured":{"model":"claude-sonnet-4-5"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cleanup_model_badges(&cleanup, CleanupMode::Clean),
+            vec!["gemma-4-31b (assemblyai)".to_string()]
+        );
+        assert_eq!(
+            cleanup_model_badges(&cleanup, CleanupMode::Structured),
+            vec!["claude-sonnet-4-5 (assemblyai)".to_string()]
+        );
+
+        // A Structured override that does not change the model keeps the
+        // base badge.
+        assert_eq!(
+            cleanup_model_badges(&CleanupConfig::default(), CleanupMode::Structured),
+            vec!["gemma-4-31b (assemblyai)".to_string()]
+        );
+    }
 
     #[test]
     fn explains_bad_keys_and_network_failures_differently() {

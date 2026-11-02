@@ -158,47 +158,63 @@ def main() -> None:
         for judge in judges:
             key = f"{tag}__judge_{re.sub(r'[^A-Za-z0-9._-]+', '_', judge)}"
             existing = merged.get(key, {}).get("rows", [])
-            done = {row["id"] for row in existing if row.get("ok")}
-            rows = existing
+            done = {(row["id"], row.get("run", 0)) for row in existing if row.get("ok")}
+            # A forced re-judge replaces the tag/judge rows rather than merging.
+            rows = [] if args.force else existing
             for sid, record in results.items():
                 if wanted and sid not in wanted:
                     continue
-                if sid not in scripts or not record.get("ok"):
+                if sid not in scripts:
                     continue
-                if sid in done and not args.force:
+                # Judge every successful stored run; app E2E/legacy records have
+                # no runs array and are judged as run 0.
+                runs = record.get("runs")
+                if isinstance(runs, list) and runs:
+                    candidates = [(index, run) for index, run in enumerate(runs) if run.get("ok")]
+                elif record.get("ok"):
+                    candidates = [(0, record)]
+                else:
                     continue
-                script = scripts[sid]
-                transcript = sanitize_transcript((stt.get(sid) or {}).get("text") or record.get("transcript") or "")
-                units = "\n".join(f"- {unit}" for unit in script.get("meaning_units", []))
-                banned = "\n".join(f"- {item}" for item in script.get("must_not", [])) or "- (none)"
-                user = (
-                    f"<transcript>\n{transcript}\n</transcript>\n\n"
-                    f"<meaning_units>\n{units}\n</meaning_units>\n\n"
-                    f"<must_not_appear>\n{banned}\n</must_not_appear>\n\n"
-                    f"<model_output>\n{record['text']}\n</model_output>"
-                )
-                raw, usage = call(judge, JUDGE_SYSTEM, user, args.max_tokens, args.timeout)
-                if args.sleep:
-                    time.sleep(args.sleep)
-                parsed = parse(raw)
-                if not parsed or not valid(parsed):
-                    print(f"  judge fail {judge} {sid}: {raw[:140]!r}")
-                    rows.append({"id": sid, "ok": False, "raw": raw[:500]})
-                    continue
-                parsed["id"] = sid
-                parsed["ok"] = True
-                parsed["usage"] = usage
-                rows.append(parsed)
-            # Keep one row per id (last wins) and recompute.
-            dedup = {row["id"]: row for row in rows}
+                for run_index, run in candidates:
+                    if (sid, run_index) in done and not args.force:
+                        continue
+                    script = scripts[sid]
+                    transcript = sanitize_transcript((stt.get(sid) or {}).get("text") or record.get("transcript") or "")
+                    units = "\n".join(f"- {unit}" for unit in script.get("meaning_units", []))
+                    banned = "\n".join(f"- {item}" for item in script.get("must_not", [])) or "- (none)"
+                    user = (
+                        f"<transcript>\n{transcript}\n</transcript>\n\n"
+                        f"<meaning_units>\n{units}\n</meaning_units>\n\n"
+                        f"<must_not_appear>\n{banned}\n</must_not_appear>\n\n"
+                        f"<model_output>\n{run.get('text') or ''}\n</model_output>"
+                    )
+                    raw, usage = call(judge, JUDGE_SYSTEM, user, args.max_tokens, args.timeout)
+                    if args.sleep:
+                        time.sleep(args.sleep)
+                    parsed = parse(raw)
+                    if not parsed or not valid(parsed):
+                        print(f"  judge fail {judge} {sid}#{run_index}: {raw[:140]!r}")
+                        rows.append({"id": sid, "run": run_index, "ok": False, "raw": raw[:500]})
+                        continue
+                    parsed["id"] = sid
+                    parsed["run"] = run_index
+                    parsed["ok"] = True
+                    parsed["usage"] = usage
+                    rows.append(parsed)
+            # Keep one row per (id, run) and recompute.
+            dedup = {(row["id"], row.get("run", 0)): row for row in rows}
             rows = list(dedup.values())
             ok_rows = [row for row in rows if row.get("ok")]
             summary = {
                 "judge": judge,
                 "n": len(ok_rows),
                 **{f"mean_{dim}": round(sum(row[dim] for row in ok_rows) / max(1, len(ok_rows)), 2) for dim in dims},
-                "meaning_fails": [row["id"] for row in ok_rows if not row.get("meaning_pass")],
-                "safety_fails": [row["id"] for row in ok_rows if row.get("safety", 10) < 10],
+                "meaning_fails": [
+                    f"{row['id']}#{row.get('run', 0)}" for row in ok_rows if not row.get("meaning_pass")
+                ],
+                "safety_fails": [
+                    f"{row['id']}#{row.get('run', 0)}" for row in ok_rows if row.get("safety", 10) < 10
+                ],
                 "rows": rows,
             }
             merged[key] = summary

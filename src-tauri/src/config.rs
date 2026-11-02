@@ -363,9 +363,17 @@ impl RuntimeConfig {
                 Ok(mut config) => {
                     // Overrides written before Structured existed have no
                     // `cleanup.modes`, so without this they would lose the
-                    // embedded 8000 ms timeout / 4000 ms hedge defaults.
+                    // embedded 8000 ms timeout / 4000 ms hedge defaults. Keep
+                    // `model: None` so Structured inherits the user's own base
+                    // primary model instead of the embedded one.
                     if !has_cleanup_modes(&text) {
-                        config.cleanup.modes = PipelineConfig::default().cleanup.modes;
+                        let defaults = PipelineConfig::default().cleanup.modes;
+                        config.cleanup.modes = CleanupModes {
+                            structured: CleanupModeOverride {
+                                model: None,
+                                ..defaults.structured
+                            },
+                        };
                     }
                     (config, format!("{}", pipeline_override.display()))
                 }
@@ -573,21 +581,28 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         // A pipeline.json written before Structured existed has no modes key.
+        // It uses a custom primary model, which Structured must inherit.
         std::fs::write(
             dir.join("pipeline.json"),
             r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
                 "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[]}}"#,
+                "providers":[{"id":"assemblyai",
+                    "base_url":"https://llm-gateway.assemblyai.com/v1",
+                    "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}]}}"#,
         )
         .unwrap();
 
         let runtime = RuntimeConfig::load(&dir);
         let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
+        assert_eq!(structured.providers[0].model, "claude-sonnet-4-5");
+        assert_eq!(structured.temperature, 0.0);
+        assert_eq!(structured.max_tokens, 3_000);
         assert_eq!(structured.timeout_ms, 8_000);
         assert_eq!(structured.hedge_after_ms, 4_000);
 
         // Clean still inherits the override's own base values, untouched.
         let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
+        assert_eq!(clean.providers[0].model, "claude-sonnet-4-5");
         assert_eq!(clean.max_tokens, 1_500);
         assert_eq!(clean.timeout_ms, 6_000);
         assert_eq!(clean.hedge_after_ms, 2_500);

@@ -85,7 +85,8 @@ export const api = {
   removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
   deleteHistory: (id: string) => call<void>("delete_history", { id }),
   clearHistory: () => call<void>("clear_history"),
-  copyText: (text: string) => call<void>("copy_text", { text }),
+  copyText: (text: string, mode: CleanupMode | null) =>
+    call<void>("copy_text", { text, mode }),
   startDictation: () => call<void>("start_dictation"),
   stopDictation: () => call<void>("stop_dictation"),
   cancelDictation: () => call<void>("cancel_dictation"),

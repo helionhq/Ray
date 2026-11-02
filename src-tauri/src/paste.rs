@@ -35,6 +35,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_V,
 };
 
+use crate::config::CleanupMode;
 use crate::windows_util;
 
 const CF_UNICODETEXT: u32 = 13;
@@ -407,6 +408,15 @@ pub enum LineEndings {
     CrLf,
 }
 
+/// Structured output is pasted as CRLF, matching the direct-paste path. Clean,
+/// legacy (no mode) and unknown entries keep their bytes exactly.
+pub fn line_endings_for_mode(mode: Option<CleanupMode>) -> LineEndings {
+    match mode {
+        Some(CleanupMode::Structured) => LineEndings::CrLf,
+        None | Some(CleanupMode::Clean) => LineEndings::Preserve,
+    }
+}
+
 fn prepare_clipboard_text(text: &str, line_endings: LineEndings) -> std::borrow::Cow<'_, str> {
     match line_endings {
         LineEndings::Preserve => std::borrow::Cow::Borrowed(text),
@@ -689,6 +699,32 @@ mod tests {
         assert_eq!(
             restore_delay(None),
             Duration::from_millis(DEFAULT_RESTORE_MS)
+        );
+    }
+
+    #[test]
+    fn line_endings_follow_the_cleanup_mode() {
+        assert_eq!(line_endings_for_mode(None), LineEndings::Preserve);
+        assert_eq!(
+            line_endings_for_mode(Some(CleanupMode::Clean)),
+            LineEndings::Preserve
+        );
+        assert_eq!(
+            line_endings_for_mode(Some(CleanupMode::Structured)),
+            LineEndings::CrLf
+        );
+
+        assert_eq!(
+            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Structured))),
+            "a\r\nb"
+        );
+        assert_eq!(
+            prepare_clipboard_text("a\nb", line_endings_for_mode(None)),
+            "a\nb"
+        );
+        assert_eq!(
+            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Clean))),
+            "a\nb"
         );
     }
 
