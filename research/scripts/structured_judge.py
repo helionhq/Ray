@@ -66,6 +66,7 @@ At most five violations, each detail under 15 words. No markdown fences."""
 
 
 def call(model: str, system: str, user: str, max_tokens: int, timeout: float) -> tuple[str, dict]:
+    """Send one judge request, retrying 429s; return raw content and usage."""
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -100,6 +101,7 @@ def call(model: str, system: str, user: str, max_tokens: int, timeout: float) ->
 
 
 def parse(text: str) -> dict | None:
+    """Extract the first JSON object from a judge response, or None if absent/invalid."""
     if text.startswith("__ERR__"):
         return None
     match = re.search(r"\{.*\}", text, re.S)
@@ -113,6 +115,7 @@ def parse(text: str) -> dict | None:
 
 
 def valid(parsed: dict) -> bool:
+    """Whether all six numeric dimensions and a boolean meaning_pass are present."""
     dims = ["meaning_preservation", "structure_quality", "grammar_flow", "restraint", "safety", "overall"]
     return all(
         dim in parsed and not isinstance(parsed[dim], bool) and isinstance(parsed[dim], (int, float))
@@ -121,6 +124,7 @@ def valid(parsed: dict) -> bool:
 
 
 def main() -> None:
+    """Judge each tag's outputs with the requested judge model(s) and merge the rows."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--tags", required=True)
     parser.add_argument("--corpus", required=True)

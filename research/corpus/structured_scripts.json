@@ -935,7 +935,7 @@
         "max_paragraphs": 5,
         "allow_bullets": true
       },
-      "notes": "Numbers and dates must be exact; currency symbols may be added naturally."
+      "notes": "Numbers and dates must be exact; no currency symbols may be added."
     },
     {
       "id": "st-contract-terms",

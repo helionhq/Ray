@@ -36,6 +36,10 @@ pub fn run() {
             let store = Arc::new(store::Store::load(&app_data));
             app.manage(store.clone());
 
+            // Remove credentials for providers Ray no longer ships. Idempotent
+            // and error-tolerant so old installs start cleanly.
+            secrets::remove_retired_secrets();
+
             let dictation = Dictation::new(app.handle().clone(), store, runtime_config);
             app.manage(dictation.clone());
 

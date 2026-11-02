@@ -338,6 +338,20 @@ pub struct RuntimeConfig {
     pub structured_prompt_source: String,
 }
 
+/// Whether a raw `pipeline.json` document explicitly contains `cleanup.modes`.
+/// This distinguishes an older override that predates the key (which must get
+/// the embedded Structured defaults) from an explicit, possibly partial object
+/// (which must keep inheriting the override's base cleanup values).
+fn has_cleanup_modes(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    value
+        .get("cleanup")
+        .and_then(|cleanup| cleanup.get("modes"))
+        .is_some()
+}
+
 impl RuntimeConfig {
     pub fn load(app_data: &Path) -> Self {
         let pipeline_override = app_data.join("pipeline.json");
@@ -346,7 +360,15 @@ impl RuntimeConfig {
 
         let (pipeline, pipeline_source) = match std::fs::read_to_string(&pipeline_override) {
             Ok(text) => match serde_json::from_str::<PipelineConfig>(&text) {
-                Ok(config) => (config, format!("{}", pipeline_override.display())),
+                Ok(mut config) => {
+                    // Overrides written before Structured existed have no
+                    // `cleanup.modes`, so without this they would lose the
+                    // embedded 8000 ms timeout / 4000 ms hedge defaults.
+                    if !has_cleanup_modes(&text) {
+                        config.cleanup.modes = PipelineConfig::default().cleanup.modes;
+                    }
+                    (config, format!("{}", pipeline_override.display()))
+                }
                 Err(error) => {
                     eprintln!("[ray] ignoring invalid pipeline.json override: {error}");
                     (PipelineConfig::default(), "embedded".into())
@@ -541,5 +563,65 @@ mod tests {
         assert_eq!(cleanup.hedge_after_ms, 2_500);
         // A document written before modes existed still loads.
         assert_eq!(cleanup.modes.structured.model, None);
+    }
+
+    #[test]
+    fn override_without_modes_gets_embedded_structured_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "ray-config-test-legacy-modes-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pipeline.json written before Structured existed has no modes key.
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[]}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
+        assert_eq!(structured.timeout_ms, 8_000);
+        assert_eq!(structured.hedge_after_ms, 4_000);
+
+        // Clean still inherits the override's own base values, untouched.
+        let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
+        assert_eq!(clean.max_tokens, 1_500);
+        assert_eq!(clean.timeout_ms, 6_000);
+        assert_eq!(clean.hedge_after_ms, 2_500);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_partial_modes_keep_base_cleanup_inheritance() {
+        let dir = std::env::temp_dir().join(format!(
+            "ray-config-test-partial-modes-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[],
+                "modes":{"structured":{"max_tokens":4200}}}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
+        // The explicit field wins; the rest inherit the base cleanup config,
+        // not the embedded Structured defaults.
+        assert_eq!(structured.max_tokens, 4_200);
+        assert_eq!(structured.timeout_ms, 6_000);
+        assert_eq!(structured.hedge_after_ms, 2_500);
+
+        let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
+        assert_eq!(clean.max_tokens, 1_500);
+        assert_eq!(clean.timeout_ms, 6_000);
+        assert_eq!(clean.hedge_after_ms, 2_500);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

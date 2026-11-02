@@ -24,6 +24,11 @@ GATEWAY = "https://llm-gateway.assemblyai.com/v1"
 
 
 def load_prompt(path: Path, data: dict, app_name: str) -> str:
+    """Load the Structured prompt and fill it the way build_system_prompt does.
+
+    Drops a leading Markdown title and substitutes the dictionary, known names,
+    app name and transcript placeholder.
+    """
     text = path.read_text(encoding="utf-8")
     # Match build_system_prompt: strip a leading Markdown title line.
     text = text.removeprefix("﻿")
@@ -46,10 +51,12 @@ def load_prompt(path: Path, data: dict, app_name: str) -> str:
 
 
 def normalize(text: str) -> list[str]:
+    """Lowercase word tokens used to compare repeat runs."""
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
 def call(model: str, system: str, user: str, temperature: float, max_tokens: int, timeout: float) -> dict:
+    """POST one non-streaming completion, retrying 429s, and record its latency."""
     payload = {
         "model": model,
         "messages": [
@@ -104,6 +111,7 @@ def call(model: str, system: str, user: str, temperature: float, max_tokens: int
 
 
 def main() -> None:
+    """Run each requested model over the corpus and merge results per tag/model."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--source", required=True, help="STT JSON filename under out/stt")

@@ -76,8 +76,18 @@ UNIT_ANCHOR = re.compile(
     r"^(\d+(?:\.\d+)?)\s*(euros?|bytes?|weeks?|months?|minutes?|days?|years?|hours?)$"
 )
 
+# The prompt forbids inventing a currency symbol the speaker did not say.
+# normalize_anchor_text strips currency signs, so they are scored separately.
+CURRENCY_SYMBOLS = ("$", "€", "£", "¥")
+CURRENCY_PENALTY = 15
+
 
 def normalize_anchor_text(text: str) -> str:
+    """Lowercase and strip currency signs/commas, then map number words to digits.
+
+    Applied to both sides of anchor matching, so "$1,200" matches "1200"; that
+    stripping is also why added currency symbols need their own check.
+    """
     text = text.lower().replace("€", "").replace("$", "").replace(",", "")
     for word, number in NUMBER_WORDS.items():
         text = re.sub(rf"\b{word}\b", number, text)
@@ -85,6 +95,11 @@ def normalize_anchor_text(text: str) -> str:
 
 
 def anchor_present(anchor: str, output: str) -> bool:
+    """Return whether an anchor survives in the output in any accepted form.
+
+    Matches the normalized anchor text, or a number next to its unit, or the
+    special "not on Windows 10" negation.
+    """
     normalized_anchor = normalize_anchor_text(anchor)
     normalized_output = normalize_anchor_text(output)
     if normalized_anchor in normalized_output:
@@ -102,6 +117,7 @@ def anchor_present(anchor: str, output: str) -> bool:
 
 
 def contains_word(text: str, needle: str) -> bool:
+    """Whole-token search that also handles multi-word needles."""
     if any(ch.isspace() for ch in needle):
         # Token-sequence match so "so that" does not fire on "so that's".
         words = re.findall(r"[a-z0-9']+", text.lower())
@@ -113,6 +129,7 @@ def contains_word(text: str, needle: str) -> bool:
 
 
 def first_word(text: str) -> str:
+    """First whitespace-delimited token with surrounding punctuation removed."""
     words = text.split()
     return re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", words[0]).lower() if words else ""
 
@@ -131,6 +148,7 @@ def count_phrase(text: str, phrase: str) -> int:
 
 
 def first_content_word(text: str) -> str:
+    """First token after stripping punctuation and skipping a leading "please"."""
     for word in text.split():
         word = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", word)
         if word and word.lower() != "please":
@@ -139,6 +157,7 @@ def first_content_word(text: str) -> str:
 
 
 def is_question(text: str) -> bool:
+    """Heuristic: a question mark, or a question word/auxiliary leading the text."""
     text = text.strip()
     if "?" in text:
         return True
@@ -152,6 +171,7 @@ def is_question(text: str) -> bool:
 
 
 def starts_with_list_marker(text: str) -> bool:
+    """Whether the first non-blank line starts with a bullet or "1. " marker."""
     line = next((line for line in text.splitlines() if line.strip()), "").lstrip()
     if line.startswith(("- ", "* ", "• ")):
         return True
@@ -163,6 +183,7 @@ def starts_with_list_marker(text: str) -> bool:
 
 
 def starts_with_execution_cue(text: str) -> bool:
+    """Whether the text opens with an instruction-style cue ("write a", ...)."""
     text = text.strip().lower()
     return (
         any(text.startswith(cue) for cue in EXECUTION_CUES)
@@ -173,6 +194,7 @@ def starts_with_execution_cue(text: str) -> bool:
 
 
 def contains_execution_cue(text: str) -> bool:
+    """Whether an instruction-style cue appears anywhere in the text."""
     text = text.lower()
     return (
         any(cue in text for cue in EXECUTION_CUES)
@@ -183,6 +205,7 @@ def contains_execution_cue(text: str) -> bool:
 
 
 def flags(text: str) -> dict:
+    """Count bullets, numbered items, paragraphs, lines and words in the output."""
     lines = [line for line in text.splitlines() if line.strip()]
     paragraphs = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
     return {
@@ -195,6 +218,11 @@ def flags(text: str) -> dict:
 
 
 def shape_ok(script: dict, text: str, fmt: dict) -> tuple[bool, list[str]]:
+    """Check the output against the script's expected_format and shape limits.
+
+    Returns (is_ok, human-readable issues). Unknown formats are reported rather
+    than silently passing.
+    """
     expected = script.get("expected_format", "prose")
     shape = script.get("shape") or {}
     issues: list[str] = []
@@ -232,7 +260,7 @@ def shape_ok(script: dict, text: str, fmt: dict) -> tuple[bool, list[str]]:
             issues.append(f"need >= 3 list items, got {fmt['bullets']} bullets / {fmt['numbered']} numbered")
         if fmt["paragraphs"] > shape.get("max_paragraphs", 3):
             issues.append(f"too many paragraphs: {fmt['paragraphs']}")
-    elif expected in ("prose_or_bullets", "bullets_or_prose"):
+    elif expected in ("prose_or_bullets", "bullets_or_prose", "paragraphs_or_bullets"):
         if fmt["numbered"] and not shape.get("allow_numbered"):
             issues.append("numbered items not allowed here")
         if fmt["bullets"] and fmt["bullets"] < 3:
@@ -258,6 +286,8 @@ def shape_ok(script: dict, text: str, fmt: dict) -> tuple[bool, list[str]]:
             issues.append(f"too many paragraphs: {fmt['paragraphs']}")
         if lists and not shape.get("allow_bullets"):
             issues.append("email body unexpectedly became a list")
+    else:
+        issues.append(f"unknown expected_format: {expected}")
     return (not issues, issues)
 
 
@@ -306,6 +336,7 @@ def guard_check(output: str, transcript: str) -> list[str]:
 
 
 def score_one(script: dict, output: str, transcript: str) -> dict:
+    """Score one model output against its script and return a reportable row."""
     anchors = script.get("anchors", [])
     missing = [a for a in anchors if not anchor_present(a, output)]
     must_not_hits = [m for m in script.get("must_not", []) if contains_word(output, m)]
@@ -340,6 +371,12 @@ def score_one(script: dict, output: str, transcript: str) -> dict:
         word for word in RELATIONSHIP_WORDS
         if contains_word(output, word) and not contains_word(transcript, word)
     ]
+    # Kept separate from format_ok: this is a prompt violation, not list/paragraph
+    # shape, and normalize_anchor_text deliberately removes these symbols.
+    currency_additions = [
+        symbol for symbol in CURRENCY_SYMBOLS
+        if symbol in output and symbol not in transcript
+    ]
 
     penalty = 0
     penalty += round(100 * len(missing) / max(1, len(anchors)))
@@ -351,6 +388,7 @@ def score_one(script: dict, output: str, transcript: str) -> dict:
     penalty += 0 if length_ok else 15
     penalty += 90 if answered else 0
     penalty += min(30, 10 * len(guard_issues))
+    penalty += CURRENCY_PENALTY if currency_additions else 0
     auto = max(0, min(100, round(100 - penalty)))
     hard_fail = bool(must_not_hits) or answered or bool(guard_issues)
     return {
@@ -373,11 +411,13 @@ def score_one(script: dict, output: str, transcript: str) -> dict:
         "guard_ok": not guard_issues,
         "guard_issues": guard_issues,
         "relationship_additions": relationship_additions,
+        "currency_additions": currency_additions,
         "run_stability": None,
     }
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
+    """Inclusive percentile of a small sample, rounded to one decimal."""
     if not values:
         return None
     if len(values) == 1:
@@ -386,6 +426,7 @@ def percentile(values: list[float], fraction: float) -> float | None:
 
 
 def main() -> None:
+    """Score each saved tag's LLM outputs and merge them into structured_scores.json."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--tags", required=True)
     parser.add_argument("--corpus", required=True)
@@ -430,6 +471,7 @@ def main() -> None:
             "format_fails": [r["id"] for r in rows if not r["format_ok"]],
             "guard_fails": [r["id"] for r in rows if not r["guard_ok"]],
             "relationship_warnings": {r["id"]: r["relationship_additions"] for r in rows if r.get("relationship_additions")},
+            "currency_additions": {r["id"]: r["currency_additions"] for r in rows if r.get("currency_additions")},
             "answered": [r["id"] for r in rows if r["answered_or_executed"]],
             "p50_ms": percentile(lat, 0.50),
             "p95_ms": percentile(lat, 0.95),
@@ -448,6 +490,14 @@ def main() -> None:
             print("   hard:", ", ".join(merged[tag]["hard_fails"][:12]))
         if merged[tag]["format_fails"]:
             print("   fmt :", ", ".join(merged[tag]["format_fails"][:12]))
+        if merged[tag]["currency_additions"]:
+            print(
+                "   cur :",
+                ", ".join(
+                    f"{sid}({''.join(symbols)})"
+                    for sid, symbols in merged[tag]["currency_additions"].items()
+                ),
+            )
     merged_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
 
 

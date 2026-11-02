@@ -91,6 +91,10 @@ def parse(stdout: str) -> tuple[str, str, str, int | None, int | None, str | Non
 
 
 def main() -> None:
+    """Run each corpus clip through the Ray selftest binary and merge the outputs.
+
+    Writes STT and cleanup results in the shapes score.py / judge.py consume.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
     ap.add_argument(

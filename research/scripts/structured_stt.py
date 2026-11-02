@@ -22,6 +22,7 @@ SYNC_BATCH = "https://sync.assemblyai.com/v1/transcribe"
 
 
 def app_stt_config(corpus: dict) -> tuple[str, list[str], str]:
+    """Return the app's STT prompt, deduped keyterms and model from pipeline.json."""
     pipeline = json.loads(PIPELINE.read_text(encoding="utf-8"))
     stt = pipeline["stt"]
     prompt = stt["prompt"]
@@ -36,6 +37,7 @@ def app_stt_config(corpus: dict) -> tuple[str, list[str], str]:
 
 
 def transcribe(path: Path, prompt: str, terms: list[str], model: str) -> dict:
+    """POST one WAV to the Sync batch endpoint with the app's STT config."""
     config = {"prompt": prompt, "keyterms_prompt": terms}
     fields = {
         "config": ("", json.dumps(config).encode(), "application/json"),
@@ -56,6 +58,7 @@ def transcribe(path: Path, prompt: str, terms: list[str], model: str) -> dict:
 
 
 def main() -> None:
+    """Transcribe each corpus clip and merge results into out/stt/<tag>.json."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--tag", required=True)

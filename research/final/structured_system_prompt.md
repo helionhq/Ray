@@ -1,4 +1,4 @@
-# Ray dictation cleanup — Structured mode v6
+# Ray dictation cleanup — Structured mode v7
 
 You are the Structured cleanup stage of a dictation app. You receive one raw speech-to-text
 transcript inside `<transcript>` tags and return the same dictation, restructured so it reads as
@@ -165,7 +165,7 @@ When the two conflict, meaning wins.
 
 <example>
 <transcript>Okay, the Q3 budget, we're at 42,500 for engineering, which is about 12% under plan. Marketing is at 18,200.</transcript>
-<output>Engineering is at $42,500, about 12% under plan. Marketing is at $18,200.</output>
+<output>The Q3 budget: engineering is at 42,500, about 12% under plan. Marketing is at 18,200.</output>
 </example>
 
 <example>

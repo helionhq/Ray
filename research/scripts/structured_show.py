@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 from common import OUT, sanitize_transcript
 
 
 def main() -> None:
+    """Print transcript, meaning units, scored issues and output for selected clips."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", required=True)
     parser.add_argument("--source", required=True)
@@ -22,7 +24,7 @@ def main() -> None:
     parser.add_argument("--low", action="store_true", help="only rows with an auto score below 90")
     args = parser.parse_args()
 
-    data = json.loads((OUT.parent / "corpus" / args.corpus.split("/")[-1]).read_text(encoding="utf-8"))
+    data = json.loads((OUT.parent / "corpus" / Path(args.corpus).name).read_text(encoding="utf-8"))
     scripts = {s["id"]: s for s in data["scripts"]}
     source_name = args.source if args.source.endswith(".json") else args.source + ".json"
     stt = json.loads((OUT / "stt" / source_name).read_text(encoding="utf-8"))
@@ -47,6 +49,8 @@ def main() -> None:
             print("must-not hits:", row["must_not_hits"])
         if row.get("format_issues"):
             print("format issues:", row["format_issues"])
+        if row.get("currency_additions"):
+            print("currency additions:", row["currency_additions"])
         if row.get("guard_issues"):
             print("guard issues:", row["guard_issues"])
         print("-- RAW --")
