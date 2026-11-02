@@ -349,6 +349,44 @@ fn has_cleanup_modes(text: &str) -> bool {
         .is_some()
 }
 
+/// Whether `provider` belongs to a backend Ray has retired. Startup deletes
+/// retired credentials, so a legacy override that still lists one would have
+/// every cleanup request fail and the user would get the raw transcript.
+fn is_retired_provider(provider: &CleanupProvider) -> bool {
+    let is_retired_name = |value: &str| {
+        crate::secrets::RETIRED
+            .iter()
+            .any(|retired| value.eq_ignore_ascii_case(retired))
+    };
+    // The endpoint is the third signal: older overrides may use a custom id or
+    // secret name but still point at the retired provider's API host.
+    let uses_retired_host = url::Url::parse(&provider.base_url).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.groq.com"))
+    });
+    is_retired_name(&provider.id) || is_retired_name(&provider.api_key_secret) || uses_retired_host
+}
+
+/// Remove retired providers from a legacy override, keeping the order of the
+/// remaining supported providers. When none remain, fall back to the embedded
+/// default so cleanup still runs.
+fn remove_retired_providers(pipeline: &mut PipelineConfig) {
+    let before = pipeline.cleanup.providers.len();
+    pipeline
+        .cleanup
+        .providers
+        .retain(|provider| !is_retired_provider(provider));
+    let removed = before - pipeline.cleanup.providers.len();
+    if removed == 0 {
+        return;
+    }
+    eprintln!("[ray] removed {removed} retired cleanup provider(s) from pipeline.json override");
+    if pipeline.cleanup.providers.is_empty() {
+        pipeline.cleanup.providers = PipelineConfig::default().cleanup.providers;
+        eprintln!("[ray] no supported cleanup providers remain; using the embedded default");
+    }
+}
+
 impl RuntimeConfig {
     pub fn load(app_data: &Path) -> Self {
         let pipeline_override = app_data.join("pipeline.json");
@@ -371,6 +409,11 @@ impl RuntimeConfig {
                                 ..defaults.structured
                             },
                         };
+                        // A legacy override may still list a provider whose
+                        // credentials startup deletes; drop it so cleanup keeps
+                        // working and falls back to the embedded default only
+                        // when nothing supported is left.
+                        remove_retired_providers(&mut config);
                     }
                     config
                 }
@@ -403,6 +446,16 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A per-test directory so parallel tests never share override files.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ray-config-test-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn embedded_pipeline_parses_and_matches_the_recommendation() {
@@ -624,6 +677,151 @@ mod tests {
         assert_eq!(clean.max_tokens, 1_500);
         assert_eq!(clean.timeout_ms, 6_000);
         assert_eq!(clean.hedge_after_ms, 2_500);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_override_with_only_groq_falls_back_to_embedded_defaults() {
+        let dir = temp_dir("legacy-groq-only");
+        // Each provider is identified as retired by a different signal: the
+        // id, the secret name, or the API host.
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[
+                    {"id":"Groq","base_url":"https://example.com/v1",
+                        "model":"llama-3.3-70b","api_key_secret":"custom"},
+                    {"id":"custom","base_url":"https://example.com/v1",
+                        "model":"llama-3.3-70b","api_key_secret":"GROQ"},
+                    {"id":"custom","base_url":"https://api.groq.com/openai/v1",
+                        "model":"llama-3.3-70b","api_key_secret":"custom"}
+                ]}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(
+            serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
+            serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
+        );
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_override_drops_groq_and_keeps_supported_providers_in_order() {
+        let dir = temp_dir("legacy-groq-primary");
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[
+                    {"id":"groq","base_url":"https://api.groq.com/openai/v1",
+                        "model":"llama-3.3-70b","api_key_secret":"groq"},
+                    {"id":"assemblyai",
+                        "base_url":"https://llm-gateway.assemblyai.com/v1",
+                        "model":"gemma-4-31b","api_key_secret":"assemblyai"},
+                    {"id":"vercel","base_url":"https://ai-gateway.vercel.sh/v1",
+                        "model":"openai/gpt-5","api_key_secret":"vercel"}
+                ]}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        let providers = &runtime.pipeline.cleanup.providers;
+        assert_eq!(
+            providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["assemblyai", "vercel"]
+        );
+        assert_eq!(providers[0].model, "gemma-4-31b");
+        assert_eq!(providers[0].api_key_secret, "assemblyai");
+        assert_eq!(providers[1].base_url, "https://ai-gateway.vercel.sh/v1");
+        assert_eq!(providers[1].model, "openai/gpt-5");
+        assert_eq!(providers[1].api_key_secret, "vercel");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_override_without_retired_providers_is_unchanged() {
+        let dir = temp_dir("legacy-supported-only");
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[
+                    {"id":"assemblyai",
+                        "base_url":"https://llm-gateway.assemblyai.com/v1",
+                        "model":"claude-sonnet-4-5","api_key_secret":"assemblyai",
+                        "extra_body":{"reasoning":{"effort":"low"}}}
+                ]}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        // Every field, including the custom model and extra body, survives.
+        assert_eq!(
+            serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
+            serde_json::json!([{
+                "id": "assemblyai",
+                "base_url": "https://llm-gateway.assemblyai.com/v1",
+                "model": "claude-sonnet-4-5",
+                "api_key_secret": "assemblyai",
+                "extra_body": {"reasoning": {"effort": "low"}}
+            }])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_cleanup_modes_are_never_migrated() {
+        let dir = temp_dir("explicit-modes");
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[{"id":"assemblyai",
+                    "base_url":"https://llm-gateway.assemblyai.com/v1",
+                    "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}],
+                "modes":{"structured":{"max_tokens":4200}}}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(
+            runtime.pipeline.cleanup.providers[0].model,
+            "claude-sonnet-4-5"
+        );
+
+        // A document that explicitly declares modes parses exactly as before,
+        // even when it lists a retired provider.
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[{"id":"groq",
+                    "base_url":"https://api.groq.com/openai/v1",
+                    "model":"llama-3.3-70b","api_key_secret":"groq"}],
+                "modes":{"structured":{}}}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "groq");
+
+        // The embedded default never contains a retired provider.
+        let defaults = PipelineConfig::default();
+        assert_eq!(defaults.cleanup.providers.len(), 1);
+        assert_eq!(defaults.cleanup.providers[0].id, "assemblyai");
+        assert!(defaults
+            .cleanup
+            .providers
+            .iter()
+            .all(|provider| !is_retired_provider(provider)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

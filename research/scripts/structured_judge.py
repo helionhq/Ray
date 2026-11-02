@@ -159,24 +159,11 @@ def main() -> None:
             key = f"{tag}__judge_{re.sub(r'[^A-Za-z0-9._-]+', '_', judge)}"
             existing = merged.get(key, {}).get("rows", [])
             done = {(row["id"], row.get("run", 0)) for row in existing if row.get("ok")}
-            # A forced re-judge replaces only the IDs being re-judged; rows for
-            # IDs outside --ids keep their stored judgments. A stored row is only
-            # replaced when its ID can actually be re-judged from this result
-            # file, so rows for selected IDs absent here are retained.
-            if args.force:
-                if wanted is None:
-                    rows = []
-                else:
-                    rejudgeable = wanted & set(results) & set(scripts)
-                    missing = wanted - rejudgeable
-                    if missing:
-                        print(
-                            f"{key}: kept stored rows for selected IDs with no rejudgeable result: "
-                            f"{', '.join(sorted(missing))}"
-                        )
-                    rows = [row for row in existing if row["id"] not in rejudgeable]
-            else:
-                rows = existing
+            # Rows attempted by this run, at (id, run) granularity. In force
+            # mode, a stored row is replaced only when its exact pair is
+            # attempted below; stored rows for every other pair are kept,
+            # whether or not --ids was passed.
+            fresh: list[dict] = []
             for sid, record in results.items():
                 if wanted and sid not in wanted:
                     continue
@@ -210,13 +197,34 @@ def main() -> None:
                     parsed = parse(raw)
                     if not parsed or not valid(parsed):
                         print(f"  judge fail {judge} {sid}#{run_index}: {raw[:140]!r}")
-                        rows.append({"id": sid, "run": run_index, "ok": False, "raw": raw[:500]})
+                        fresh.append({"id": sid, "run": run_index, "ok": False, "raw": raw[:500]})
                         continue
                     parsed["id"] = sid
                     parsed["run"] = run_index
                     parsed["ok"] = True
                     parsed["usage"] = usage
-                    rows.append(parsed)
+                    fresh.append(parsed)
+            if args.force:
+                # A forced re-judge replaces only the (id, run) pairs actually
+                # attempted above, including failed judge responses. Every
+                # other stored pair survives, with or without --ids.
+                replaced = {(row["id"], row.get("run", 0)) for row in fresh}
+                rows = [
+                    row for row in existing
+                    if (row["id"], row.get("run", 0)) not in replaced
+                ]
+                rows.extend(fresh)
+                if wanted is not None:
+                    missing = sorted(wanted - {row["id"] for row in fresh})
+                    if missing:
+                        print(
+                            f"{key}: kept stored rows for selected IDs with no replacement row: "
+                            f"{', '.join(missing)}"
+                        )
+            else:
+                # Non-force keeps every existing row and appends the new ones;
+                # the dedup below keeps the last row for each (id, run).
+                rows = existing + fresh
             # Keep one row per (id, run) and recompute.
             dedup = {(row["id"], row.get("run", 0)): row for row in rows}
             rows = list(dedup.values())

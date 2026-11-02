@@ -10,7 +10,7 @@ pub const VERCEL: &str = "vercel";
 
 /// Providers Ray no longer supports. Their stored credentials must be removed
 /// so a retired key cannot linger in Credential Manager with no UI to clear it.
-const RETIRED: &[&str] = &["groq"];
+pub const RETIRED: &[&str] = &["groq"];
 
 pub fn env_names(secret: &str) -> &'static [&'static str] {
     match secret {

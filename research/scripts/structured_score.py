@@ -499,27 +499,12 @@ def main() -> None:
             print(f"missing {path}")
             continue
         results = json.loads(path.read_text(encoding="utf-8"))
-        # With --ids, rescore only those clips and keep the stored rows for the
-        # rest; the tag summary is recomputed over the combined rows. A stored
-        # row is only replaced when its ID can actually be rescored from this
-        # result file; rows for selected IDs absent here are retained.
-        if wanted is None:
-            rows = []
-        else:
-            rescorable = wanted & set(results) & set(scripts)
-            missing = wanted - rescorable
-            if missing:
-                print(
-                    f"{tag}: kept stored rows for selected IDs with no rescorable result: "
-                    f"{', '.join(sorted(missing))}"
-                )
-            rows = [
-                row for row in merged.get(tag, {}).get("rows", [])
-                if row["id"] not in rescorable
-            ]
-        # Rows written by an older scorer have no run number; label them run 0.
-        for row in rows:
-            row.setdefault("run", 0)
+        # Rows produced by this run, at (id, run) granularity. The tag summary
+        # is recomputed over the stored rows plus these. A stored row is
+        # replaced only when this result file reproduces its exact (id, run)
+        # pair, so IDs with only failed runs, and run numbers absent from the
+        # result record, keep their rows whether or not --ids was passed.
+        fresh: list[dict] = []
         stabilities = []
         unscored = 0
         for sid, record in results.items():
@@ -547,7 +532,7 @@ def main() -> None:
                     row["total_ms"] = run.get("total_ms")
                     row["finish_reason"] = run.get("finish_reason")
                     row["run_stability"] = stability
-                    rows.append(row)
+                    fresh.append(row)
             elif record.get("ok"):
                 # App E2E and legacy records have no runs array; score them as run 0.
                 row = score_one(scripts[sid], record.get("text") or "", transcript)
@@ -555,7 +540,23 @@ def main() -> None:
                 row["total_ms"] = record.get("total_ms")
                 row["finish_reason"] = record.get("finish_reason")
                 row["run_stability"] = stability
-                rows.append(row)
+                fresh.append(row)
+        # Start from the stored rows and drop only the pairs this run actually
+        # produced; everything else survives untouched, with or without --ids.
+        rows = list(merged.get(tag, {}).get("rows", []))
+        # Rows written by an older scorer have no run number; label them run 0.
+        for row in rows:
+            row.setdefault("run", 0)
+        replaced = {(row["id"], row.get("run", 0)) for row in fresh}
+        rows = [row for row in rows if (row["id"], row.get("run", 0)) not in replaced]
+        rows.extend(fresh)
+        if wanted is not None:
+            missing = sorted(wanted - {row["id"] for row in fresh})
+            if missing:
+                print(
+                    f"{tag}: kept stored rows for selected IDs with no replacement row: "
+                    f"{', '.join(missing)}"
+                )
         if not rows:
             print(f"{tag}: no scored clips")
             continue
