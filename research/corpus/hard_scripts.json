@@ -1,0 +1,485 @@
+{
+  "description": "Round-2 adversarial corpus. The mess is written into the spoken text so the TTS actually says it (stutters, restarts, self-corrections, trailing off, meaning-bearing fillers, run-on lists, formatting commands). Kept separate from scripts.json, which is the regression corpus.",
+  "dictionary": [
+    "Arham",
+    "Helion",
+    "Ray"
+  ],
+  "builtin_names": [
+    "Claude",
+    "ChatGPT",
+    "GPT-5",
+    "Gemma",
+    "Qwen",
+    "gpt-oss",
+    "Grok",
+    "Groq",
+    "Gemini",
+    "Anthropic",
+    "OpenAI",
+    "Vercel",
+    "Tauri",
+    "Supabase",
+    "Linear",
+    "Notion",
+    "Kubernetes",
+    "PostgreSQL",
+    "Next.js",
+    "shadcn",
+    "Tailwind",
+    "TypeScript",
+    "GitHub",
+    "Slack",
+    "Deepgram",
+    "AssemblyAI",
+    "Typeless",
+    "Rust",
+    "pnpm"
+  ],
+  "scripts": [
+    {
+      "id": "hard-tone-preserve",
+      "category": "tone",
+      "voice": "aura-2-thalia-en",
+      "speed": 1.1,
+      "spoken": "Yo, quick one. The onboarding copy needs a pass. It's too wordy. Can you, um, tighten it up before the demo?",
+      "ideal": "Yo, quick one. The onboarding copy needs a pass. It's too wordy. Can you tighten it up before the demo?",
+      "expected_format": "prose",
+      "require": [
+        "Yo, quick one",
+        "needs a pass. It's too wordy",
+        "tighten"
+      ],
+      "forbid": [
+        "Hey, quick",
+        "because",
+        "as it's too wordy"
+      ],
+      "checks": [
+        "'Yo' not replaced with 'Hey'",
+        "no invented 'because'",
+        "same four sentences"
+      ]
+    },
+    {
+      "id": "hard-stutter-repeat",
+      "category": "disfluency",
+      "voice": "aura-2-orion-en",
+      "speed": 0.95,
+      "spoken": "Hey, um, we we need to, uh, we need to fix the the onboarding flow before the the demo on Thursday.",
+      "ideal": "Hey, we need to fix the onboarding flow before the demo on Thursday.",
+      "expected_format": "prose",
+      "require": [
+        "we need to fix the onboarding flow before the demo on Thursday"
+      ],
+      "forbid": [
+        "we we",
+        "the the",
+        "onboarding flow before the the"
+      ],
+      "checks": [
+        "stutters removed",
+        "single clean sentence",
+        "no other words lost"
+      ]
+    },
+    {
+      "id": "hard-restart-abandoned",
+      "category": "restart",
+      "voice": "aura-2-andromeda-en",
+      "speed": 1.0,
+      "spoken": "So the thing is, okay, let me start over. The beta for Ray needs a a proper onboarding email before we we send it to the waitlist.",
+      "ideal": "The beta for Ray needs a proper onboarding email before we send it to the waitlist.",
+      "expected_format": "prose",
+      "require": [
+        "The beta for Ray needs a proper onboarding email before we send it to the waitlist"
+      ],
+      "forbid": [
+        "start over",
+        "the thing is",
+        "a a",
+        "we we"
+      ],
+      "checks": [
+        "abandoned opener dropped",
+        "final intent kept"
+      ]
+    },
+    {
+      "id": "hard-self-correction-name",
+      "category": "self-correction",
+      "voice": "aura-2-apollo-en",
+      "speed": 1.0,
+      "spoken": "Send the contract to Mark, no, wait, to Sarah. And, uh, cc Arham.",
+      "ideal": "Send the contract to Sarah, and cc Arham.",
+      "expected_format": "prose",
+      "require": [
+        "Sarah",
+        "Arham"
+      ],
+      "forbid": [
+        "Mark",
+        "no, wait"
+      ],
+      "checks": [
+        "superseded name removed",
+        "final name and dictionary term exact"
+      ]
+    },
+    {
+      "id": "hard-scratch-that",
+      "category": "self-correction",
+      "voice": "aura-2-helena-en",
+      "speed": 1.0,
+      "spoken": "Book the room for Friday at 3, scratch that, Thursday at 3:30, for the Helion review.",
+      "ideal": "Book the room for Thursday at 3:30 for the Helion review.",
+      "expected_format": "prose",
+      "require": [
+        "Thursday at 3:30",
+        "Helion"
+      ],
+      "forbid": [
+        "Friday",
+        "scratch that",
+        "3 for"
+      ],
+      "checks": [
+        "date and time corrected",
+        "cue removed",
+        "Helion exact"
+      ]
+    },
+    {
+      "id": "hard-trailing-off",
+      "category": "trailing",
+      "voice": "aura-2-draco-en",
+      "speed": 0.95,
+      "spoken": "I was going to say we should move the whole thing to, uh, the new provider, but, actually, let's just keep it where it is for now.",
+      "ideal": "I was going to say we should move the whole thing to the new provider, but, actually, let's just keep it where it is for now.",
+      "expected_format": "prose",
+      "require": [
+        "I was going to say",
+        "the new provider",
+        "keep it where it is for now"
+      ],
+      "forbid": [
+        "However",
+        "But we should"
+      ],
+      "checks": [
+        "trailing thought kept, not completed with invented content",
+        "tone kept"
+      ]
+    },
+    {
+      "id": "hard-like-content",
+      "category": "filler-content",
+      "voice": "aura-2-luna-en",
+      "speed": 1.05,
+      "spoken": "I like Claude, you know? You know the answer better than I do. It's like, you know, kind of a big deal.",
+      "ideal": "I like Claude, you know? You know the answer better than I do. It's kind of a big deal.",
+      "expected_format": "prose",
+      "require": [
+        "I like Claude",
+        "You know the answer",
+        "kind of a big deal"
+      ],
+      "forbid": [
+        "I enjoy",
+        "It's like a big deal",
+        "It's a big deal"
+      ],
+      "checks": [
+        "content 'like' kept",
+        "content 'you know' kept",
+        "filler 'like/you know' removed"
+      ],
+      "ignore_filler_penalty": true
+    },
+    {
+      "id": "hard-filler-content",
+      "category": "filler-content",
+      "voice": "aura-2-iris-en",
+      "speed": 1.0,
+      "spoken": "So, um, I mean, the the real issue is that it's kind of slow, you know, but I sort of like it.",
+      "ideal": "So, the real issue is that it's kind of slow, but I sort of like it.",
+      "expected_format": "prose",
+      "require": [
+        "kind of slow",
+        "sort of like it"
+      ],
+      "forbid": [
+        "somewhat slow",
+        "rather slow",
+        "quite slow",
+        "a bit slow",
+        "I really like"
+      ],
+      "checks": [
+        "hedges are content, not fillers",
+        "no synonym swap"
+      ],
+      "ignore_filler_penalty": true
+    },
+    {
+      "id": "hard-runon-list",
+      "category": "run-on",
+      "voice": "aura-2-arcas-en",
+      "speed": 0.95,
+      "spoken": "We need, um, milk, eggs, and also bread, and, uh, coffee, and I think that's it, and butter too.",
+      "ideal": "We need milk, eggs, and also bread, and coffee, and I think that's it, and butter too.",
+      "expected_format": "prose",
+      "require": [
+        "milk",
+        "eggs",
+        "bread",
+        "coffee",
+        "I think that's it",
+        "butter"
+      ],
+      "forbid": [
+        "- ",
+        "1. "
+      ],
+      "checks": [
+        "run-on list stays prose",
+        "every item kept",
+        "no bullets over-applied"
+      ]
+    },
+    {
+      "id": "hard-email-lines",
+      "category": "email",
+      "voice": "aura-2-zeus-en",
+      "speed": 0.95,
+      "spoken": "Hi Sarah. Um, quick update on the Ray launch. We we pushed the beta to Friday because of the the Tauri updater bug. Let me know if that that works. Thanks, Arham.",
+      "ideal": "Hi Sarah,\n\nQuick update on the Ray launch. We pushed the beta to Friday because of the Tauri updater bug. Let me know if that works.\n\nThanks,\nArham",
+      "expected_format": "email",
+      "require": [
+        "Hi Sarah,",
+        "Thanks,",
+        "Arham",
+        "Tauri"
+      ],
+      "forbid": [
+        "Hi Sarah, quick",
+        "Thanks, Arham."
+      ],
+      "checks": [
+        "greeting on its own line",
+        "sign-off on its own lines",
+        "body stays prose"
+      ]
+    },
+    {
+      "id": "hard-format-bullets",
+      "category": "format-command",
+      "voice": "aura-2-vesta-en",
+      "speed": 1.0,
+      "spoken": "Okay, three things. Bullet point. Ship the beta. Bullet point. Email the waitlist. Bullet point. Update the changelog.",
+      "ideal": "Okay, 3 things:\n- Ship the beta.\n- Email the waitlist.\n- Update the changelog.",
+      "expected_format": "bullets",
+      "require": [
+        "Okay, 3 things:",
+        "- Ship the beta.",
+        "- Email the waitlist.",
+        "- Update the changelog."
+      ],
+      "forbid": [
+        "bullet point",
+        "Bullet point"
+      ],
+      "checks": [
+        "spoken bullet command honoured",
+        "command words not left in output"
+      ]
+    },
+    {
+      "id": "hard-new-paragraph",
+      "category": "format-command",
+      "voice": "aura-2-hermes-en",
+      "speed": 1.0,
+      "spoken": "Here's the plan. New paragraph. First we ship the beta. New paragraph. Then we email the waitlist. Period.",
+      "ideal": "Here's the plan.\n\nFirst we ship the beta.\n\nThen we email the waitlist.",
+      "expected_format": "paragraphs",
+      "require": [
+        "Here's the plan",
+        "First we ship the beta.",
+        "Then we email the waitlist."
+      ],
+      "forbid": [
+        "new paragraph",
+        "Period"
+      ],
+      "checks": [
+        "'new paragraph' honoured",
+        "'period' consumed as punctuation"
+      ]
+    },
+    {
+      "id": "hard-misheard-names",
+      "category": "names",
+      "voice": "aura-2-atlas-en",
+      "speed": 0.95,
+      "spoken": "Tell Arman that Helium's demo is at four, and Ray should be on the the second monitor.",
+      "ideal": "Tell Arham that Helion's demo is at 4, and Ray should be on the second monitor.",
+      "expected_format": "prose",
+      "require": [
+        "Arham",
+        "Helion",
+        "Ray",
+        "at 4"
+      ],
+      "forbid": [
+        "Arman",
+        "Helium",
+        "four"
+      ],
+      "checks": [
+        "dictionary names recovered from close mishearings",
+        "number formatted"
+      ]
+    },
+    {
+      "id": "hard-numbers-times",
+      "category": "numbers",
+      "voice": "aura-2-mars-en",
+      "speed": 1.0,
+      "spoken": "The call is at 3:30 p.m. on March 3rd, the invoice is 4,250 dollars, and the discount is 12.5 percent. Call me at 415 555 0198 if anything changes.",
+      "ideal": "The call is at 3:30 p.m. on March 3, the invoice is $4,250, and the discount is 12.5%. Call me at 415-555-0198 if anything changes.",
+      "expected_format": "prose",
+      "require": [
+        "3:30",
+        "March 3",
+        "$4,250",
+        "12.5%",
+        "415-555-0198"
+      ],
+      "forbid": [
+        "4,250 dollars",
+        "12.5 percent",
+        "4155550198"
+      ],
+      "checks": [
+        "currency, percent, date and phone formatting",
+        "no digits lost"
+      ]
+    },
+    {
+      "id": "hard-product-names",
+      "category": "names",
+      "voice": "aura-2-juno-en",
+      "speed": 1.0,
+      "spoken": "We're testing Gemma and Qwen against G P T O S S on Groq, our inference provider, with AssemblyAI for the the speech-to-text and Deepgram for the the voice. Helion is paying for it, and Arham owns the rollout.",
+      "ideal": "We're testing Gemma and Qwen against gpt-oss on Groq, our inference provider, with AssemblyAI for the speech-to-text and Deepgram for the voice. Helion is paying for it, and Arham owns the rollout.",
+      "expected_format": "prose",
+      "require": [
+        "Gemma",
+        "Qwen",
+        "gpt-oss",
+        "Groq, our inference provider",
+        "AssemblyAI",
+        "Deepgram",
+        "Helion",
+        "Arham"
+      ],
+      "forbid": [
+        "Grok",
+        "GPT-5",
+        "GPT OSS",
+        "Assembly AI"
+      ],
+      "checks": [
+        "product casing exact",
+        "Grok/Groq not confused",
+        "stutters removed"
+      ]
+    },
+    {
+      "id": "hard-mixed-corrections",
+      "category": "self-correction",
+      "voice": "aura-2-selene-en",
+      "speed": 1.05,
+      "spoken": "Let's meet Tuesday at 2, no, Wednesday at 2:30, sorry, make that 3. And send the invite to Priya, not Dana. Actually, cc Dana too.",
+      "ideal": "Let's meet Wednesday at 3, and send the invite to Priya, and cc Dana too.",
+      "expected_format": "prose",
+      "require": [
+        "Wednesday at 3",
+        "Priya",
+        "cc Dana"
+      ],
+      "forbid": [
+        "Tuesday",
+        "2:30",
+        "not Dana"
+      ],
+      "checks": [
+        "chained corrections resolved to the final wording",
+        "later correction (cc Dana) kept"
+      ]
+    },
+    {
+      "id": "hard-restart-topic",
+      "category": "restart",
+      "voice": "aura-2-odysseus-en",
+      "speed": 1.0,
+      "spoken": "Okay, so, wait, before I forget, um, the deploy broke again. And, uh, the the env var is missing on staging. Can someone add it?",
+      "ideal": "Okay, so before I forget, the deploy broke again. The env var is missing on staging. Can someone add it?",
+      "expected_format": "prose",
+      "require": [
+        "before I forget",
+        "the deploy broke again",
+        "env var is missing on staging",
+        "Can someone add it?"
+      ],
+      "forbid": [
+        "the the"
+      ],
+      "checks": [
+        "abandoned opener dropped",
+        "three sentences preserved"
+      ]
+    },
+    {
+      "id": "hard-monologue",
+      "category": "paragraphs",
+      "voice": "aura-2-orion-en",
+      "speed": 0.95,
+      "spoken": "Okay, so, um, here's where things stand on Ray. The, uh, the beta is basically ready, but we we still have a couple of, you know, rough edges. First, the the onboarding email is, um, too wordy, and Sarah said it, it reads like a legal document. Second, the the Tauri updater is, is flaky on Windows 10, actually, wait, it's only flaky when the the app is, um, installed under a a different user. Third, and this is the big one, our cleanup latency has a a long tail. The median is, uh, fine, but every so often a request takes, like, seven or eight seconds, and that that's not acceptable for a dictation app. I was talking to Arham about it yesterday, and he he thinks we should, um, hedge the request, so fire the fallback if the primary hasn't come back after, say, two and a half seconds. That way the the worst case is, you know, bounded. On the the product side, Helion's design review is on Thursday at 3:30, and they they want to see the new floating bar. Also, uh, the pricing page still says 12 dollars a month, but we we agreed on 15, so someone needs to, um, update that before the demo. Oh, and one more thing, the the waitlist is at, I think, 2,400 people, which is, uh, great, but we should probably, you know, onboard them in batches of fifty or a hundred so support doesn't, um, get overwhelmed. Actually, scratch that, let's do a hundred and fifty the first week and see how it goes. And, um, can you send me the the updated roadmap by Friday? No, make that Monday, because I'm, uh, out on Friday. Also, uh, we should, we should probably set up a, you know, a status page before the demo, because support keeps getting the same, the same questions. And, um, can you check the, the analytics dashboard? I think the, the conversion numbers are, are stale since Tuesday. Actually, wait, they update on Wednesdays, so maybe they're fine. Let's just, uh, double-check before the review.",
+      "ideal": "Okay, so here's where things stand on Ray. The beta is basically ready, but we still have a couple of rough edges. First, the onboarding email is too wordy, and Sarah said it reads like a legal document. Second, the Tauri updater is flaky on Windows 10; actually, wait, it's only flaky when the app is installed under a different user. Third, and this is the big one, our cleanup latency has a long tail. The median is fine, but every so often a request takes seven or eight seconds, and that's not acceptable for a dictation app. I was talking to Arham about it yesterday, and he thinks we should hedge the request, so fire the fallback if the primary hasn't come back after, say, two and a half seconds. That way the worst case is bounded.\n\nOn the product side, Helion's design review is on Thursday at 3:30, and they want to see the new floating bar. Also, the pricing page still says $12 a month, but we agreed on $15, so someone needs to update that before the demo.\n\nOh, and one more thing: the waitlist is at, I think, 2,400 people, which is great, but we should probably onboard them in batches so support doesn't get overwhelmed. Let's do 150 the first week and see how it goes. And can you send me the updated roadmap by Monday because I'm out on Friday. Also, we should probably set up a status page before the demo, because support keeps getting the same questions. And can you check the analytics dashboard? I think the conversion numbers are stale since Tuesday. Actually, wait, they update on Wednesdays, so maybe they're fine. Let's just double-check before the review.",
+      "expected_format": "paragraphs",
+      "require": [
+        "Okay, so here's where things stand on Ray",
+        "Oh, and one more thing",
+        "Arham",
+        "Helion",
+        "$12",
+        "$15",
+        "2,400",
+        "in batches",
+        "overwhelmed",
+        "150",
+        "Monday",
+        "status page",
+        "analytics dashboard",
+        "Wednesdays"
+      ],
+      "forbid": [
+        "Okay, so, um",
+        "we we",
+        "the the",
+        "a a",
+        "50 or 100",
+        "scratch that",
+        "No, make that"
+      ],
+      "checks": [
+        "2-3 minute monologue",
+        "paragraphs follow topics",
+        "self-corrections resolved",
+        "numbers and names exact",
+        "no invented content"
+      ]
+    }
+  ]
+}

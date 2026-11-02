@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for Ray's main window and floating bar.",
+  "windows": ["main", "bar"],
+  "permissions": ["core:default"]
+}
