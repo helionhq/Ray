@@ -547,8 +547,11 @@ consequently — counted as whole-token sequences (output count > transcript cou
 linkers ("also", "but", "however") remain allowed. The question and execution heuristics also
 mirror the shipping guard: request lead-ins ("please", "can you", "okay,", …) are stripped
 before cue detection, and "Do not …" is treated as an imperative, not a do-support question.
-Over all **174** stored outputs (112 final research runs — 42 tuning + 14 held-out, two runs
-each — plus all 62 app E2E entries) the guard rejects **0**. The only added connective anywhere
+Over all **174** stored outputs the guard rejects **0**: the 112 final research runs (42 tuning
+plus 14 held-out, two runs each) and the 62 Structured app-path outputs (42 tuning + 14 held-out
+E2E, 3 `(unknown)`-context probes, 2 retry-chain probes and 1 smoke). The 29 Clean regression and
+18 Clean hard app outputs were checked against Clean's own guard and are outside this Structured
+simulation. The only added connective anywhere
 is the soft "also" in `ho-list-parallel` (both runs), where all facts survive; rejecting it would
 have thrown away a faithful output. The old substring check would have rejected
 `st-mono-launch` because its output contains "so that's" (substring present, token phrase

@@ -159,8 +159,12 @@ def main() -> None:
             key = f"{tag}__judge_{re.sub(r'[^A-Za-z0-9._-]+', '_', judge)}"
             existing = merged.get(key, {}).get("rows", [])
             done = {(row["id"], row.get("run", 0)) for row in existing if row.get("ok")}
-            # A forced re-judge replaces the tag/judge rows rather than merging.
-            rows = [] if args.force else existing
+            # A forced re-judge replaces only the IDs being re-judged; rows for
+            # IDs outside --ids keep their stored judgments.
+            if args.force:
+                rows = [row for row in existing if wanted and row["id"] not in wanted]
+            else:
+                rows = existing
             for sid, record in results.items():
                 if wanted and sid not in wanted:
                     continue

@@ -499,24 +499,30 @@ def main() -> None:
             print(f"missing {path}")
             continue
         results = json.loads(path.read_text(encoding="utf-8"))
-        rows = []
+        # With --ids, rescore only those clips and keep the stored rows for the
+        # rest; the tag summary is recomputed over the combined rows.
+        rows = [row for row in merged.get(tag, {}).get("rows", []) if wanted and row["id"] not in wanted]
         stabilities = []
         unscored = 0
         for sid, record in results.items():
-            if wanted and sid not in wanted:
-                continue
             if sid not in scripts:
                 continue
-            transcript = sanitize_transcript((stt.get(sid) or {}).get("text") or record.get("transcript") or "")
+            # Tag-wide stats still cover IDs that --ids keeps from the stored rows.
             stability = record.get("run_stability")
             if stability is not None:
                 stabilities.append(stability)
             runs = record.get("runs")
             if isinstance(runs, list) and runs:
+                unscored += sum(1 for run in runs if not run.get("ok"))
+            elif not record.get("ok"):
+                unscored += 1
+            if wanted and sid not in wanted:
+                continue
+            transcript = sanitize_transcript((stt.get(sid) or {}).get("text") or record.get("transcript") or "")
+            if isinstance(runs, list) and runs:
                 # Score every successful stored run, labelled with its run number.
                 for run_index, run in enumerate(runs):
                     if not run.get("ok"):
-                        unscored += 1
                         continue
                     row = score_one(scripts[sid], run.get("text") or "", transcript)
                     row["run"] = run_index
@@ -532,8 +538,6 @@ def main() -> None:
                 row["finish_reason"] = record.get("finish_reason")
                 row["run_stability"] = stability
                 rows.append(row)
-            else:
-                unscored += 1
         if not rows:
             print(f"{tag}: no scored clips")
             continue
