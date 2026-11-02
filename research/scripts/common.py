@@ -103,3 +103,25 @@ def wav_duration(path: Path) -> float:
 
     with wave.open(str(path), "rb") as w:
         return w.getnframes() / w.getframerate()
+
+
+def sanitize_transcript(text: str) -> str:
+    """Mirror the app's sanitize_transcript before the prompt is built."""
+    out: list[str] = []
+    chars = list(text)
+    for index, char in enumerate(chars):
+        if char != "�":
+            out.append(char)
+            continue
+        previous_is_word = bool(out) and out[-1].isalnum()
+        following = next((c for c in chars[index + 1 :] if not c.isspace()), "")
+        next_is_word = bool(following) and following.isalnum()
+        if previous_is_word and next_is_word:
+            out.append(",")
+            if index + 1 < len(chars) and not chars[index + 1].isspace():
+                out.append(" ")
+    cleaned = "".join(
+        char for char in out
+        if not ("\x00" <= char <= "\x08" or char in "\x0b\x0c" or "\x0e" <= char <= "\x1f")
+    )
+    return " ".join(cleaned.split())

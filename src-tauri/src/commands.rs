@@ -8,8 +8,9 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::audio::{self, InputDevice};
+use crate::config::CleanupMode;
 use crate::hotkey;
-use crate::pipeline::{ConfigSummary, Dictation};
+use crate::pipeline::Dictation;
 use crate::secrets;
 use crate::store::{self, HistoryEntry, Settings, Store};
 use crate::windows_util;
@@ -17,7 +18,6 @@ use crate::windows_util;
 #[derive(Serialize)]
 pub struct KeyStatus {
     pub assemblyai: bool,
-    pub groq: bool,
     pub vercel: bool,
 }
 
@@ -28,7 +28,6 @@ pub struct Snapshot {
     pub settings: Settings,
     pub keys: KeyStatus,
     pub devices: Vec<InputDevice>,
-    pub config: ConfigSummary,
     pub launch_at_login: bool,
     /// `None` when the Right Alt hook is healthy.
     pub hotkey_error: Option<String>,
@@ -36,10 +35,7 @@ pub struct Snapshot {
 }
 
 #[tauri::command]
-pub async fn get_snapshot(
-    store: State<'_, Arc<Store>>,
-    dictation: State<'_, Arc<Dictation>>,
-) -> Result<Snapshot, String> {
+pub async fn get_snapshot(store: State<'_, Arc<Store>>) -> Result<Snapshot, String> {
     let data = store.snapshot();
     Ok(Snapshot {
         history: data.history,
@@ -47,11 +43,9 @@ pub async fn get_snapshot(
         settings: data.settings,
         keys: KeyStatus {
             assemblyai: secrets::has(secrets::ASSEMBLYAI),
-            groq: secrets::has(secrets::GROQ),
             vercel: secrets::has(secrets::VERCEL),
         },
         devices: audio::list_input_devices().unwrap_or_default(),
-        config: dictation.config_summary(),
         launch_at_login: windows_util::launch_at_login(),
         hotkey_error: hotkey::status(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -72,7 +66,7 @@ pub fn clear_secret(provider: String) -> Result<(), String> {
 
 fn validate_provider(provider: &str) -> Result<(), String> {
     match provider {
-        secrets::ASSEMBLYAI | secrets::GROQ | secrets::VERCEL => Ok(()),
+        secrets::ASSEMBLYAI | secrets::VERCEL => Ok(()),
         other => Err(format!("Unknown provider: {other}")),
     }
 }
@@ -126,10 +120,10 @@ pub async fn test_secret(
                     provider.model
                 ),
                 Ok(response) => format!(
-                    "Speech connected; the LLM Gateway returned HTTP {} (Groq fallback still works)",
+                    "Speech connected; the LLM Gateway returned HTTP {} (cleanup will use the raw transcript)",
                     response.status()
                 ),
-                Err(_) => "Speech connected; the LLM Gateway was unreachable (Groq fallback still works)".into(),
+                Err(_) => "Speech connected; the LLM Gateway was unreachable (cleanup will use the raw transcript)".into(),
             });
         }
         return Ok("AssemblyAI connected".into());
@@ -244,8 +238,11 @@ pub fn clear_history(store: State<'_, Arc<Store>>, app: AppHandle) -> Result<(),
 }
 
 #[tauri::command]
-pub fn copy_text(text: String) -> Result<(), String> {
-    crate::paste::copy_text(&text)
+pub fn copy_text(text: String, mode: Option<String>) -> Result<(), String> {
+    let line_endings = crate::paste::line_endings_for_mode(
+        mode.as_deref().and_then(CleanupMode::from_id),
+    );
+    crate::paste::copy_text_with(&text, line_endings)
 }
 
 /// The most recent transcript whose History save failed. It is kept in memory
@@ -327,7 +324,10 @@ pub fn copy_history_entry(id: String, store: State<'_, Arc<Store>>) -> Result<()
         .iter()
         .find(|entry| entry.id == id)
         .ok_or_else(|| "That entry no longer exists".to_string())?;
-    crate::paste::copy_text(&entry.text)
+    let line_endings = crate::paste::line_endings_for_mode(
+        entry.mode.as_deref().and_then(CleanupMode::from_id),
+    );
+    crate::paste::copy_text_with(&entry.text, line_endings)
 }
 
 #[allow(dead_code)]

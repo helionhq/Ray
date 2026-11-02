@@ -35,6 +35,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_V,
 };
 
+use crate::config::CleanupMode;
 use crate::windows_util;
 
 const CF_UNICODETEXT: u32 = 13;
@@ -387,9 +388,60 @@ fn clipboard_is_empty() -> bool {
 
 /// Public entry point for the history page's copy button.
 pub fn copy_text(text: &str) -> Result<(), String> {
+    copy_text_with(text, LineEndings::Preserve)
+}
+
+/// Copy with the clipboard line-ending convention the caller needs.
+pub fn copy_text_with(text: &str, line_endings: LineEndings) -> Result<(), String> {
     // A pending dictation restore must not undo the user's deliberate copy.
     flush_pending_restore();
-    set_clipboard_text(text, false).map(|_| ())
+    let text = prepare_clipboard_text(text, line_endings);
+    set_clipboard_text(&text, false).map(|_| ())
+}
+
+/// How line breaks are written to CF_UNICODETEXT. Windows text controls expect
+/// CRLF; `Preserve` keeps the bytes exactly as they were (Clean's existing
+/// behaviour) while `CrLf` normalises Structured's paragraphs and lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineEndings {
+    Preserve,
+    CrLf,
+}
+
+/// Structured output is pasted as CRLF, matching the direct-paste path. Clean,
+/// legacy (no mode) and unknown entries keep their bytes exactly.
+pub fn line_endings_for_mode(mode: Option<CleanupMode>) -> LineEndings {
+    match mode {
+        Some(CleanupMode::Structured) => LineEndings::CrLf,
+        None | Some(CleanupMode::Clean) => LineEndings::Preserve,
+    }
+}
+
+fn prepare_clipboard_text(text: &str, line_endings: LineEndings) -> std::borrow::Cow<'_, str> {
+    match line_endings {
+        LineEndings::Preserve => std::borrow::Cow::Borrowed(text),
+        LineEndings::CrLf => std::borrow::Cow::Owned(with_crlf(text)),
+    }
+}
+
+/// Normalise every line break to CRLF. Existing CRLF and lone CR are handled,
+/// so the result is idempotent.
+fn with_crlf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                out.push_str("\r\n");
+            }
+            '\n' => out.push_str("\r\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -414,6 +466,7 @@ pub fn paste_text(
     text: &str,
     target: Option<isize>,
     keep_on_clipboard: bool,
+    line_endings: LineEndings,
 ) -> Result<PasteOutcome, String> {
     if text.trim().is_empty() {
         return Ok(PasteOutcome::default());
@@ -426,9 +479,10 @@ pub fn paste_text(
         return Err(reason);
     }
 
+    let clipboard_text = prepare_clipboard_text(text, line_endings);
     let saved = save_clipboard();
     let previous_clipboard_lost = matches!(saved, Saved::Unknown);
-    if let Err(error) = set_clipboard_text(text, true) {
+    if let Err(error) = set_clipboard_text(&clipboard_text, true) {
         restore_clipboard(saved);
         return Err(error);
     }
@@ -464,7 +518,7 @@ pub fn paste_text(
         // safe because the old sequence can never match again.
         *slot = Some(PendingRestore {
             saved,
-            text: text.to_string(),
+            text: clipboard_text.into_owned(),
             sequence,
         });
     }
@@ -646,5 +700,45 @@ mod tests {
             restore_delay(None),
             Duration::from_millis(DEFAULT_RESTORE_MS)
         );
+    }
+
+    #[test]
+    fn line_endings_follow_the_cleanup_mode() {
+        assert_eq!(line_endings_for_mode(None), LineEndings::Preserve);
+        assert_eq!(
+            line_endings_for_mode(Some(CleanupMode::Clean)),
+            LineEndings::Preserve
+        );
+        assert_eq!(
+            line_endings_for_mode(Some(CleanupMode::Structured)),
+            LineEndings::CrLf
+        );
+
+        assert_eq!(
+            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Structured))),
+            "a\r\nb"
+        );
+        assert_eq!(
+            prepare_clipboard_text("a\nb", line_endings_for_mode(None)),
+            "a\nb"
+        );
+        assert_eq!(
+            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Clean))),
+            "a\nb"
+        );
+    }
+
+    #[test]
+    fn structured_line_endings_become_crlf_for_the_clipboard() {
+        assert_eq!(with_crlf("a\nb"), "a\r\nb");
+        assert_eq!(with_crlf("a\r\nb"), "a\r\nb");
+        assert_eq!(with_crlf("a\rb"), "a\r\nb");
+        assert_eq!(with_crlf("a\n\n- one\n- two"), "a\r\n\r\n- one\r\n- two");
+        // Preserve is a no-op, so Clean's clipboard bytes are unchanged.
+        assert_eq!(
+            prepare_clipboard_text("a\nb", LineEndings::Preserve),
+            "a\nb"
+        );
+        assert_eq!(prepare_clipboard_text("a\nb", LineEndings::CrLf), "a\r\nb");
     }
 }

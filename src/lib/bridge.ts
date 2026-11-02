@@ -8,6 +8,7 @@ export interface HistoryEntry {
   raw: string | null;
   app: string | null;
   duration_ms: number;
+  mode: CleanupMode | null;
 }
 
 export interface InputDevice {
@@ -17,11 +18,13 @@ export interface InputDevice {
 }
 
 export type Theme = "system" | "light" | "dark";
+export type CleanupMode = "clean" | "structured";
 
 export interface Settings {
   launch_at_login: boolean;
   input_device: string | null;
   cleanup_enabled: boolean;
+  cleanup_mode: CleanupMode;
   streaming_enabled: boolean;
   keep_raw: boolean;
   theme: Theme;
@@ -29,16 +32,7 @@ export interface Settings {
 
 export interface KeyStatus {
   assemblyai: boolean;
-  groq: boolean;
   vercel: boolean;
-}
-
-export interface ConfigSummary {
-  pipeline_source: string;
-  prompt_source: string;
-  speech_model: string;
-  streaming: boolean;
-  cleanup_models: string[];
 }
 
 export interface Snapshot {
@@ -47,13 +41,12 @@ export interface Snapshot {
   settings: Settings;
   keys: KeyStatus;
   devices: InputDevice[];
-  config: ConfigSummary;
   launch_at_login: boolean;
   hotkey_error: string | null;
   version: string;
 }
 
-export type Provider = "assemblyai" | "groq" | "vercel";
+export type Provider = "assemblyai" | "vercel";
 
 /** True only inside a Tauri webview; plain-browser previews have no IPC. */
 export function hasTauri(): boolean {
@@ -82,7 +75,8 @@ export const api = {
   removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
   deleteHistory: (id: string) => call<void>("delete_history", { id }),
   clearHistory: () => call<void>("clear_history"),
-  copyText: (text: string) => call<void>("copy_text", { text }),
+  copyText: (text: string, mode: CleanupMode | null) =>
+    call<void>("copy_text", { text, mode }),
   startDictation: () => call<void>("start_dictation"),
   stopDictation: () => call<void>("stop_dictation"),
   cancelDictation: () => call<void>("cancel_dictation"),

@@ -6,13 +6,15 @@
 const SERVICE: &str = "ray";
 
 pub const ASSEMBLYAI: &str = "assemblyai";
-pub const GROQ: &str = "groq";
 pub const VERCEL: &str = "vercel";
+
+/// Providers Ray no longer supports. Their stored credentials must be removed
+/// so a retired key cannot linger in Credential Manager with no UI to clear it.
+pub const RETIRED: &[&str] = &["groq"];
 
 pub fn env_names(secret: &str) -> &'static [&'static str] {
     match secret {
         ASSEMBLYAI => &["ASSEMBLYAI_API_KEY", "RAY_ASSEMBLYAI_API_KEY"],
-        GROQ => &["GROQ_API_KEY", "RAY_GROQ_API_KEY"],
         VERCEL => &[
             "VERCEL_AI_GATEWAY_KEY",
             "AI_GATEWAY_API_KEY",
@@ -79,14 +81,41 @@ pub fn delete(secret: &str) -> Result<(), String> {
     }
 }
 
+/// One-time startup cleanup: delete credentials left behind by providers that
+/// have been retired. Safe to call on every launch; a credential that is not
+/// present is simply skipped, so only an actual removal is logged.
+pub fn remove_retired_secrets() {
+    for secret in RETIRED {
+        match remove_secret_if_present(secret) {
+            Ok(true) => eprintln!("[ray] removed retired credential: {secret}"),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("[ray] could not remove retired credential {secret}: {error}")
+            }
+        }
+    }
+}
+
+/// Delete `secret` from the OS store, reporting whether it existed. A missing
+/// entry is success (`false`); any other keyring error is returned so the
+/// caller can log it without aborting startup.
+fn remove_secret_if_present(secret: &str) -> Result<bool, String> {
+    let entry = entry(secret)?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(format!("Could not remove key: {error}")),
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
     #[test]
     fn credential_manager_round_trip() {
-        // A dedicated entry so the user's real AssemblyAI/Groq keys are never
-        // touched.
+        // A dedicated entry so the user's real AssemblyAI/Vercel keys are
+        // never touched.
         let name = "ray-selftest-roundtrip";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
         entry
@@ -98,5 +127,21 @@ mod tests {
         );
         entry.delete_credential().expect("remove secret");
         assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+    }
+
+    #[test]
+    fn retired_secret_migration_is_idempotent() {
+        // A dedicated entry so the user's real AssemblyAI/Vercel keys are
+        // never touched.
+        let name = "ray-retired-selftest";
+        let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
+        entry.set_password("retired-value").expect("store secret");
+
+        // First pass removes the entry and reports the removal.
+        assert_eq!(remove_secret_if_present(name), Ok(true));
+        assert!(matches!(entry.get_password(), Err(keyring::Error::NoEntry)));
+
+        // Second pass is a no-op: a missing entry is success, not an error.
+        assert_eq!(remove_secret_if_present(name), Ok(false));
     }
 }

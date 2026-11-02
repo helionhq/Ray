@@ -75,3 +75,32 @@ they are about **$0.11** at list rates. Total spend remains well under the $10 c
 Round 3b (cleanup-only prompt iteration, §9.6 in `RESULTS.md`): 97 gemma-4-31b gateway calls
 (three hard runs, two held-out runs and three single-clip probes), roughly 0.25M tokens,
 about **$0.02-0.03** at list rates. No STT, TTS or judge calls.
+
+## Structured mode (2026-11-02)
+
+| item | detail | est. cost $ |
+|---|---|---:|
+| Deepgram TTS | 26,216 characters: 42 tuning + 14 held-out clips, plus four voice regenerations | 0.786 |
+| AssemblyAI Sync STT | 33.83 audio-min: 24.17 tuning, 7.49 held-out, 2.17 for four regenerated clips | 0.282 |
+| LLM Gateway | gemma-4-31b eval sweeps (v1/v2/v4/v5/v6 and smoke tests; two runs where noted), qwen comparison, two judge passes | 0.282 |
+| **Structured subtotal** | | **1.350** |
+
+## App end-to-end validation (2026-11-02)
+
+All E2E runs went through the shipping Rust pipeline (`ray --selftest-stream`, live Sync STT)
+with the working-tree debug binary; `--mode` selects Clean or Structured. STT costs use the
+same rate as the tables above. The app path does not record gateway token usage, so cleanup
+and judge calls are estimated at list rates.
+
+| item | detail | est. cost $ |
+|---|---|---:|
+| app_structured_v6 | 24.17 audio-min, 42-clip Structured tuning | 0.2014 |
+| app_structured_v6_heldout | 7.49 audio-min first pass + 2.58 min for two timeout retries | 0.0839 |
+| app_clean_regression_e2e | 9.05 audio-min, 29-clip Clean regression | 0.0754 |
+| app_clean_hard_e2e | 5.41 audio-min, 18-clip Clean hard | 0.0451 |
+| app-name / retry probes | 4.27 audio-min (st-mono-week, st-standup, ho-weekend-logistics, ho-correction-chain x2) | 0.0356 |
+| gateway cleanup | 112 calls (56 Structured, 47 Clean, 9 probe/retry), ~0.46M input tokens | ~0.07 |
+| judges | 112 calls (both judges x 56 Structured clips), ~0.12M input tokens | ~0.02 |
+| **E2E subtotal** | | **~0.53** |
+
+The E2E work is additive; the whole research budget remains well under $10.

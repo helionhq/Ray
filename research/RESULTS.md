@@ -8,13 +8,13 @@
    typical clips.
 2. **Cleanup:** our own LLM pass with the production prompt in
    `research/final/cleanup_system_prompt.md`, using **`gemma-4-31b` on the AssemblyAI LLM
-   Gateway** (same API key as STT), falling back to **`openai/gpt-oss-120b` on Groq**.
+   Gateway** (same API key as STT), with a second provider as an optional fallback.
 3. **Rejected:** AssemblyAI's Dictation API. Even with custom `llm_instruction` + `smart`
    rewrite it **deleted dictated sentences that looked like instructions**, never fixed
    Grok/Groq, and was slower (p50 1.85–1.94 s for the STT+rewrite call alone).
 
 End-to-end p50 with the recommended stack is **~2.1 s** for a typical 10 s dictation
-(STT finalise ~0.6 s + LLM ~1.55 s). With the Groq fallback as primary it is **~1.0 s**;
+(STT finalise ~0.6 s + LLM ~1.55 s). With the second provider as primary it is **~1.0 s**;
 the quality cost is measurable (see §4).
 
 ---
@@ -93,8 +93,8 @@ these clips, so they are in-sample scores; see the caveat in §8.4.
 | Model | Provider | Judge overall | Fidelity | Names | Format | Safety | p50 | p95 | Cost |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
 | **gemma-4-31b** | AAI Gateway | **9.43** | 9.54 | 9.68 | 9.46 | 9.96 | 1.42 s | 1.81 s | $0.14/$0.40 per M |
-| gpt-oss-120b | Groq | 8.93 | 8.86 | 9.50 | 9.04 | 9.71 | 0.38 s | 0.81 s | free tier |
-| gpt-oss-20b | Groq | — | — | — | — | — | 0.50 s | 0.69 s | free tier |
+| gpt-oss-120b | second provider | 8.93 | 8.86 | 9.50 | 9.04 | 9.71 | 0.38 s | 0.81 s | free tier |
+| gpt-oss-20b | second provider | — | — | — | — | — | 0.50 s | 0.69 s | free tier |
 | qwen3.5-4b-32k-fast | AAI Gateway | — | — | — | — | — | 1.07 s | 1.36 s | $0.10/$0.50 per M |
 
 Auto scores in ascending quality: qwen 92.8, gpt-oss-20b 94.1, gpt-oss-120b 94.8,
@@ -117,7 +117,7 @@ Why gemma wins on quality:
 |---|---|---:|---|
 | v1 | rules only | — | baseline |
 | v2 | formatting thresholds, no-answer rule, Grok/Groq rule | — | good structure, still forced names |
-| v3 | few-shot examples for lists, Groq context, safety | 98.2 | strong, but "Gough" → "Groq" over-correction |
+| v3 | few-shot examples for lists, provider context, safety | 98.2 | strong, but "Gough" → "Groq" over-correction |
 | **v4** | forbid forcing reference names; "ClickOne" example; trim 1,400→1,100 prompt tokens | **97.7** | fixes both over-corrections; 0.1–0.8 s faster |
 
 (98.2 is the full 29-clip v3 run; v4 is also a full 29-clip run. The v4 auto score is
@@ -138,7 +138,7 @@ These are in-sample for the clips the prompt examples overlap; see the caveat in
 | gpt-oss-120b | 94.8 | 8.93 | 8.86 | 9.50 | 9.04 | 9.71 | 0.48 s | 0.89 s | 1.11 s |
 
 The v4 run of gemma scored 9.22 (n=27) on the same judge; the difference from 9.43 is judge
-variance plus two clips the judge could not score before the Groq daily token cap was hit
+variance plus two clips the judge could not score before the second provider's daily token cap was hit
 (§5). The model ordering did not change in any run. Judge = `gpt-oss-120b` with
 `reasoning_effort: low`; the primary model is not self-judged.
 
@@ -163,14 +163,14 @@ output in full. All five are paste-ready:
 
 ## 5. Rate limits and reliability
 
-**Groq free tier (observed response headers / 429 bodies, same for gpt-oss-20b/120b/qwen):**
+**Second provider (historical) free tier (observed response headers / 429 bodies, same for gpt-oss-20b/120b/qwen):**
 - 1,000 requests/day, **8,000 tokens/minute**, **200,000 tokens/day**.
 - The TPD cap is the binding constraint: at ~1.35k tokens per cleanup (1.1k prompt + ~250
   output), that is **~148 dictations/day** — fine for a light user, **not enough for
   hundreds/day**. This was hit during evaluation and caused 429s that stalled the judge.
 - TPM alone allows ~6 calls/minute. Honour `Retry-After` / `x-ratelimit-reset-tokens` and
   fall back to the gateway.
-- Consequence: Groq is a good **fallback/fast mode**, not the primary for a heavy user.
+- Consequence: that provider was a good **fallback/fast mode**, not the primary for a heavy user.
 
 **AssemblyAI Sync STT:** no published Sync-specific RPM/concurrency number; the account
 limit applies to concurrent jobs (higher plans get more). General HTTP limit is 20k
@@ -204,11 +204,11 @@ Deepgram TTS ~$0.38 (not AssemblyAI). See `research/SPEND.md` for the per-run ta
 ## 7. Recommendation
 
 **Primary:** Sync live STT + `gemma-4-31b` (AAI Gateway).
-**Fallback:** same STT batch endpoint + `openai/gpt-oss-120b` (Groq, `reasoning_effort: low`).
+**Fallback (historical):** `openai/gpt-oss-120b` on a second provider, since removed. The current pipeline uses the gateway primary and the raw transcript last resort.
 **Last resort:** insert the raw transcript.
 
 Choose gemma for quality (the stated priority: user ends a complex dictation without reading
-it), and because Groq's free **200k tokens/day** cap would throttle a heavy user at ~150
+it), and because that provider's free **200k tokens/day** cap would throttle a heavy user at ~150
 dictations/day. If the product decides latency is more important than the last ~0.5 judge
 points, flip the primary/fallback pair — gpt-oss-120b is ~1.1 s faster and still scores
 8.93/10 on the full judge.
@@ -316,22 +316,22 @@ caveat in §8.4.
 | Model | Provider | Old auto | Hard auto | p50 old/hard | p95 old/hard | Outcome |
 |---|---|---:|---:|---:|---:|---|
 | **gemma-4-31b** | AAI Gateway | **98.8** (29) | **99.1** (18) | 857 / 781 ms | 1,866 / 1,193 ms | **primary** |
-| openai/gpt-oss-120b | Groq | 94.8 (29, round 1) | 96.4 (18) | 1,174 ms | 7,475 ms* | **fallback** |
-| openai/gpt-oss-20b | Groq | 94.1 (29, round 1) | 97.2 (17) | 846 ms | 6,857 ms* | not switched |
-| qwen/qwen3.8-27b | Groq | partial | 4/18 clips | ~400 ms | 10,900 ms | reject |
+| openai/gpt-oss-120b | second provider | 94.8 (29, round 1) | 96.4 (18) | 1,174 ms | 7,475 ms* | **fallback** |
+| openai/gpt-oss-20b | second provider | 94.1 (29, round 1) | 97.2 (17) | 846 ms | 6,857 ms* | not switched |
+| qwen/qwen3.8-27b | second provider | partial | 4/18 clips | ~400 ms | 10,900 ms | reject |
 | qwen3.5-4b-32k-fast | AAI Gateway | 95.5 (29) | 90.2 (18) | 1,033 ms | 98,257 ms | reject |
-| allam-2-7b, gpt-oss-safeguard-20b | Groq | not scored | not scored | — | — | not shortlisted |
+| allam-2-7b, gpt-oss-safeguard-20b | second provider | not scored | not scored | — | — | not shortlisted |
 
-* p95 includes Groq free-tier 429 backoff, not model time. First-attempt times were ~0.7-1.2 s. Gemma p50/p95 are old/hard; the other rows are hard-corpus only.
+* p95 includes second-provider free-tier 429 backoff, not model time. First-attempt times were ~0.7-1.2 s. Gemma p50/p95 are old/hard; the other rows are hard-corpus only.
 The old auto numbers for gpt-oss-120b/20b are the round-1 full-corpus scores; their hard
 numbers are the round-2 corpus. The 20b hard n is 17: on the first 2.7-minute monologue it
 spent the entire 1,500-token completion budget on reasoning and returned no text. Raising
-`max_tokens` to 3,000 fixed the failure mode, but Groq's daily token cap was exhausted before
-the re-run; the app now uses 3,000 for both providers.
+`max_tokens` to 3,000 fixed the failure mode, but the second provider's daily token cap was exhausted before
+the re-run; the app now uses 3,000 for cleanup.
 
 Available model access on 2026-11-01:
 
-- **Groq** now lists only `openai/gpt-oss-120b`, `openai/gpt-oss-20b`,
+- **Second provider (historical)** listed only `openai/gpt-oss-120b`, `openai/gpt-oss-20b`,
   `openai/gpt-oss-safeguard-20b`, `qwen/qwen3.8-27b`, `allam-2-7b` and the Whisper models.
   The kimi, llama-4, qwen3-32b and llama-3.3 entries the brief suggested are no longer in
   this account's catalog.
@@ -352,7 +352,7 @@ immediately. If it has not produced a valid answer after `hedge_after_ms` (2,500
 just below the measured cold p95 of 2,792 ms and well above the warm p95), the fallback is
 started in parallel. The first answer that passes the fidelity checks wins; the losing
 request is dropped, which cancels it. If the primary fails early, the fallback starts
-immediately instead of waiting for the hedge. A Groq 429 can only fail the fallback request;
+immediately instead of waiting for the hedge. A fallback-provider 429 can only fail the fallback request;
 it never delays or cancels the primary.
 
 The per-provider hard timeout was lowered from 15 s to 6 s and now covers **both** sending
@@ -378,10 +378,10 @@ same `app_v8_final`/`hard_v8_final` `total_ms` samples read 857/781 ms here and 
 there.
 
 The 2,500 ms hedge sits almost exactly on the medium-transcript p95 (2,497 ms). On the 161 s
-monologue most repeats cross it, but gemma still returns before the Groq fallback, so all 20
+monologue most repeats cross it, but gemma still returns before the fallback, so all 20
 repeats stayed on the primary; the tail is bounded at 4.0 s instead of the old 7.8 s / 15 s
 outliers. A forced-fallback run (`RAY_TEST_FORCE_FALLBACK=1`) returned the tone-preservation
-clip through Groq in 3.4 s cold, proving the fallback path itself is healthy.
+clip through the fallback provider in 3.4 s cold, proving the fallback path itself is healthy.
 
 
 ### 8.4 Final scores
@@ -427,8 +427,8 @@ re-judged against the corrected ideals, round 2 is 9.78, not 9.89.
 `hard-monologue` is 78 because it keeps the superseded "50 or 100". Fresh round-3 runs are
 in §9.
 
-Judge note: round 1 used `openai/gpt-oss-120b` on Groq (9.40 overall). The round-2 judge is
-`qwen3.5-4b-32k-fast` on the AssemblyAI gateway because the Groq free tier hit its daily token
+Judge note: round 1 used `openai/gpt-oss-120b` on the second provider (9.40 overall). The round-2 judge is
+`qwen3.5-4b-32k-fast` on the AssemblyAI gateway because the second provider's free tier hit its daily token
 cap during the sweep. It is an independent model, but the scores are not directly comparable
 to the round-1 judge; the deterministic auto scores and the full read-through are the primary
 evidence. One old-clip judge response (`false-start`) was truncated and excluded (n=11).
@@ -453,7 +453,7 @@ The regression set did not regress (98.1 -> 98.8); its only sub-95 clips are ASR
   hard set catches the common patterns, but the model is not a parser.
 - The fidelity guards are lexical and deliberately narrow. They stop the named regressions;
   they cannot detect every synonym swap.
-- Groq's free tier is the binding constraint on the fallback: 8k TPM and ~200k TPD. The
+- The second provider's free tier was the binding constraint on the fallback: 8k TPM and ~200k TPD. The
   hedge protects the primary path, but a fallback request can still 429 and add latency.
 - The 120 s Sync live cap means long dictations roll over to a second request; the overlap
   join is tested by the 161 s monologue and the 215 s rollover clip, but boundary artifacts

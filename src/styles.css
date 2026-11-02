@@ -1107,56 +1107,137 @@ kbd {
   gap: 8px;
 }
 
-.badge {
-  padding: 5px 7px 4px;
-  border-radius: 6px;
-  background: var(--bg);
-  box-shadow: inset 0 0 0 1px var(--line);
+.key-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   color: var(--ink-2);
-  font: 500 11px/1 var(--font-mono);
+  font-size: 12px;
   white-space: nowrap;
 }
 
-.badge.is-saved {
-  color: var(--ink);
+.key-status svg {
+  flex: none;
 }
 
-.badge.primary {
-  background: var(--surface);
-  box-shadow: inset 0 0 0 1px var(--line-2);
-  color: var(--ink);
-}
-
-.ok {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-left: 6px;
-  color: var(--ink-2);
-  font-size: 12px;
-  font-weight: 400;
-}
-
-.ok svg {
+.key-status.is-ok svg {
   color: var(--ok);
 }
 
-.chain {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
+.key-status.is-error {
+  color: var(--live);
 }
 
-.chain svg {
-  flex: none;
+.key-status.is-muted {
   color: var(--ink-3);
 }
 
-.sub-row {
-  min-height: 0;
-  padding-top: 12px;
-  padding-bottom: 12px;
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-3);
+}
+
+.status-dot.is-empty {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--ink-3);
+}
+
+.status-spinner {
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: key-spin 700ms linear infinite;
+}
+
+@keyframes key-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.key-more {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-3);
+  transition: background-color 120ms ease, color 120ms ease,
+    transform 160ms var(--ease-out);
+}
+
+.key-more[aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.key-more:not(:disabled):active {
+  transform: scale(0.96);
+}
+
+.key-menu {
+  position: fixed;
+  z-index: 30;
+  min-width: 168px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 0 0 1px var(--line-2), 0 12px 32px -12px rgba(0, 0, 0, 0.4),
+    0 2px 8px rgba(0, 0, 0, 0.08);
+  transform-origin: top right;
+  animation: key-menu-in 140ms var(--ease-out);
+}
+
+@keyframes key-menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-2px);
+  }
+}
+
+.key-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 30px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  transition: background-color 120ms ease, color 120ms ease,
+    transform 160ms var(--ease-out);
+}
+
+.key-menu button:not(:disabled):active {
+  transform: scale(0.98);
+}
+
+.key-more:disabled,
+.key-menu button:disabled {
+  opacity: 0.45;
+}
+
+.key-menu button.is-armed {
+  background: rgba(240, 80, 90, 0.08);
+  color: var(--live);
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
 }
 
 .key-editor {
@@ -1294,33 +1375,6 @@ kbd {
 
 .segmented button:disabled {
   opacity: 0.5;
-}
-
-.facts {
-  border-top: 1px solid var(--line);
-}
-
-.facts > div {
-  display: grid;
-  grid-template-columns: 120px minmax(0, 1fr);
-  gap: 16px;
-  padding: 9px 16px;
-  border-bottom: 1px solid var(--line);
-}
-
-.facts > div:last-child {
-  border-bottom: 0;
-}
-
-.facts dt {
-  color: var(--ink-3);
-  font-size: 11.5px;
-}
-
-.facts dd {
-  overflow-wrap: anywhere;
-  color: var(--ink-2);
-  font-size: 11.5px;
 }
 
 .about-actions {
@@ -1495,6 +1549,21 @@ kbd {
     color: var(--ink);
   }
 
+  .key-more:hover:not(:disabled) {
+    background: var(--hover);
+    color: var(--ink);
+  }
+
+  .key-menu button:hover:not(:disabled) {
+    background: var(--hover);
+    color: var(--ink);
+  }
+
+  .key-menu button.is-danger:hover:not(:disabled) {
+    background: rgba(240, 80, 90, 0.08);
+    color: var(--live);
+  }
+
   .segmented button:hover:not(:disabled) {
     color: var(--ink);
   }
@@ -1638,6 +1707,8 @@ kbd {
   .btn:active,
   .btn-primary:active,
   .icon-btn:active,
+  .key-more:active,
+  .key-menu button:active,
   .banner-action:active,
   .segmented button:active {
     transform: none !important;
