@@ -367,7 +367,7 @@ fn is_retired_provider(provider: &CleanupProvider) -> bool {
     is_retired_name(&provider.id) || is_retired_name(&provider.api_key_secret) || uses_retired_host
 }
 
-/// Remove retired providers from a legacy override, keeping the order of the
+/// Remove retired providers from a parsed override, keeping the order of the
 /// remaining supported providers. When none remain, fall back to the embedded
 /// default so cleanup still runs.
 fn remove_retired_providers(pipeline: &mut PipelineConfig) {
@@ -409,12 +409,14 @@ impl RuntimeConfig {
                                 ..defaults.structured
                             },
                         };
-                        // A legacy override may still list a provider whose
-                        // credentials startup deletes; drop it so cleanup keeps
-                        // working and falls back to the embedded default only
-                        // when nothing supported is left.
-                        remove_retired_providers(&mut config);
                     }
+                    // Any override may still list a provider whose credentials
+                    // startup deletes; drop it so cleanup keeps working and
+                    // falls back to the embedded default only when nothing
+                    // supported is left. This runs even when `cleanup.modes`
+                    // is explicit, because those overrides still need a usable
+                    // provider.
+                    remove_retired_providers(&mut config);
                     config
                 }
                 Err(error) => {
@@ -776,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cleanup_modes_are_never_migrated() {
+    fn explicit_cleanup_modes_skip_migration_but_still_filter_retired_providers() {
         let dir = temp_dir("explicit-modes");
         std::fs::write(
             dir.join("pipeline.json"),
@@ -795,9 +797,48 @@ mod tests {
             runtime.pipeline.cleanup.providers[0].model,
             "claude-sonnet-4-5"
         );
+        // Explicit modes are never replaced with the embedded Structured
+        // defaults: the declared field wins and the rest inherit the base
+        // cleanup values (6000 ms / 2500 ms), not 8000 ms / 4000 ms.
+        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
+        assert_eq!(structured.max_tokens, 4_200);
+        assert_eq!(structured.timeout_ms, 6_000);
+        assert_eq!(structured.hedge_after_ms, 2_500);
 
-        // A document that explicitly declares modes parses exactly as before,
-        // even when it lists a retired provider.
+        // Explicit modes do not exempt an override from retired-provider
+        // filtering: the supported provider survives and is retried first.
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
+                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+                "providers":[
+                    {"id":"groq","base_url":"https://api.groq.com/openai/v1",
+                        "model":"llama-3.3-70b","api_key_secret":"groq"},
+                    {"id":"assemblyai",
+                        "base_url":"https://llm-gateway.assemblyai.com/v1",
+                        "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}
+                ],
+                "modes":{"structured":{"max_tokens":4200}}}}"#,
+        )
+        .unwrap();
+
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(
+            runtime
+                .pipeline
+                .cleanup
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            ["assemblyai"]
+        );
+        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
+        assert_eq!(structured.max_tokens, 4_200);
+        assert_eq!(structured.timeout_ms, 6_000);
+
+        // When explicit modes leave no supported provider, filtering falls back
+        // to the embedded default so cleanup still has somewhere to run.
         std::fs::write(
             dir.join("pipeline.json"),
             r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
@@ -810,8 +851,21 @@ mod tests {
         .unwrap();
 
         let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(
+            serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
+            serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
+        );
         assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
-        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "groq");
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
+        // The provider fallback does not migrate the explicit modes.
+        assert_eq!(
+            runtime
+                .pipeline
+                .cleanup
+                .for_mode(CleanupMode::Structured)
+                .timeout_ms,
+            6_000
+        );
 
         // The embedded default never contains a retired provider.
         let defaults = PipelineConfig::default();
