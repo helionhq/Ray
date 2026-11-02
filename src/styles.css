@@ -1179,7 +1179,7 @@ kbd {
   color: var(--ink);
 }
 
-.key-more:active {
+.key-more:not(:disabled):active {
   transform: scale(0.96);
 }
 
@@ -1220,8 +1220,13 @@ kbd {
     transform 160ms var(--ease-out);
 }
 
-.key-menu button:active {
+.key-menu button:not(:disabled):active {
   transform: scale(0.98);
+}
+
+.key-more:disabled,
+.key-menu button:disabled {
+  opacity: 0.45;
 }
 
 .key-menu button.is-armed {
@@ -1544,17 +1549,17 @@ kbd {
     color: var(--ink);
   }
 
-  .key-more:hover {
+  .key-more:hover:not(:disabled) {
     background: var(--hover);
     color: var(--ink);
   }
 
-  .key-menu button:hover {
+  .key-menu button:hover:not(:disabled) {
     background: var(--hover);
     color: var(--ink);
   }
 
-  .key-menu button.is-danger:hover {
+  .key-menu button.is-danger:hover:not(:disabled) {
     background: rgba(240, 80, 90, 0.08);
     color: var(--live);
   }

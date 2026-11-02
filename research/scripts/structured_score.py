@@ -500,8 +500,26 @@ def main() -> None:
             continue
         results = json.loads(path.read_text(encoding="utf-8"))
         # With --ids, rescore only those clips and keep the stored rows for the
-        # rest; the tag summary is recomputed over the combined rows.
-        rows = [row for row in merged.get(tag, {}).get("rows", []) if wanted and row["id"] not in wanted]
+        # rest; the tag summary is recomputed over the combined rows. A stored
+        # row is only replaced when its ID can actually be rescored from this
+        # result file; rows for selected IDs absent here are retained.
+        if wanted is None:
+            rows = []
+        else:
+            rescorable = wanted & set(results) & set(scripts)
+            missing = wanted - rescorable
+            if missing:
+                print(
+                    f"{tag}: kept stored rows for selected IDs with no rescorable result: "
+                    f"{', '.join(sorted(missing))}"
+                )
+            rows = [
+                row for row in merged.get(tag, {}).get("rows", [])
+                if row["id"] not in rescorable
+            ]
+        # Rows written by an older scorer have no run number; label them run 0.
+        for row in rows:
+            row.setdefault("run", 0)
         stabilities = []
         unscored = 0
         for sid, record in results.items():
@@ -542,7 +560,7 @@ def main() -> None:
             print(f"{tag}: no scored clips")
             continue
         scores = [r["auto_score"] for r in rows]
-        lat = [r["total_ms"] for r in rows if r["total_ms"]]
+        lat = [r.get("total_ms") for r in rows if r.get("total_ms")]
         merged[tag] = {
             "n": len(rows),
             "mean_auto": round(sum(scores) / len(scores), 1),

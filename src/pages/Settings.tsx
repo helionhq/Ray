@@ -72,6 +72,10 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   const [checked, setChecked] = useState<UpdateCheck | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const moreRefs = useRef<Partial<Record<Provider, HTMLButtonElement | null>>>({});
+  const keyVersions = useRef<Record<Provider, number>>({
+    assemblyai: 0,
+    vercel: 0,
+  });
 
   useEffect(() => {
     if (!armedRemove) return;
@@ -84,7 +88,9 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
     if (provider === null) return;
     const activeProvider: Provider = provider;
     const menu = menuRef.current;
-    menu?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus();
+    menu
+      ?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
+      ?.focus();
 
     function closeOnOutside(event: PointerEvent) {
       const target = event.target as Node;
@@ -171,6 +177,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   async function saveKey(provider: Provider) {
     const value = drafts[provider].trim();
     if (!value) return;
+    keyVersions.current[provider] += 1;
     setBusy(`save-${provider}`);
     try {
       await api.saveSecret(provider, value);
@@ -189,6 +196,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   }
 
   async function testKey(provider: Provider) {
+    const version = keyVersions.current[provider];
     setBusy(`test-${provider}`);
     setTestErrors((current) => ({ ...current, [provider]: undefined }));
     try {
@@ -199,19 +207,22 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
         setReplacing((current) => ({ ...current, [provider]: false }));
       }
       const message = await api.testSecret(provider);
+      if (keyVersions.current[provider] !== version) return;
       setTestStates((current) => ({ ...current, [provider]: "connected" }));
       notify(message);
       await refresh();
     } catch (error) {
+      if (keyVersions.current[provider] !== version) return;
       setTestStates((current) => ({ ...current, [provider]: "failed" }));
       setTestErrors((current) => ({ ...current, [provider]: String(error) }));
       notify(String(error));
     } finally {
-      setBusy(null);
+      setBusy((current) => (current === `test-${provider}` ? null : current));
     }
   }
 
   async function removeKey(provider: Provider) {
+    keyVersions.current[provider] += 1;
     setBusy(`remove-${provider}`);
     try {
       await api.clearSecret(provider);
@@ -299,13 +310,18 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   }
 
   function beginReplace(provider: Provider) {
+    keyVersions.current[provider] += 1;
     setReplacing((current) => ({ ...current, [provider]: true }));
+    setTestStates((current) => ({ ...current, [provider]: null }));
+    setTestErrors((current) => ({ ...current, [provider]: undefined }));
     setMenuFor(null);
   }
 
   function onMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
     const items = Array.from(
-      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+      event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not(:disabled)',
+      ),
     );
     if (event.key === "Tab") {
       setMenuFor(null);
@@ -421,6 +437,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
                 aria-controls={menuOpen ? menuId : undefined}
                 aria-label={`More actions for ${label}`}
                 title={`More actions for ${label}`}
+                disabled={isBusy}
                 onClick={(event) => toggleKeyMenu(provider, event.currentTarget)}
               >
                 <MoreIcon size={16} />
@@ -439,6 +456,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
                 <button
                   type="button"
                   role="menuitem"
+                  disabled={isBusy}
                   onClick={() => beginReplace(provider)}
                 >
                   Replace key
@@ -450,6 +468,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
                   className={`is-danger${
                     armedRemove === provider ? " is-armed" : ""
                   }`}
+                  disabled={isBusy}
                   onClick={() => {
                     if (armedRemove === provider) {
                       void removeKey(provider);

@@ -160,9 +160,21 @@ def main() -> None:
             existing = merged.get(key, {}).get("rows", [])
             done = {(row["id"], row.get("run", 0)) for row in existing if row.get("ok")}
             # A forced re-judge replaces only the IDs being re-judged; rows for
-            # IDs outside --ids keep their stored judgments.
+            # IDs outside --ids keep their stored judgments. A stored row is only
+            # replaced when its ID can actually be re-judged from this result
+            # file, so rows for selected IDs absent here are retained.
             if args.force:
-                rows = [row for row in existing if wanted and row["id"] not in wanted]
+                if wanted is None:
+                    rows = []
+                else:
+                    rejudgeable = wanted & set(results) & set(scripts)
+                    missing = wanted - rejudgeable
+                    if missing:
+                        print(
+                            f"{key}: kept stored rows for selected IDs with no rejudgeable result: "
+                            f"{', '.join(sorted(missing))}"
+                        )
+                    rows = [row for row in existing if row["id"] not in rejudgeable]
             else:
                 rows = existing
             for sid, record in results.items():
