@@ -12,7 +12,7 @@ export function PrivacyPage() {
   });
 
   return (
-    <LegalPage title="Privacy policy" updated="November 8, 2026">
+    <LegalPage title="Privacy policy" updated="November 9, 2026">
       <p>
         Ray is a Windows dictation app made by Helion. This policy explains what
         happens to your words when you use the app and this site. It is a
@@ -23,10 +23,12 @@ export function PrivacyPage() {
       <p>
         When you dictate, Ray records audio on your PC and sends it through our
         Cloudflare Worker to <strong>AssemblyAI</strong>, which transcribes it.
-        When Structured cleanup runs, Ray also sends the transcript, the terms
-        in your personal dictionary, and the name of the foreground app you are
-        dictating into to AssemblyAI&rsquo;s language model so it can rewrite the
-        text.
+        Ray also sends the terms in your personal dictionary to AssemblyAI with
+        each dictation as recognition hints, so it spells saved names the way
+        you entered them. When Structured cleanup runs, Ray also sends the
+        transcript, your dictionary terms, and the name of the foreground app
+        you are dictating into to AssemblyAI&rsquo;s language model so it can
+        rewrite the text.
       </p>
       <p>
         <strong>

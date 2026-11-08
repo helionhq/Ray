@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import app from "../../worker/index";
@@ -14,6 +14,10 @@ import {
 import { listSubscriptions, getUser, claimPendingCheckoutStatement } from "../../worker/db";
 import { BATCH_MAX_BYTES } from "../../worker/routes/stt";
 import { weekBounds, nowSeconds } from "../../worker/lib/weeks";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -721,6 +725,65 @@ describe("Clerk user.deleted webhook", () => {
     expect(await jsonOf(duplicate)).toMatchObject({ duplicate: true });
   });
 
+  it("cancels still-renewing Creem subscriptions on deletion", async () => {
+    const userId = "user_clerk_cancel";
+    await seedUser(userId);
+    await seedSubscription(userId, {
+      id: "sub_clerk_active",
+      status: "active",
+    });
+    await seedSubscription(userId, {
+      id: "sub_clerk_trialing",
+      status: "trialing",
+    });
+    await seedSubscription(userId, {
+      id: "sub_clerk_canceled",
+      status: "canceled",
+    });
+    await seedSubscription(userId, {
+      id: "sub_clerk_scheduled",
+      status: "scheduled_cancel",
+    });
+    await seedSubscription(userId, {
+      id: "sub_clerk_expired",
+      status: "expired",
+    });
+
+    const calls: { url: string; init?: RequestInit }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        // One failure must not fail the Clerk webhook (best effort).
+        return String(input).includes("sub_clerk_trialing")
+          ? new Response("nope", { status: 500 })
+          : new Response(JSON.stringify({ id: "sub" }), { status: 200 });
+      },
+    );
+
+    const response = await deliverClerk(userDeletedEvent(userId), {
+      id: "msg_clerk_cancel",
+      environment: workerEnv(),
+    });
+    expect(response.status).toBe(200);
+
+    // canceled/scheduled_cancel/expired subscriptions renew nothing, so they
+    // are not cancelled again.
+    expect(calls.map((call) => call.url).sort()).toEqual([
+      "https://test-api.creem.io/v1/subscriptions/sub_clerk_active/cancel",
+      "https://test-api.creem.io/v1/subscriptions/sub_clerk_trialing/cancel",
+    ]);
+    for (const call of calls) {
+      expect(JSON.parse(String(call.init?.body))).toEqual({
+        mode: "immediate",
+      });
+      expect(
+        (call.init?.headers as Record<string, string>)["x-api-key"],
+      ).toBe(env.CREEM_API_KEY);
+    }
+    expect(await getUser(env.DB, userId)).toBeNull();
+  });
+
   it("rejects an invalid Svix signature and stale timestamps", async () => {
     const userId = "user_clerk_bad_signature";
     await seedUser(userId);
@@ -1040,6 +1103,36 @@ describe("rate limiting", () => {
       error: "too_many_requests",
     });
     expect(keySeen).toBe("ip:203.0.113.9");
+  });
+
+  it("rate limits authenticated STT per user", async () => {
+    await seedUser("user_stt_rate");
+    const token = await seedDevice("user_stt_rate");
+    let keySeen = "";
+    const response = await app.request(
+      new Request("https://ray.test/v1/stt/sync", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "audio/wav",
+        },
+        body: "audio",
+      }),
+      undefined,
+      workerEnv({
+        RATE_LIMIT_STT: {
+          limit: async ({ key }) => {
+            keySeen = key;
+            return { success: false };
+          },
+        },
+      }),
+    );
+    expect(response.status).toBe(429);
+    expect(await jsonOf(response)).toMatchObject({
+      error: "too_many_requests",
+    });
+    expect(keySeen).toBe("user:user_stt_rate");
   });
 
   it("continues when the binding is absent", async () => {

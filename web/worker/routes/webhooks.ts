@@ -12,8 +12,9 @@
  * - users are mapped by metadata.user_id, then creem_customer_id only (never
  *   email); only the two configured products grant Pro.
  *
- * Clerk (optional): Svix-verified `user.deleted` revokes every device and
- * soft-deletes the user. Disabled (503) when CLERK_WEBHOOK_SECRET is unset.
+ * Clerk (optional): Svix-verified `user.deleted` cancels the user's renewing
+ * Creem subscriptions (best effort), revokes every device, and soft-deletes
+ * the user. Disabled (503) when CLERK_WEBHOOK_SECRET is unset.
  *
  * Request bodies are never logged.
  */
@@ -27,6 +28,7 @@ import {
   findUserByCreemCustomerId,
   getSubscription,
   insertWebhookEventStatement,
+  listSubscriptions,
   markUserDeletedStatement,
   revokeAllDevicesStatement,
   setCreemCustomerIdStatement,
@@ -34,6 +36,7 @@ import {
   upsertUserStatement,
 } from "../db";
 import {
+  creemPost,
   parseCreemWebhook,
   verifyCreemSignature,
   type ParsedSubscriptionEvent,
@@ -47,6 +50,18 @@ import { parseJsonObject, readBodyLimited } from "../http";
 const WEBHOOK_BODY_LIMIT_BYTES = 1_048_576;
 const CLERK_WEBHOOK_BODY_LIMIT_BYTES = 256 * 1024;
 const WEBHOOK_RETENTION_DAYS = 30;
+
+/**
+ * Statuses that will not renew or charge again. Every other stored status is
+ * canceled immediately when the Clerk user is deleted, so the card cannot
+ * keep being charged after the user loses portal access.
+ */
+const NON_RENEWING_SUBSCRIPTION_STATUSES = new Set([
+  "canceled",
+  "scheduled_cancel",
+  "expired",
+  "revoked",
+]);
 
 interface SubscriptionStatements {
   applied: boolean;
@@ -328,6 +343,41 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
       }
 
       const now = nowSeconds();
+
+      // Best effort before access is revoked: once the user is soft-deleted
+      // they can no longer sign in to reach the Creem portal, so a renewing
+      // subscription would keep charging a card they cannot manage. Creem's
+      // cancel endpoint is POST /v1/subscriptions/{id}/cancel; `immediate`
+      // stops the next renewal.
+      try {
+        const subscriptions = await listSubscriptions(c.env.DB, userId);
+        await Promise.all(
+          subscriptions
+            .filter(
+              (subscription) =>
+                !NON_RENEWING_SUBSCRIPTION_STATUSES.has(subscription.status),
+            )
+            .map(async (subscription) => {
+              const result = await creemPost(
+                c.env,
+                `/subscriptions/${encodeURIComponent(subscription.id)}/cancel`,
+                { mode: "immediate" },
+              );
+              if (!result.ok) {
+                // No user or subscription id in logs; find it by customer in
+                // Creem if manual follow-up is needed.
+                console.error(
+                  "failed to cancel a deleted user's subscription",
+                );
+              }
+            }),
+        );
+      } catch {
+        // Deletion must still proceed; a missed cancellation is logged for
+        // manual follow-up.
+        console.error("failed to cancel a deleted user's subscriptions");
+      }
+
       const markerId = `clerk:${headers.id ?? crypto.randomUUID()}`;
       const results = await c.env.DB.batch([
         revokeAllDevicesStatement(c.env.DB, userId, now),

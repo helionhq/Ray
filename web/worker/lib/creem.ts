@@ -7,6 +7,12 @@
  * `toUnixMillis` / `toUnixSeconds` accept both.
  */
 
+import type { Env } from "../env";
+import {
+  fetchWithTimeout,
+  parseJsonObject,
+  upstreamErrorMessage,
+} from "../http";
 import {
   hexToBytes,
   hmacSha256Hex,
@@ -26,6 +32,54 @@ export function creemApiBase(raw: string | undefined | null): string {
   const trimmed = (raw ?? "").trim().replace(/\/+$/u, "");
   if (trimmed === "") return DEFAULT_CREEM_API_BASE;
   return /\/v1$/iu.test(trimmed) ? trimmed : `${trimmed}/v1`;
+}
+
+interface CreemSuccess {
+  ok: true;
+  data: Record<string, unknown>;
+}
+
+interface CreemFailure {
+  ok: false;
+  message: string;
+}
+
+/** POSTs a JSON payload to the Creem API. Never throws. */
+export async function creemPost(
+  env: Pick<Env, "CREEM_API_BASE" | "CREEM_API_KEY">,
+  path: string,
+  payload: Record<string, unknown>,
+): Promise<CreemSuccess | CreemFailure> {
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(
+      `${creemApiBase(env.CREEM_API_BASE)}${path}`,
+      {
+        method: "POST",
+        headers: {
+          "x-api-key": env.CREEM_API_KEY,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      },
+      15_000,
+    );
+  } catch {
+    return { ok: false, message: "Billing service is unavailable." };
+  }
+
+  const text = await response.text();
+  if (!response.ok) {
+    return {
+      ok: false,
+      message: upstreamErrorMessage(text, "Billing request failed."),
+    };
+  }
+  const data = parseJsonObject(text);
+  if (!data) {
+    return { ok: false, message: "Billing returned an invalid response." };
+  }
+  return { ok: true, data };
 }
 
 /**

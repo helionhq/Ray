@@ -44,6 +44,7 @@ export interface Env {
   RATE_LIMIT_REVOKE_ALL?: RateLimitBinding;
   RATE_LIMIT_DESKTOP_TOKEN?: RateLimitBinding;
   RATE_LIMIT_WEBHOOKS?: RateLimitBinding;
+  RATE_LIMIT_STT?: RateLimitBinding;
 }
 
 export interface UserRow {

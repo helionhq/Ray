@@ -37,6 +37,11 @@
       "name": "RATE_LIMIT_WEBHOOKS",
       "namespace_id": "4205",
       "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_STT",
+      "namespace_id": "4206",
+      "simple": { "limit": 30, "period": 60 }
     }
   ],
   // Test-only dummy values. Never use real keys here.

@@ -511,7 +511,7 @@ impl Dictation {
                     Ok(Ok(text)) if !text.trim().is_empty() => {
                         let text = text.trim();
                         raw = Some(match partial.as_deref() {
-                            Some(previous) => stt::join_segment_transcripts(previous, text),
+                            Some(previous) => stt::join_batch_transcripts(previous, text),
                             None => text.to_string(),
                         });
                     }

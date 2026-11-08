@@ -45,6 +45,13 @@
       "name": "RATE_LIMIT_WEBHOOKS",
       "namespace_id": "4105",
       "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      // Per-user STT flood brake. One desktop dictation sends at most a live
+      // segment every ~118 s plus its batch fallback, far below this.
+      "name": "RATE_LIMIT_STT",
+      "namespace_id": "4106",
+      "simple": { "limit": 30, "period": 60 }
     }
   ],
   // Public configuration. Replace the placeholders before deploying.

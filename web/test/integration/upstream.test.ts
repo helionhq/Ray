@@ -7,6 +7,7 @@ import {
   getSttFailures,
   getUsageWords,
 } from "../../worker/db";
+import { BATCH_MAX_BYTES } from "../../worker/routes/stt";
 import {
   nowSeconds,
   weekBounds,
@@ -290,6 +291,31 @@ describe("word counting and cleanup grants on STT responses", () => {
     expect(await getUsageWords(env.DB, "user_words_cjk", weekStart)).toBe(4);
   });
 
+  it("counts a zero-word transcription toward the weekly failure budget", async () => {
+    await seedUser("user_zero_words");
+    const token = await seedDevice("user_zero_words");
+    stubFetch(
+      () =>
+        new Response(JSON.stringify({ text: "" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+
+    const response = await app.request(
+      syncRequest(token),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(200);
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    expect(await getUsageWords(env.DB, "user_zero_words", weekStart)).toBe(0);
+    // Silent audio still costs an upstream transcription, so it is budgeted.
+    expect(
+      await getSttFailures(env.DB, "user_zero_words", weekStart),
+    ).toBe(1);
+  });
+
   it("counts a completed batch transcript from the words array", async () => {
     await seedUser("user_batch_words");
     const token = await seedDevice("user_batch_words");
@@ -399,6 +425,84 @@ describe("batch streamed input cap (decision 6)", () => {
 
     const response = await app.request(
       new Request("https://ray.test/v1/stt/batch", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "audio/wav",
+        },
+        body,
+      }),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(413);
+    expect(await jsonOf(response)).toMatchObject({
+      error: "payload_too_large",
+    });
+  });
+});
+
+describe("sync input cap", () => {
+  it("rejects a declared sync body over 12 MB without calling upstream", async () => {
+    await seedUser("user_sync_cap");
+    const token = await seedDevice("user_sync_cap");
+    const calls = stubFetch(
+      () => new Response(JSON.stringify({ text: "hi" }), { status: 200 }),
+    );
+
+    const response = await app.request(
+      new Request("https://ray.test/v1/stt/sync", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "audio/wav",
+          "content-length": String(BATCH_MAX_BYTES + 1),
+        },
+        body: "audio",
+      }),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(413);
+    expect(await jsonOf(response)).toMatchObject({
+      error: "payload_too_large",
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("returns 413 when a streamed sync body overflows 12 MB", async () => {
+    await seedUser("user_sync_stream");
+    const token = await seedDevice("user_sync_stream");
+
+    vi.stubGlobal(
+      "fetch",
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        // Consume the streamed proxy body like the real upstream would.
+        const reader = (
+          init?.body as ReadableStream<Uint8Array>
+        ).getReader();
+        while (!(await reader.read()).done) {
+          // Drain until the limiter errors.
+        }
+        return new Response(JSON.stringify({ text: "hi" }), { status: 200 });
+      },
+    );
+
+    const chunk = new Uint8Array(64 * 1024);
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent > 13 * 1024 * 1024) {
+          controller.close();
+          return;
+        }
+        sent += chunk.byteLength;
+        controller.enqueue(chunk);
+      },
+    });
+
+    const response = await app.request(
+      new Request("https://ray.test/v1/stt/sync", {
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,

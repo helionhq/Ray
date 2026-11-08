@@ -146,11 +146,14 @@ Create a Clerk webhook pointing at `{SITE_URL}/api/webhooks/clerk`, subscribe
 to `user.deleted`, and store the Svix signing secret as
 `CLERK_WEBHOOK_SECRET`. The endpoint verifies `svix-id`,
 `svix-timestamp` (five-minute tolerance) and `svix-signature` over the raw
-body. On `user.deleted` it revokes every device token, deletes outstanding
-desktop sign-in codes, and soft-deletes the user so device tokens and Clerk
-sessions stop working immediately. Without the secret the endpoint answers
-503 and is effectively disabled. Other Clerk event types are acknowledged and
-ignored.
+body. On `user.deleted` it cancels any still-renewing Creem subscriptions
+(best effort, `POST /v1/subscriptions/{id}/cancel` with `mode: "immediate"`),
+revokes every device token, deletes outstanding desktop sign-in codes, and
+soft-deletes the user so device tokens and Clerk sessions stop working
+immediately. A Creem cancellation failure is logged (without user ids) and
+never fails the webhook, so deletion always proceeds. Without the secret the
+endpoint answers 503 and is effectively disabled. Other Clerk event types are
+acknowledged and ignored.
 
 ## Creem setup
 
@@ -326,8 +329,8 @@ sign-in (the browser hand-off checks `SITE_URL`).
 | POST | `/api/billing/portal` | either | Creem customer portal URL |
 | POST | `/api/webhooks/creem` | Creem signature | subscription/refund/dispute lifecycle |
 | POST | `/api/webhooks/clerk` | Svix signature | optional `user.deleted` |
-| POST | `/v1/stt/sync-live` | device | streamed AssemblyAI Sync live proxy |
-| POST | `/v1/stt/sync` | device | AssemblyAI Sync batch proxy |
+| POST | `/v1/stt/sync-live` | device | streamed AssemblyAI Sync live proxy (12 MB cap) |
+| POST | `/v1/stt/sync` | device | AssemblyAI Sync batch proxy (12 MB cap) |
 | POST | `/v1/stt/batch` | device | v2 upload/create/poll fallback (12 MB cap) |
 | POST | `/v1/cleanup/chat/completions` | device | AssemblyAI LLM gateway proxy (grant-gated) |
 
@@ -380,19 +383,21 @@ Plans: **Starter** (1,000 words/week, resets Monday 00:00 UTC) and **Pro**
   `finally`. Over the cap: `429 too_many_requests`.
 - **Failed-transcription budget (M2).** A transcription that fails consumes
   no words, so failures are counted per user per ISO week in `stt_failures`.
-  After 200 failed attempts in one week, STT answers
+  A successful response that produced zero words (silence or noise) counts the
+  same way: it still costs an upstream transcription but adds nothing to the
+  word quota. After 200 such attempts in one week, STT answers
   `429 too_many_requests` (with `resets_at`) until the next Monday.
-- **Batch input cap (decision 6).** `/v1/stt/batch` rejects a declared
-  `Content-Length` over 12 MB and enforces the same cap chunk by chunk while
-  streaming the audio to AssemblyAI. Nothing calls `arrayBuffer()` on an
-  unbounded body.
+- **STT input cap (decision 6).** Every STT route — `/v1/stt/sync-live`,
+  `/v1/stt/sync` and `/v1/stt/batch` — rejects a declared `Content-Length`
+  over 12 MB and enforces the same cap chunk by chunk while streaming the
+  audio to AssemblyAI. Nothing calls `arrayBuffer()` on an unbounded body.
 - **Rate limiting (M6).** The Worker uses Workers Rate Limiting bindings
   (`ratelimits` in `wrangler.jsonc`): per user for
-  `/api/desktop/authorize`, `/api/billing/*` and `/api/devices/revoke-all`,
-  per IP for `/api/desktop/token` and both webhook endpoints. Counts are per
-  Cloudflare location and eventually consistent. If a binding is absent at
-  runtime (for example an older local runtime), the Worker logs one warning
-  and continues without rate limiting.
+  `/api/desktop/authorize`, `/api/billing/*`, `/api/devices/revoke-all` and
+  every `/v1/stt/*` route, per IP for `/api/desktop/token` and both webhook
+  endpoints. Counts are per Cloudflare location and eventually consistent. If
+  a binding is absent at runtime (for example an older local runtime), the
+  Worker logs one warning and continues without rate limiting.
 
 Live rollover: overlapping segments from two simultaneous dictations may be
 counted twice. This is accepted; the quota is a cost guard, not an exact

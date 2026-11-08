@@ -6,15 +6,16 @@
  *
  * `/v1/stt/sync-live` forwards the original streamed multipart body without
  * buffering it. `/v1/stt/batch` implements the v2 upload/create/poll fallback
- * server-side, streaming the audio upstream under a hard 12 MB cap.
+ * server-side. Every STT route streams upstream under a hard 12 MB body cap.
  */
 
 import type { Context, Hono } from "hono";
 import type { AppContext } from "../env";
 import { requireDevice } from "../auth";
-import { addWords, grantCleanup } from "../db";
+import { addSttFailure, addWords, grantCleanup } from "../db";
 import { quotaGuard } from "../quota-guard";
 import { sttGuard } from "../stt-guard";
+import { rateLimitUser } from "../lib/rate-limit";
 import { base64UrlDecode } from "../lib/crypto";
 import {
   CLEANUP_CALLS_PER_TRANSCRIPTION,
@@ -43,7 +44,11 @@ const UPLOAD_TIMEOUT_MS = 60_000;
 const CREATE_TIMEOUT_MS = 20_000;
 const POLL_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_KEYTERMS = 1_000;
-/** Decision 6: /v1/stt/batch accepts at most 12 MB of audio. */
+/**
+ * Decision 6: /v1/stt/batch accepts at most 12 MB of audio. Sync and sync-live
+ * use the same cap: the desktop's 5-minute batch WAV is 9.6 MB and a 118 s
+ * live segment is ~3.8 MB, so no real request comes close.
+ */
 export const BATCH_MAX_BYTES = 12 * 1024 * 1024;
 const DEFAULT_SPEECH_MODELS = ["universal-3-5-pro", "universal-2"];
 
@@ -56,7 +61,17 @@ async function recordUsage(
   weekStart: number,
   words: number,
 ): Promise<void> {
-  if (words <= 0) return;
+  if (words <= 0) {
+    // Audio that produced no words (silence, noise) still costs an upstream
+    // transcription but never consumes quota, so it counts against the same
+    // weekly failure budget instead of running unmetered.
+    try {
+      await addSttFailure(c.env.DB, c.get("user").id, weekStart);
+    } catch {
+      // Failure accounting is best effort; never break the response.
+    }
+    return;
+  }
   await addWords(c.env.DB, c.get("user").id, weekStart, words);
   try {
     // Every counted transcription earns cleanup capacity (decision 1).
@@ -89,6 +104,15 @@ async function proxySync(
 ): Promise<Response> {
   const weekStart = weekBounds(nowSeconds()).weekStart;
 
+  if (declaredLengthTooLarge(c.req.header("content-length"), BATCH_MAX_BYTES)) {
+    return payloadTooLarge(c);
+  }
+  const body = c.req.raw.body;
+  if (!body) return invalidAudio(c);
+  // The same streamed cap as /v1/stt/batch: a lying or missing Content-Length
+  // cannot push an unbounded body (and an unbounded upstream bill) through.
+  const limited = createLimitedBody(body, BATCH_MAX_BYTES);
+
   const headers = new Headers();
   headers.set("authorization", c.env.ASSEMBLYAI_API_KEY);
   const contentType = c.req.header("content-type");
@@ -103,16 +127,18 @@ async function proxySync(
     upstream = await fetch(upstreamUrl, {
       method: "POST",
       headers,
-      body: c.req.raw.body,
+      body: limited.stream,
       redirect: "manual",
     });
   } catch {
+    if (limited.tooLarge()) return payloadTooLarge(c);
     const failure = upstreamUnavailable();
     return c.json(
       { error: failure.error, message: failure.message },
       failure.status,
     );
   }
+  if (limited.tooLarge()) return payloadTooLarge(c);
 
   const text = await upstream.text();
   if (upstream.ok) {
@@ -485,6 +511,7 @@ export function registerSttRoutes(app: Hono<AppContext>): void {
   app.post(
     "/v1/stt/sync-live",
     requireDevice,
+    rateLimitUser("RATE_LIMIT_STT"),
     quotaGuard,
     sttGuard,
     async (c) => proxySync(c, SYNC_LIVE_URL),
@@ -493,6 +520,7 @@ export function registerSttRoutes(app: Hono<AppContext>): void {
   app.post(
     "/v1/stt/sync",
     requireDevice,
+    rateLimitUser("RATE_LIMIT_STT"),
     quotaGuard,
     sttGuard,
     async (c) => proxySync(c, SYNC_URL),
@@ -501,6 +529,7 @@ export function registerSttRoutes(app: Hono<AppContext>): void {
   app.post(
     "/v1/stt/batch",
     requireDevice,
+    rateLimitUser("RATE_LIMIT_STT"),
     quotaGuard,
     sttGuard,
     async (c) => {

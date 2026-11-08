@@ -16,15 +16,10 @@ import {
   resolveBillingIssue,
   resolvePlan,
 } from "../lib/plan";
-import { creemApiBase } from "../lib/creem";
+import { creemPost } from "../lib/creem";
 import { rateLimitUser } from "../lib/rate-limit";
 import { nowSeconds } from "../lib/weeks";
-import {
-  fetchWithTimeout,
-  parseJsonObject,
-  readBodyLimited,
-  upstreamErrorMessage,
-} from "../http";
+import { parseJsonObject, readBodyLimited } from "../http";
 
 /**
  * How long a created checkout blocks another one. The subscription webhook
@@ -32,53 +27,6 @@ import {
  * a delayed delivery, and expires so the user can try again.
  */
 export const PENDING_CHECKOUT_TTL_SECONDS = 15 * 60;
-
-interface CreemSuccess {
-  ok: true;
-  data: Record<string, unknown>;
-}
-
-interface CreemFailure {
-  ok: false;
-  message: string;
-}
-
-async function creemPost(
-  env: Env,
-  path: string,
-  payload: Record<string, unknown>,
-): Promise<CreemSuccess | CreemFailure> {
-  let response: Response;
-  try {
-    response = await fetchWithTimeout(
-      `${creemApiBase(env.CREEM_API_BASE)}${path}`,
-      {
-        method: "POST",
-        headers: {
-          "x-api-key": env.CREEM_API_KEY,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      },
-      15_000,
-    );
-  } catch {
-    return { ok: false, message: "Billing service is unavailable." };
-  }
-
-  const text = await response.text();
-  if (!response.ok) {
-    return {
-      ok: false,
-      message: upstreamErrorMessage(text, "Billing request failed."),
-    };
-  }
-  const data = parseJsonObject(text);
-  if (!data) {
-    return { ok: false, message: "Billing returned an invalid response." };
-  }
-  return { ok: true, data };
-}
 
 function siteUrl(env: Env): string {
   return env.SITE_URL.trim().replace(/\/+$/u, "");

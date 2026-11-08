@@ -405,10 +405,19 @@ fn normalize_word(word: &str) -> String {
 /// audio, so its transcript starts with words the first one already produced.
 /// Remove that overlap, and when the cut fell inside a word, let the complete
 /// word from the second segment replace the fragment at the end of the first.
-///
-/// Also used to join live text with the batch fallback, which starts at the
-/// covered PCM offset (no overlap, but a word can be cut at the boundary).
 pub(crate) fn join_segment_transcripts(previous: &str, next: &str) -> String {
+    join_transcripts(previous, next, true)
+}
+
+/// Join live text with the batch fallback. The batch starts at the end of the
+/// PCM covered by completed live segments, so the two transcripts do not
+/// overlap: a suffix/prefix match is a word the user really repeated across
+/// the split and must be kept. Only a word cut at the split is repaired.
+pub(crate) fn join_batch_transcripts(previous: &str, next: &str) -> String {
+    join_transcripts(previous, next, false)
+}
+
+fn join_transcripts(previous: &str, next: &str, overlap: bool) -> String {
     let previous = previous.trim();
     let next = next.trim();
     if previous.is_empty() {
@@ -426,39 +435,44 @@ pub(crate) fn join_segment_transcripts(previous: &str, next: &str) -> String {
     let next_norm: Vec<String> = next_words.iter().map(|word| normalize_word(word)).collect();
     let max = previous_words.len().min(next_words.len()).min(40);
 
-    // The overlap began inside an earlier word, so the second segment starts
-    // with only its tail ("AssemblyAI for now" | "AI for now"). Drop the tail
-    // only when the words after it line up with the rest of the first
-    // segment; that avoids eating a real word such as "is" after "analysis".
-    if next_norm.len() >= 2 && next_norm[0].len() >= 2 {
-        let tail = &next_norm[0];
-        for index in 0..previous_norm.len() {
-            let word = &previous_norm[index];
-            let remaining = previous_norm.len() - index - 1;
-            if remaining >= 1
-                && word.len() > tail.len()
-                && word.ends_with(tail.as_str())
-                && next_norm.len() > remaining
-                && previous_norm[index + 1..] == next_norm[1..=remaining]
-            {
-                let rest = next_words[1..].join(" ");
-                return join_segment_transcripts(previous, &rest);
+    if overlap {
+        // The overlap began inside an earlier word, so the second segment
+        // starts with only its tail ("AssemblyAI for now" | "AI for now").
+        // Drop the tail only when the words after it line up with the rest of
+        // the first segment; that avoids eating a real word such as "is"
+        // after "analysis".
+        if next_norm.len() >= 2 && next_norm[0].len() >= 2 {
+            let tail = &next_norm[0];
+            for index in 0..previous_norm.len() {
+                let word = &previous_norm[index];
+                let remaining = previous_norm.len() - index - 1;
+                if remaining >= 1
+                    && word.len() > tail.len()
+                    && word.ends_with(tail.as_str())
+                    && next_norm.len() > remaining
+                    && previous_norm[index + 1..] == next_norm[1..=remaining]
+                {
+                    let rest = next_words[1..].join(" ");
+                    return join_segment_transcripts(previous, &rest);
+                }
+            }
+        }
+
+        // Complete words repeated because of the overlap: keep the first copy.
+        for k in (1..=max).rev() {
+            if previous_norm[previous_words.len() - k..] == next_norm[..k] {
+                return format!("{} {}", previous, next_words[k..].join(" "))
+                    .trim()
+                    .to_string();
             }
         }
     }
 
-    // Complete words repeated because of the overlap: keep the first copy.
-    for k in (1..=max).rev() {
-        if previous_norm[previous_words.len() - k..] == next_norm[..k] {
-            return format!("{} {}", previous, next_words[k..].join(" "))
-                .trim()
-                .to_string();
-        }
-    }
-
-    // A word was cut at the boundary. The next segment contains the words
-    // before it plus the full word, so drop the fragment (and the duplicated
-    // run before it) from the first segment and keep the next one whole.
+    // A word was cut at the boundary. At a live rollover the next segment
+    // contains the words before it plus the full word, so drop the fragment
+    // (and the duplicated run before it) from the first segment and keep the
+    // next one whole. At a batch boundary there is no repeated run, so only
+    // the single cut word is repaired.
     for k in (1..=max).rev() {
         let fragment = &previous_norm[previous_words.len() - 1];
         if fragment.len() < 3 {
@@ -474,8 +488,9 @@ pub(crate) fn join_segment_transcripts(previous: &str, next: &str) -> String {
                 .trim()
                 .to_string();
             }
-        } else if previous_norm[previous_words.len() - k..previous_words.len() - 1]
-            == next_norm[..k - 1]
+        } else if overlap
+            && previous_norm[previous_words.len() - k..previous_words.len() - 1]
+                == next_norm[..k - 1]
             && next_norm[k - 1].starts_with(fragment)
             && next_norm[k - 1].len() > fragment.len()
         {
@@ -791,6 +806,36 @@ mod tests {
     fn rollover_join_keeps_independent_segments() {
         assert_eq!(
             join_segment_transcripts("First part ends here.", "Second part starts here."),
+            "First part ends here. Second part starts here."
+        );
+    }
+
+    #[test]
+    fn batch_join_keeps_a_word_repeated_across_the_split() {
+        // The batch starts where live stopped, so there is no overlap: the
+        // repeated "said" was really spoken and must not be de-duplicated.
+        assert_eq!(
+            join_batch_transcripts("I said", "said we should ship it."),
+            "I said said we should ship it."
+        );
+        // The overlap-only tail repair must not run at a batch boundary.
+        assert_eq!(
+            join_batch_transcripts(
+                "The transcription stays on AssemblyAI for now.",
+                "AI for now, but we'll add an adapter."
+            ),
+            "The transcription stays on AssemblyAI for now. AI for now, but we'll add an adapter."
+        );
+    }
+
+    #[test]
+    fn batch_join_repairs_a_word_cut_at_the_split() {
+        assert_eq!(
+            join_batch_transcripts("We should ship the workfl", "workflow tomorrow."),
+            "We should ship the workflow tomorrow."
+        );
+        assert_eq!(
+            join_batch_transcripts("First part ends here.", "Second part starts here."),
             "First part ends here. Second part starts here."
         );
     }

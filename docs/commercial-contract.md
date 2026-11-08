@@ -120,7 +120,7 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
 | POST | `/api/billing/checkout` | either | body `{ interval: "monthly" \| "annual" }` → `{ url }` (Creem checkout) |
 | POST | `/api/billing/portal` | either | → `{ url }` (Creem customer portal) |
 | POST | `/api/webhooks/creem` | Creem signature | subscription lifecycle |
-| POST | `/api/webhooks/clerk` | Svix signature | optional Clerk `user.deleted`; `503 not_configured` when `CLERK_WEBHOOK_SECRET` is unset |
+| POST | `/api/webhooks/clerk` | Svix signature | optional Clerk `user.deleted`: cancels still-renewing Creem subscriptions (best effort), revokes devices, soft-deletes the user; `503 not_configured` when `CLERK_WEBHOOK_SECRET` is unset |
 | POST | `/v1/stt/sync-live` | device | streaming proxy for AssemblyAI Sync live |
 | POST | `/v1/stt/sync` | device | proxy for AssemblyAI Sync batch |
 | POST | `/v1/stt/batch` | device | server-side v2 fallback: body is a WAV (≤ 12 MB); Worker uploads, creates, polls; returns `{ text }` |
@@ -183,13 +183,14 @@ rate-limited and shows a friendly retry message.
 - `/v1/stt/sync-live`: the desktop sends exactly what it used to send to
   `https://sync.assemblyai.com/v1/transcribe/live` (streamed multipart body, `X-AAI-Model`
   header, `content-type` with boundary). The Worker checks auth + quota **before** reading
-  the body, then forwards the streamed body (`request.body`) upstream with
-  `authorization: <ASSEMBLYAI_API_KEY>`, forwarding only `content-type` and `X-AAI-Model`.
-  It reads the upstream JSON, counts words in `text`, adds them to this week's usage, and
-  returns the upstream status + body unchanged (except the upstream-error mapping below).
-  Sync live accepts up to 120 s per request; the desktop rolls over to a new request at
-  118 s, and the segment transcripts are joined.
-- `/v1/stt/sync`: same, for `https://sync.assemblyai.com/v1/transcribe` (non-streamed body).
+  the body, then forwards the streamed body (`request.body`) upstream under the same 12 MB
+  cap as batch, with `authorization: <ASSEMBLYAI_API_KEY>`, forwarding only `content-type`
+  and `X-AAI-Model`. It reads the upstream JSON, counts words in `text`, adds them to this
+  week's usage, and returns the upstream status + body unchanged (except the upstream-error
+  mapping below). Sync live accepts up to 120 s per request; the desktop rolls over to a new
+  request at 118 s, and the segment transcripts are joined.
+- `/v1/stt/sync`: same, for `https://sync.assemblyai.com/v1/transcribe` (non-streamed body),
+  also under the 12 MB cap.
 - `/v1/stt/batch`: request body is `audio/wav` (maximum **12 MB**, enforced on
   `Content-Length` and chunk by chunk while streaming; over the cap is
   `413 payload_too_large`, an empty body is `400 invalid_audio`), optional header
@@ -207,9 +208,12 @@ rate-limited and shows a friendly retry message.
   expiry, released in `finally` even when a client stream ends or the handler fails).
   Over the cap: `429 { "error": "too_many_requests" }`. Live rollover segments are
   sequential (the desktop reads one segment's response before starting the next), so a
-  normal long dictation never holds two leases.
+  normal long dictation never holds two leases. All three STT routes also sit behind the
+  per-user `RATE_LIMIT_STT` Workers Rate Limiting binding (30 requests/minute).
 - Failed transcriptions count against a generous weekly budget (`stt_failures`, 200 per
   week); over it STT answers `429 { "error": "too_many_requests", "resets_at": … }`.
+  A successful response that counted zero words (silence or noise) counts the same way:
+  it costs an upstream transcription but consumes no quota.
 - Upstream failures never look like Ray errors: upstream 401/402/403/5xx and
   unreachable/timeout become `502 { "error": "upstream_error" }`; an upstream 429 becomes
   `503 { "error": "upstream_busy" }`.
@@ -305,6 +309,8 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
    dictionary so the expanded Structured prompt stays under the system cap.
 3. **Per-user STT concurrency lease.** At most 2 in-flight STT requests per user (D1 `stt_leases`
    with a 6-min expiry, released in `finally`). Over the cap: `429 { error: "too_many_requests" }`.
+   STT routes also use the per-user `RATE_LIMIT_STT` rate-limit binding, and a zero-word
+   transcription (silence) counts against the weekly failure budget.
 4. **Upstream errors never look like Ray errors.** The Worker maps any upstream 401/402/403/429 (and
    5xx/timeouts) to `502 { error: "upstream_error" }` (or `503 { error: "upstream_busy" }` for upstream 429).
    The desktop classifies Ray errors **by JSON `error` code** (`unauthorized`, `quota_exceeded`, `fair_use`,
@@ -314,8 +320,8 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
 5. **Mid-dictation limit on live rollover.** If a later sync-live segment gets `quota_exceeded`/`fair_use`,
    keep the segments already transcribed (return the partial text and paste it), then show the limit
    message.
-6. **`/v1/stt/batch` input cap:** 12 MB (Content-Length check plus a streamed cap), streamed upload to
-   AssemblyAI, no `arrayBuffer()` of unbounded input.
+6. **STT input cap:** 12 MB on every STT route (`sync-live`, `sync`, `batch`), Content-Length
+   check plus a streamed cap, streamed upload to AssemblyAI, no `arrayBuffer()` of unbounded input.
 7. **Word counting:** prefer the length of AssemblyAI's `words` array when present; otherwise count
    whitespace tokens, with each CJK/Hiragana/Katakana/Hangul character counted as one word.
 8. **Billing integrity:** only `CREEM_PRODUCT_PRO_MONTHLY` / `CREEM_PRODUCT_PRO_ANNUAL` grant Pro;
@@ -340,9 +346,10 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
     challenges.cloudflare.com for bot protection; check Clerk's CSP docs).
 14. **Copy honesty:** Pro is "Unlimited words" with "Fair use applies" (Terms explain fair use without a
     number); don't say "No weekly reset". Privacy says Ray's *servers* never store audio or
-    transcripts, discloses that cleanup sends the transcript plus your dictionary terms and the
-    foreground app's name to AssemblyAI for processing, and says History is kept locally on your PC.
-    No absolute "never stored" claims that ignore local History.
+    transcripts, discloses that dictionary terms are sent to AssemblyAI as recognition hints on
+    every transcription and, with cleanup, alongside the transcript and the foreground app's name,
+    and says History is kept locally on your PC. No absolute "never stored" claims that ignore
+    local History.
 15. **Weekly reset display:** always "resets Monday 00:00 UTC" (or a UTC-formatted date), never a
     local weekday. The desktop treats cached usage with `now >= resets_at` as stale (refresh before
     blocking).
