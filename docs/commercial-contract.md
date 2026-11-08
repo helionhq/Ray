@@ -219,3 +219,66 @@ counted (STT already counted them).
   (reasonable placeholder text clearly marked for legal review).
 - Visual language: monochrome, Geist / Geist Mono, generous whitespace, Linear/Notion
   restraint, matching the desktop app's look. Responsive down to 360px.
+
+## Review-round decisions (binding for the fix round)
+
+1. **Cleanup grants (replaces the quota check on cleanup).** `/v1/cleanup/chat/completions` no longer
+   checks the weekly quota. Instead it requires an unexpired *cleanup grant* earned by a
+   just-counted transcription. D1 table `cleanup_grants(user_id TEXT PK, words INTEGER,
+   calls_left INTEGER, expires_at INTEGER)`. Every STT response that counted words upserts the grant:
+   if expired, reset to `words = counted`; otherwise `words += counted`; `calls_left = min(calls_left + 6, 30)`;
+   `expires_at = now + 15 min`. Cleanup: atomically decrement `calls_left` where `calls_left > 0 AND
+   expires_at > now`, and reject if the `<transcript>…</transcript>` content in the last user message
+   has more than `grant.words + 25` words. On failure, return `403 { error: "no_cleanup_grant" }`. The
+   desktop treats that like any other cleanup failure (paste the raw transcript). This means the
+   dictation that crosses the limit always completes and gets cleaned up, and cleanup can't be
+   used as a general LLM.
+2. **Cleanup body whitelist.** Forward only `model`, `messages`, `temperature`, `max_tokens`
+   (clamped ≤ 4000), and `stream: false`. Drop everything else (`n`, `max_completion_tokens`, tools…).
+   Max 2 messages (system + user); system ≤ 24 KB, user ≤ 40 KB.
+3. **Per-user STT concurrency lease.** At most 2 in-flight STT requests per user (D1 `stt_leases`
+   with a 6-min expiry, released in `finally`). Over the cap: `429 { error: "too_many_requests" }`.
+4. **Upstream errors never look like Ray errors.** The Worker maps any upstream 401/402/403/429 (and
+   5xx/timeouts) to `502 { error: "upstream_error" }` (or `503 { error: "upstream_busy" }` for upstream 429).
+   The desktop classifies Ray errors **by JSON `error` code** (`unauthorized`, `quota_exceeded`, `fair_use`,
+   `too_many_requests`), not by status alone. Only `unauthorized` signs out; only `quota_exceeded` /
+   `fair_use` skip the batch fallback. `upstream_*` and `too_many_requests` follow the normal
+   fallback path.
+5. **Mid-dictation limit on live rollover.** If a later sync-live segment gets `quota_exceeded`/`fair_use`,
+   keep the segments already transcribed (return the partial text and paste it), then show the limit
+   message.
+6. **`/v1/stt/batch` input cap:** 12 MB (Content-Length check plus a streamed cap), streamed upload to
+   AssemblyAI, no `arrayBuffer()` of unbounded input.
+7. **Word counting:** prefer the length of AssemblyAI's `words` array when present; otherwise count
+   whitespace tokens, with each CJK/Hiragana/Katakana/Hangul character counted as one word.
+8. **Billing integrity:** only `CREEM_PRODUCT_PRO_MONTHLY` / `CREEM_PRODUCT_PRO_ANNUAL` grant Pro;
+   `refund.created` and `dispute.created` revoke entitlement immediately (status `revoked`, never
+   entitled); webhook idempotency is recorded **after** the state change is applied (same D1 batch);
+   no email-based user mapping (metadata.user_id, then creem_customer_id only); a missing
+   `CREEM_WEBHOOK_SECRET` fails closed; terminal statuses win `updated_at` ties.
+9. **`/api/me` additions:** `user.email` is never null (empty string if unknown). New field
+   `billing_issue: null | "past_due" | "unpaid" | "paused"` for a non-entitled subscription that still
+   exists and needs a payment-method fix. When `billing_issue` is set, both UIs show "Payment issue:
+   update your card" with the portal button instead of the upgrade CTA, and `/api/billing/checkout`
+   returns `409 { error: "billing_issue" }`.
+10. **Devices:** `POST /api/devices/revoke-all` (clerk auth) revokes every device token for the user;
+    the site's Account page has "Sign out all devices".
+11. **Hand-off consent:** `/desktop/sign-in` never auto-authorizes. Signed in, it shows "Continue as
+    <email>" (an explicit click calls authorize) plus "Use a different account" (Clerk sign-out, then
+    show `<SignIn>` again, keeping the params).
+12. **Clerk verification fails closed:** an invalid/empty `SITE_URL` is a 500 config error, never
+    an empty `authorizedParties`.
+13. **Site security headers:** `web/public/_headers` sets frame-ancestors none / X-Frame-Options DENY,
+    nosniff, Referrer-Policy, HSTS, and a CSP compatible with Clerk (its frontend API domain, img.clerk.com,
+    challenges.cloudflare.com for bot protection; check Clerk's CSP docs).
+14. **Copy honesty:** Pro is "Unlimited words" with "Fair use applies" (Terms explain fair use without a
+    number); don't say "No weekly reset". Privacy says Ray's *servers* never store audio or
+    transcripts, discloses that cleanup sends the transcript plus your dictionary terms and the
+    foreground app's name to AssemblyAI for processing, and says History is kept locally on your PC.
+    No absolute "never stored" claims that ignore local History.
+15. **Weekly reset display:** always "resets Monday 00:00 UTC" (or a UTC-formatted date), never a
+    local weekday. The desktop treats cached usage with `now >= resets_at` as stale (refresh before
+    blocking).
+16. **Billing success:** after `ray://billing/success`, the desktop polls `/api/me` (1 s, 2 s, 4 s, …, ~45 s
+    total) until `plan == "pro"`, showing "Activating Pro…". The site's `/account` refreshes on
+    focus/visibility and polls the same way when arriving from `/billing/success`.
