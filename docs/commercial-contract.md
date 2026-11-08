@@ -17,7 +17,7 @@ deviate, keep the deviation minimal and record it in your final report.
     1,000 words is roughly 8-10 minutes of speech, so these only catch silent or
     near-empty audio abuse. Never advertise them; over either cap STT returns the normal
     `quota_exceeded` / `fair_use` shapes.
-  - Pro price: **$8/month billed monthly**, or **$6/month billed annually ($72/year)**.
+  - Pro price: **$9/month billed monthly**, or **$6/month billed annually ($72/year)**.
 - Auth: **Clerk**, with **email** (code or password, whichever Clerk defaults to) and **Google**.
 - Payments: **Creem** (https://docs.creem.io). Two Creem products: Pro Monthly, Pro Annual.
 - Backend: **Cloudflare Workers + D1**, deployed together with the public landing page as
@@ -281,7 +281,7 @@ Cleanup words are **not** counted (STT already counted them).
   message ("Sign in to Ray to dictate") and opens the main window.
 - **Account** (new nav item or a top section of Settings): email, plan badge
   (Starter/Pro), a weekly usage meter for Starter ("412 of 1,000 words this week · resets
-  Monday"), upgrade buttons ("Upgrade to Pro: $8/mo" and "$6/mo billed yearly", which open
+  Monday"), upgrade buttons ("Upgrade to Pro: $9/mo" and "$6/mo billed yearly", which open
   checkout in the browser), "Manage billing" for Pro (portal), and "Sign out". Refresh `/api/me`
   on window focus, after each dictation, and when a `ray://billing/success` deep link
   arrives (Creem success_url can point to `{SITE_URL}/billing/success`, which bounces to

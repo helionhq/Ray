@@ -20,10 +20,10 @@ export const PLANS = {
     blurb: "For people who would rather talk than type.",
     monthly: {
       interval: "monthly" as const,
-      price: 8,
+      price: 9,
       period: "/month",
       billing: "Billed monthly",
-      total: 8,
+      total: 9,
     },
     annual: {
       interval: "annual" as const,
@@ -31,7 +31,7 @@ export const PLANS = {
       period: "/month",
       billing: "Billed $72 yearly",
       total: 72,
-      savings: "Save 25%",
+      savings: "Save 33%",
     },
   },
 } as const;

@@ -89,7 +89,7 @@ placeholder before deploying.
 | `CREEM_WEBHOOK_SECRET` | secret | Creem webhook signing secret (`whsec_…`). Missing/blank means every Creem webhook is rejected with 401. |
 | `CLERK_WEBHOOK_SECRET` | secret (required) | Svix signing secret for Clerk webhooks. Required for account deletion: when unset, `POST /api/webhooks/clerk` answers 503 and deleted accounts keep their PII, device access and Creem subscription. |
 | `CREEM_API_BASE` | var | `https://test-api.creem.io` or `https://api.creem.io` |
-| `CREEM_PRODUCT_PRO_MONTHLY` | var | Creem product id for Pro Monthly ($8/mo) |
+| `CREEM_PRODUCT_PRO_MONTHLY` | var | Creem product id for Pro Monthly ($9/mo) |
 | `CREEM_PRODUCT_PRO_ANNUAL` | var | Creem product id for Pro Annual ($72/yr) |
 | `STARTER_WEEKLY_WORDS` | var | Starter weekly allowance, default `1000` |
 | `FAIR_USE_WEEKLY_WORDS` | var | Hidden Pro fair-use cap, default `100000` |
@@ -162,7 +162,7 @@ acknowledged and ignored.
 ## Creem setup
 
 1. Create two recurring products in the Creem dashboard:
-   - **Pro Monthly** — $8/month
+   - **Pro Monthly** — $9/month
    - **Pro Annual** — $72/year ($6/month billed annually)
 2. Copy both product ids into `CREEM_PRODUCT_PRO_MONTHLY` and
    `CREEM_PRODUCT_PRO_ANNUAL`.
