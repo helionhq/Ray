@@ -42,14 +42,23 @@ pub fn run() {
             let store = Arc::new(store::Store::load(&app_data));
             app.manage(store.clone());
 
-            // Remove credentials for providers Ray no longer ships. Idempotent
-            // and error-tolerant so old installs start cleanly.
-            secrets::remove_retired_secrets();
+            // Credential Manager I/O can block (or prompt); keep both the
+            // retired-secret cleanup and the session read off the setup
+            // thread. The UI shows its loading screen until `account-changed`
+            // arrives, so a signed-in user never sees a signed-out flash.
+            tauri::async_runtime::spawn_blocking(secrets::remove_retired_secrets);
 
-            let auth = Arc::new(Auth::load());
+            let auth = Arc::new(Auth::new(Some(app_data.join("signed-out"))));
             app.manage(auth.clone());
+            let auth_loader = auth.clone();
+            let auth_handle = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                auth_loader.load_stored_token();
+                let _ = auth_handle.emit("account-changed", auth_loader.state());
+            });
 
-            let dictation = Dictation::new(app.handle().clone(), store, auth, runtime_config);
+            let dictation =
+                Dictation::new(app.handle().clone(), store, auth.clone(), runtime_config);
             app.manage(dictation.clone());
 
             // Installed builds register `ray://` at install time from
@@ -255,7 +264,10 @@ fn handle_deep_links(app: &tauri::AppHandle, urls: Vec<url::Url>) {
         let http = http.clone();
         let api_base = api_base.clone();
         tauri::async_runtime::spawn(async move {
-            match auth::handle_deep_link(&auth, &http, &api_base, &raw).await {
+            // The stored session is read off the setup thread; a billing
+            // deep link from a cold start must wait for it.
+            auth.wait_loaded(std::time::Duration::from_secs(3)).await;
+            match auth::handle_deep_link(&app, &auth, &http, &api_base, &raw).await {
                 Ok(auth::DeepLinkOutcome::Changed(state)) => {
                     let _ = app.emit("account-changed", *state);
                     show_main(&app);

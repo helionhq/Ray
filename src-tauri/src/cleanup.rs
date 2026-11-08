@@ -3,9 +3,10 @@
 //! `POST {api}/v1/cleanup/chat/completions` is OpenAI-compatible; the Worker
 //! proxies it to the AssemblyAI LLM gateway with the server-side key. Models
 //! are tried in the order in `pipeline.json`; a second entry keeps the hedged
-//! fallback behavior. If every model fails, the raw transcript is used so
-//! dictation never silently drops the user's words. Quota and auth failures
-//! are the exception: they are returned as a typed error and the session stops.
+//! fallback behavior. If every model fails — including a 402/429/403 from the
+//! cleanup proxy — the raw transcript is used so dictation never silently
+//! drops the user's words. Only a Ray `unauthorized` is fatal; the pipeline
+//! still pastes the raw transcript before asking the user to sign in again.
 //!
 //! Structured is the only cleanup mode, so its guard is the only answer guard.
 
@@ -23,8 +24,8 @@ pub struct CleanupResult {
     pub text: String,
     pub provider: Option<String>,
     pub note: Option<String>,
-    /// A fatal quota/auth error from the Ray API. When present the pipeline
-    /// must not paste or retry; it ends the session with this message.
+    /// An auth (session) error from the Ray API. The pipeline still keeps and
+    /// pastes the raw transcript; it signs out and shows this message.
     pub fatal: Option<ApiError>,
 }
 
@@ -194,7 +195,7 @@ pub async fn cleanup(
             fatal: None,
         },
         Err(failure) if failure.fatal.is_some() => {
-            CleanupResult::fatal(failure.fatal.expect("checked above"))
+            CleanupResult::fatal(*failure.fatal.expect("checked above"))
         }
         Err(failure) => {
             let mut notes = Vec::new();
@@ -246,7 +247,9 @@ enum CallError {
 
 #[derive(Debug)]
 struct RunFailure {
-    fatal: Option<ApiError>,
+    /// Boxed so this rarely-built error type stays small in the hot
+    /// `Result` shared by every provider future.
+    fatal: Option<Box<ApiError>>,
     primary: Option<String>,
     fallback: Option<String>,
 }
@@ -254,7 +257,7 @@ struct RunFailure {
 impl RunFailure {
     fn fatal(error: ApiError) -> Self {
         Self {
-            fatal: Some(error),
+            fatal: Some(Box::new(error)),
             primary: None,
             fallback: None,
         }
@@ -413,10 +416,15 @@ async fn call_provider(
             Err(_) => return Err(CallError::Retry("timed out".into())),
         };
         if !status.is_success() {
-            // Quota/auth failures must not be retried or hedged, not even
-            // under a transient-looking 429.
+            // A 402/429 from the cleanup proxy must never end the dictation:
+            // the transcript already exists and is about to be pasted raw.
+            // Only a Ray `unauthorized` (the session is gone) is fatal; the
+            // pipeline still pastes the raw transcript before prompting.
             if let Some(error) = ApiError::from_response(status.as_u16(), &text) {
-                return Err(CallError::Fatal(error));
+                if error.kind == api::ApiErrorKind::Unauthorized {
+                    return Err(CallError::Fatal(error));
+                }
+                return Err(CallError::Retry(error.to_string()));
             }
             let message = api::message_from_body(&text);
             let retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
@@ -998,7 +1006,9 @@ mod tests {
         let fallback_polled = Arc::new(AtomicBool::new(false));
         let flag = fallback_polled.clone();
         let primary = async {
-            Err::<String, CallError>(CallError::Fatal(ApiError::from_response(402, "").unwrap()))
+            Err::<String, CallError>(CallError::Fatal(
+                ApiError::from_response(401, r#"{"error":"unauthorized"}"#).unwrap(),
+            ))
         };
         let fallback = async move {
             flag.store(true, Ordering::SeqCst);
@@ -1010,10 +1020,96 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             failure.fatal.as_ref().map(|error| error.kind),
-            Some(api::ApiErrorKind::QuotaExceeded)
+            Some(api::ApiErrorKind::Unauthorized)
         );
         assert!(!fallback_polled.load(Ordering::SeqCst));
         assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// A one-shot HTTP server for the cleanup failure tests.
+    fn serve_once(status_line: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..headers_end]).to_ascii_lowercase();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= headers_end + 4 + content_length {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn quota_and_grant_failures_still_return_the_raw_transcript() {
+        // Decision 1/5: a cleanup 402/429/403 must never lose a transcript.
+        for (status, body) in [
+            (
+                "402 Payment Required",
+                r#"{"error":"quota_exceeded","message":"Weekly limit reached"}"#,
+            ),
+            (
+                "429 Too Many Requests",
+                r#"{"error":"fair_use","message":"Fair-use limit reached"}"#,
+            ),
+            ("403 Forbidden", r#"{"error":"no_cleanup_grant"}"#),
+        ] {
+            let base = serve_once(status, body);
+            let config = CleanupConfig {
+                retries: 0,
+                timeout_ms: 2_000,
+                ..CleanupConfig::default()
+            };
+            let result = cleanup(
+                &reqwest::Client::new(),
+                &base,
+                "ray_test",
+                &config,
+                CleanupInput {
+                    template: "Rewrite the transcript.",
+                    transcript: "Keep these words.",
+                    dictionary: &[],
+                    known_names: &[],
+                    app_name: "Notepad",
+                },
+            )
+            .await;
+            assert!(result.fatal.is_none(), "{status} must not be fatal");
+            assert_eq!(result.text, "Keep these words.", "{status}");
+            assert!(
+                result
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("raw transcript")),
+                "{status} should explain the raw fallback"
+            );
+        }
     }
 
     #[tokio::test]

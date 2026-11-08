@@ -6,6 +6,7 @@ interface Props {
   snapshot: Snapshot;
   refresh: () => Promise<void>;
   notify: (message: string) => void;
+  activatingPro: boolean;
 }
 
 const numberFormat = new Intl.NumberFormat();
@@ -14,17 +15,25 @@ const dateFormat = new Intl.DateTimeFormat(undefined, {
   day: "numeric",
   year: "numeric",
 });
-const weekdayFormat = new Intl.DateTimeFormat(undefined, { weekday: "long" });
+// Decision 15: the weekly reset is always shown in UTC, never as a local
+// weekday (which can read as the wrong day near midnight).
+const resetFormat = new Intl.DateTimeFormat("en-US", {
+  weekday: "long",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+  timeZone: "UTC",
+});
 
 function resetLabel(account: Account): string {
   const iso = account.usage.resets_at;
   if (iso) {
     const date = new Date(iso);
     if (!Number.isNaN(date.getTime())) {
-      return `resets ${weekdayFormat.format(date)}`;
+      return `resets ${resetFormat.format(date)} UTC`;
     }
   }
-  return "resets Monday";
+  return "resets Monday 00:00 UTC";
 }
 
 function dateLabel(iso: string | null): string | null {
@@ -39,6 +48,14 @@ function planLabel(account: Account): "Starter" | "Pro" {
 
 function proNote(account: Account): string {
   const renews = dateLabel(account.current_period_end);
+  // A trial is not a renewal, and a canceled subscription that is still
+  // within its paid period ends rather than renews.
+  if (account.status === "trialing") {
+    return renews ? `Trial ends ${renews}` : "Trial active";
+  }
+  if (account.status === "canceled") {
+    return renews ? `Ends on ${renews}` : "Ended";
+  }
   if (account.cancel_at_period_end) {
     return renews ? `Cancels on ${renews}` : "Cancels at the end of this period";
   }
@@ -47,14 +64,19 @@ function proNote(account: Account): string {
     return `Renews on ${renews} · billed every ${cadence}`;
   }
   if (account.status === "past_due") return "Payment past due";
-  if (account.status === "canceled") return "Canceled";
   return "Active";
 }
 
-export function AccountPage({ snapshot, refresh, notify }: Props) {
+export function AccountPage({
+  snapshot,
+  refresh,
+  notify,
+  activatingPro,
+}: Props) {
   const [account, setAccount] = useState<Account | null>(snapshot.auth.account);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(
     async (reportError: boolean) => {
@@ -101,6 +123,15 @@ export function AccountPage({ snapshot, refresh, notify }: Props) {
       notify(String(caught));
     } finally {
       setBusy(null);
+    }
+  }
+
+  async function refreshNow() {
+    setRefreshing(true);
+    try {
+      await load(true);
+    } finally {
+      setRefreshing(false);
     }
   }
 
@@ -157,6 +188,14 @@ export function AccountPage({ snapshot, refresh, notify }: Props) {
           <h1>Account</h1>
           <p className="sub">Plan, usage, and billing.</p>
         </div>
+        <button
+          type="button"
+          className="btn"
+          disabled={refreshing || busy !== null}
+          onClick={() => void refreshNow()}
+        >
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </button>
       </header>
 
       <div className="group-label">Profile</div>
@@ -193,7 +232,35 @@ export function AccountPage({ snapshot, refresh, notify }: Props) {
 
       <div className="group-label">Plan</div>
       <div className="card">
-        {starter ? (
+        {activatingPro && (
+          <div className="row" role="status">
+            <div className="row-copy">
+              <div className="label">Activating Pro…</div>
+              <div className="help">
+                Confirming your subscription with the billing provider.
+              </div>
+            </div>
+          </div>
+        )}
+        {account.billing_issue ? (
+          <div className="row">
+            <div className="row-copy">
+              <div className="label">Payment issue: update your card</div>
+              <div className="help">
+                Ray couldn't charge your payment method. Update it in the
+                billing portal to keep dictating.
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={busy !== null}
+              onClick={() => void manageBilling()}
+            >
+              {busy === "portal" ? "Opening…" : "Manage billing"}
+            </button>
+          </div>
+        ) : starter ? (
           <>
             <div className="row account-usage">
               <div className="row-copy">
@@ -209,7 +276,9 @@ export function AccountPage({ snapshot, refresh, notify }: Props) {
                   aria-label="Weekly words used"
                   aria-valuemin={0}
                   aria-valuemax={limit ?? 0}
-                  aria-valuenow={used}
+                  // aria-valuenow must never exceed its max, even when the
+                  // server reports usage above the limit.
+                  aria-valuenow={Math.min(used, limit ?? used)}
                 >
                   <span style={{ width: `${percent}%` }} />
                 </div>
@@ -219,7 +288,7 @@ export function AccountPage({ snapshot, refresh, notify }: Props) {
               <div className="row-copy">
                 <div className="label">Upgrade to Pro</div>
                 <div className="help">
-                  Unlimited words, same privacy. Cancel anytime.
+                  Unlimited words. Fair use applies. Cancel anytime.
                 </div>
               </div>
               <div className="plan-actions">

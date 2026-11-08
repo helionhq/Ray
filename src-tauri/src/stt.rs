@@ -31,11 +31,41 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// A failed live request, plus any segment transcripts that finished before
+/// the failure. A quota error on a later rollover segment must never discard
+/// the segments the user already spoke (review decision 5).
+#[derive(Debug)]
+pub struct LiveError {
+    pub error: ApiError,
+    pub partial: Option<String>,
+}
+
+impl LiveError {
+    fn new(error: ApiError, transcripts: &[String]) -> Self {
+        Self {
+            error,
+            partial: partial_text(transcripts),
+        }
+    }
+
+    pub fn is_fatal(&self) -> bool {
+        self.error.is_fatal()
+    }
+}
+
+impl std::fmt::Display for LiveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for LiveError {}
+
 /// One live transcription session (Sync live is the only supported protocol).
 pub struct LiveSession {
     pub audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     stop_tx: watch::Sender<bool>,
-    task: JoinHandle<Result<String, ApiError>>,
+    task: JoinHandle<Result<String, LiveError>>,
 }
 
 impl LiveSession {
@@ -43,20 +73,26 @@ impl LiveSession {
         self.audio_tx.clone()
     }
 
-    pub async fn finish(self, timeout: Duration) -> Result<String, ApiError> {
+    pub async fn finish(self, timeout: Duration) -> Result<String, LiveError> {
         let _ = self.stop_tx.send(true);
         let mut task = self.task;
         tokio::select! {
             result = &mut task => match result {
                 Ok(result) => result,
-                Err(error) => Err(ApiError::other(format!("Sync live task failed: {error}"))),
+                Err(error) => Err(LiveError {
+                    error: ApiError::other(format!("Sync live task failed: {error}")),
+                    partial: None,
+                }),
             },
             _ = tokio::time::sleep(timeout) => {
                 // Do not leave a stalled upload running: it would hold the
                 // connection and its 300 s request timeout while the batch
                 // fallback already has the audio.
                 task.abort();
-                Err(ApiError::other("Sync live did not finish in time"))
+                Err(LiveError {
+                    error: ApiError::other("Sync live did not finish in time"),
+                    partial: None,
+                })
             }
         }
     }
@@ -96,7 +132,7 @@ async fn run_sync_live(
     mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stop_rx: watch::Receiver<bool>,
     http: reqwest::Client,
-) -> Result<String, ApiError> {
+) -> Result<String, LiveError> {
     // Stay a little under the endpoint's 120 s audio cap per request.
     let segment_seconds = config.sync_live.max_audio_seconds.saturating_sub(2).max(1);
     let max_bytes = (segment_seconds * config.sample_rate as u64 * 2) as usize;
@@ -111,16 +147,19 @@ async fn run_sync_live(
     let mut audio_tail: Vec<u8> = Vec::new();
     loop {
         let boundary = boundary();
-        let config_json = sync_config(config, keyterms)?;
+        let config_json =
+            sync_config(config, keyterms).map_err(|error| LiveError::new(error, &transcripts))?;
         let head = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"config\"\r\nContent-Type: application/json\r\n\r\n{config_json}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"audio.pcm\"\r\nContent-Type: audio/pcm\r\n\r\n"
         );
         let tail = format!("\r\n--{boundary}--\r\n");
         let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, io::Error>>(128);
-        body_tx
-            .send(Ok(Bytes::from(head)))
-            .await
-            .map_err(|_| ApiError::other("Could not start the upload"))?;
+        if body_tx.send(Ok(Bytes::from(head))).await.is_err() {
+            return Err(LiveError::new(
+                ApiError::other("Could not start the upload"),
+                &transcripts,
+            ));
+        }
         let mut segment_stop = stop_rx.clone();
         let request = http
             .post(&endpoint)
@@ -191,17 +230,37 @@ async fn run_sync_live(
         drop(body_tx);
         let response = send_task
             .await
-            .map_err(|error| ApiError::other(format!("Sync live task failed: {error}")))?
-            .map_err(|error| ApiError::other(format!("Sync live request failed: {error}")))?;
+            .map_err(|error| {
+                LiveError::new(
+                    ApiError::other(format!("Sync live task failed: {error}")),
+                    &transcripts,
+                )
+            })?
+            .map_err(|error| {
+                LiveError::new(
+                    ApiError::other(format!("Sync live request failed: {error}")),
+                    &transcripts,
+                )
+            })?;
         let status = response.status();
         let text = response.text().await.map_err(|error| {
-            ApiError::other(format!("Could not read the Sync live response: {error}"))
+            LiveError::new(
+                ApiError::other(format!("Could not read the Sync live response: {error}")),
+                &transcripts,
+            )
         })?;
         if !status.is_success() {
-            return Err(response_error("Sync live", status.as_u16(), &text));
+            return Err(LiveError::new(
+                response_error("Sync live", status.as_u16(), &text),
+                &transcripts,
+            ));
         }
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|error| ApiError::other(format!("Ray sent invalid JSON: {error}")))?;
+        let value: Value = serde_json::from_str(&text).map_err(|error| {
+            LiveError::new(
+                ApiError::other(format!("Ray sent invalid JSON: {error}")),
+                &transcripts,
+            )
+        })?;
         let transcript = value
             .get("text")
             .and_then(Value::as_str)
@@ -225,10 +284,24 @@ async fn run_sync_live(
         join_segment_transcripts(&acc, next)
     });
     if text.is_empty() {
-        Err(ApiError::other("No speech was detected"))
+        Err(LiveError {
+            error: ApiError::other("No speech was detected"),
+            partial: None,
+        })
     } else {
         Ok(text)
     }
+}
+
+/// Join every completed live segment, returning `None` for silence. Kept
+/// separate from `run_sync_live` so the "keep what was transcribed" rule can
+/// be unit-tested without a network.
+fn partial_text(transcripts: &[String]) -> Option<String> {
+    let text = transcripts.iter().fold(String::new(), |acc, next| {
+        join_segment_transcripts(&acc, next)
+    });
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Keep only the last `limit` bytes of audio sent to a segment, for the
@@ -415,11 +488,27 @@ fn keyterms_header(terms: &[String]) -> Option<String> {
 // Batch fallbacks
 // ---------------------------------------------------------------------------
 
-/// The longest `transcribe_wav` can legitimately take. The Worker enforces its
-/// own 45 s poll deadline for the v2 fallback, so one client deadline covers
-/// both requests.
+/// Worst case for the Worker-side v2 fallback: 60 s to upload the WAV, 20 s
+/// to create the transcript, then up to 45 s of polling.
+pub const RAY_BATCH_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+pub const RAY_BATCH_CREATE_TIMEOUT: Duration = Duration::from_secs(20);
+pub const RAY_BATCH_POLL_TIMEOUT: Duration = Duration::from_secs(45);
+/// Slack on top of both sequential requests for scheduling and response reads.
+pub const BATCH_BUDGET_MARGIN: Duration = Duration::from_secs(15);
+/// The request timeout for `/v1/stt/batch` itself. It must cover the Worker's
+/// whole upload → create → poll sequence, not just one HTTP hop.
+pub const RAY_BATCH_REQUEST_MARGIN: Duration = Duration::from_secs(5);
+
+pub fn ray_batch_timeout() -> Duration {
+    RAY_BATCH_UPLOAD_TIMEOUT + RAY_BATCH_CREATE_TIMEOUT + RAY_BATCH_POLL_TIMEOUT
+}
+
+/// The longest `transcribe_wav` can legitimately take: the Sync batch timeout
+/// plus the Worker's whole v2 fallback worst case, plus one margin. The two
+/// fallbacks run sequentially, so a budget that only covered one of them would
+/// abandon the second request while it was still healthy.
 pub fn batch_time_budget(config: &SttConfig) -> Duration {
-    Duration::from_millis(config.batch.timeout_ms)
+    Duration::from_millis(config.batch.timeout_ms) + ray_batch_timeout() + BATCH_BUDGET_MARGIN
 }
 
 /// Sync batch first (fast, single multipart request), then the Worker-side v2
@@ -509,9 +598,11 @@ async fn transcribe_ray_batch(
     if !config.batch.speech_models.is_empty() {
         request = request.header("X-Ray-Speech-Models", config.batch.speech_models.join(","));
     }
+    // The Worker uploads, creates, and polls before answering; a 45 s client
+    // timeout would cut off a healthy v2 transcription mid-poll.
     let response = request
         .body(wav)
-        .timeout(Duration::from_millis(config.batch.timeout_ms))
+        .timeout(ray_batch_timeout() + RAY_BATCH_REQUEST_MARGIN)
         .send()
         .await
         .map_err(|error| ApiError::other(format!("Batch request failed: {error}")))?;
@@ -675,8 +766,66 @@ mod tests {
         assert!(fair.is_fatal());
         let auth = response_error("Sync live", 401, r#"{"error":"unauthorized"}"#);
         assert!(auth.is_fatal());
+        // Upstream failures are mapped by the Worker to these codes and must
+        // keep their normal fallback path.
+        for (status, body) in [
+            (502, r#"{"error":"upstream_error"}"#),
+            (503, r#"{"error":"upstream_busy"}"#),
+            (429, r#"{"error":"too_many_requests"}"#),
+            (403, r#"{"error":"no_cleanup_grant"}"#),
+            (401, "not a Ray error"),
+        ] {
+            let error = response_error("Sync live", status, body);
+            assert!(!error.is_fatal(), "{status} {body} must not be fatal");
+        }
         let server = response_error("Sync live", 500, "boom");
         assert!(!server.is_fatal());
         assert!(server.to_string().contains("500"));
+    }
+
+    #[test]
+    fn a_failed_rollover_segment_keeps_the_transcribed_segments() {
+        // Decision 5: a quota error on a later live segment returns the text
+        // that already exists instead of discarding the dictation.
+        let transcripts = vec![
+            "We should ship the update.".to_string(),
+            "ship the update. Then tell Arham.".to_string(),
+        ];
+        let failure = LiveError::new(
+            response_error("Sync live", 402, r#"{"error":"quota_exceeded"}"#),
+            &transcripts,
+        );
+        assert!(failure.is_fatal());
+        assert_eq!(
+            failure.partial.as_deref(),
+            Some("We should ship the update. Then tell Arham.")
+        );
+        // An upstream error also carries the partial text, but remains
+        // non-fatal so the batch fallback is still tried first.
+        let upstream = LiveError::new(
+            response_error("Sync live", 502, r#"{"error":"upstream_error"}"#),
+            &transcripts,
+        );
+        assert!(!upstream.is_fatal());
+        assert!(upstream.partial.is_some());
+        // No completed segment means there is nothing to preserve.
+        assert_eq!(LiveError::new(ApiError::other("boom"), &[]).partial, None);
+    }
+
+    #[test]
+    fn batch_budget_covers_both_sequential_fallbacks() {
+        let config = SttConfig::default();
+        let expected = Duration::from_millis(config.batch.timeout_ms)
+            + Duration::from_secs(60 + 20 + 45)
+            + BATCH_BUDGET_MARGIN;
+        assert_eq!(batch_time_budget(&config), expected);
+        // The budget must exceed Sync batch plus the entire v2 worst case.
+        assert!(
+            batch_time_budget(&config)
+                > Duration::from_millis(config.batch.timeout_ms) + ray_batch_timeout()
+        );
+        // `/v1/stt/batch`'s own request timeout matches the Worker worst case.
+        assert_eq!(ray_batch_timeout(), Duration::from_secs(125));
+        assert!(ray_batch_timeout() + RAY_BATCH_REQUEST_MARGIN > ray_batch_timeout());
     }
 }
