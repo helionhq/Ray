@@ -1,42 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { SignIn, useAuth } from "@clerk/react";
+import { SignIn, useAuth, useUser } from "@clerk/react";
 import { AuthShell } from "../components/AuthShell";
 import { AuthNotConfigured } from "../components/AuthNotConfigured";
-import { AlertIcon, ArrowRightIcon, CheckIcon, DownloadIcon } from "../components/Icons";
+import {
+  AlertIcon,
+  ArrowRightIcon,
+  CheckIcon,
+  DownloadIcon,
+} from "../components/Icons";
 import {
   ApiError,
   authorizeDesktop,
   isRayAuthRedirect,
   type DesktopAuthorizeResponse,
 } from "../lib/api";
+import {
+  desktopSignInPath,
+  validDesktopParams,
+  type DesktopParams,
+} from "../lib/auth-redirect";
 import { clerkEnabled } from "../lib/clerk";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { Link, useLocation } from "../lib/router";
 import { DOWNLOAD_URL } from "../content";
 
 const STORAGE_KEY = "ray.desktop.authorize";
-const BASE64URL_43 = /^[A-Za-z0-9_-]{43}$/;
-
-interface DesktopParams {
-  state: string;
-  challenge: string;
-}
-
 const PARAMS_MAX_AGE_MS = 10 * 60 * 1000;
-
-/** One network call per state/challenge, even through StrictMode remounts. */
-const authorizeCache = new Map<string, Promise<DesktopAuthorizeResponse>>();
-
-function isBase64Url(value: string | null): value is string {
-  return typeof value === "string" && BASE64URL_43.test(value);
-}
-
-function validParams(state: string | null, challenge: string | null) {
-  if (isBase64Url(state) && isBase64Url(challenge)) {
-    return { state, challenge } satisfies DesktopParams;
-  }
-  return null;
-}
 
 function readStoredParams(): DesktopParams | null {
   try {
@@ -51,7 +40,7 @@ function readStoredParams(): DesktopParams | null {
     ) {
       return null;
     }
-    return validParams(parsed.state ?? null, parsed.challenge ?? null);
+    return validDesktopParams(parsed.state ?? null, parsed.challenge ?? null);
   } catch {
     return null;
   }
@@ -60,50 +49,64 @@ function readStoredParams(): DesktopParams | null {
 function resolveParams(search: string): DesktopParams | null {
   const query = new URLSearchParams(search);
   return (
-    validParams(query.get("state"), query.get("challenge")) ??
+    validDesktopParams(query.get("state"), query.get("challenge")) ??
     readStoredParams()
   );
 }
 
-function authorizeOnce(
-  params: DesktopParams,
-  getToken: () => Promise<string | null>,
-) {
-  const key = `${params.state}.${params.challenge}`;
-  const existing = authorizeCache.get(key);
-  if (existing) return existing;
-
-  const request = (async () => {
-    const token = await getToken();
-    if (!token) {
-      throw new ApiError(
-        401,
-        "unauthorized",
-        "Your session expired. Start sign-in again from the Ray app.",
-      );
-    }
-    const result = await authorizeDesktop(token, params.state, params.challenge);
-    if (!isRayAuthRedirect(result.redirect)) {
-      throw new ApiError(
-        500,
-        "invalid_response",
-        "Ray returned an unexpected sign-in redirect.",
-      );
-    }
-    return result;
-  })();
-
-  authorizeCache.set(key, request);
-  request.catch(() => {
-    // Let a deliberate retry make a fresh call; the initial mount still
-    // shares one promise between StrictMode's two effect runs.
-    authorizeCache.delete(key);
-  });
-  return request;
+function ConsentView({
+  email,
+  signingOut,
+  onContinue,
+  onUseDifferentAccount,
+}: {
+  email: string;
+  signingOut: boolean;
+  onContinue: () => void;
+  onUseDifferentAccount: () => void;
+}) {
+  return (
+    <AuthShell>
+      <div className="auth-card auth-message">
+        <span className="auth-message-icon is-ok" aria-hidden="true">
+          <CheckIcon size={20} />
+        </span>
+        <h1>Continue as {email}</h1>
+        <p>
+          Ray for Windows is waiting to connect to this account. Only continue
+          if you started sign-in from the Ray app on this PC.
+        </p>
+        <div className="auth-actions">
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={onContinue}
+            disabled={signingOut}
+          >
+            Continue
+            <ArrowRightIcon size={15} />
+          </button>
+        </div>
+        <button
+          type="button"
+          className="btn btn-ghost auth-switch-account"
+          onClick={onUseDifferentAccount}
+          disabled={signingOut}
+        >
+          {signingOut ? "Signing out…" : "Use a different account"}
+        </button>
+        <p className="auth-message-hint">
+          Ray never sees your password. Choosing a different account signs you
+          out here and brings back the sign-in form.
+        </p>
+      </div>
+    </AuthShell>
+  );
 }
 
 function DesktopSignInInner() {
-  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { isLoaded, isSignedIn, getToken, signOut } = useAuth();
+  const { user } = useUser();
   const { search } = useLocation();
   const params = useMemo(() => resolveParams(search), [search]);
   const [status, setStatus] = useState<
@@ -113,7 +116,24 @@ function DesktopSignInInner() {
   const [error, setError] = useState<{ message: string; status: number } | null>(
     null,
   );
+  const [signingOut, setSigningOut] = useState(false);
   const opened = useRef<string | null>(null);
+  // One authorize request per click, even if the button gets a rapid second
+  // click before React re-renders the disabled state.
+  const inFlight = useRef<Promise<DesktopAuthorizeResponse> | null>(null);
+
+  const desktopUrl = useMemo(
+    () =>
+      params
+        ? `${window.location.origin}${desktopSignInPath(params)}`
+        : `${window.location.origin}/desktop/sign-in`,
+    [params],
+  );
+
+  const email =
+    user?.primaryEmailAddress?.emailAddress ??
+    user?.emailAddresses?.[0]?.emailAddress ??
+    "your Ray account";
 
   // Keep the hand-off parameters for the rest of the browser session. Clerk's
   // own flow can move the hash around; the query is what Ray needs back.
@@ -129,10 +149,57 @@ function DesktopSignInInner() {
     }
   }, [params]);
 
+  // Hand off once. The custom protocol may show a browser prompt instead of
+  // navigating, which is why the Open Ray button stays on screen.
   useEffect(() => {
-    if (!params || !isLoaded || !isSignedIn || status !== "idle") return;
+    if (status !== "success" || !redirect) return;
+    if (opened.current === redirect) return;
+    opened.current = redirect;
+    try {
+      window.location.href = redirect;
+    } catch {
+      // Custom schemes can be blocked; the button remains for a user gesture.
+    }
+  }, [status, redirect]);
+
+  /**
+   * Consent is always explicit: `/desktop/sign-in` never authorizes just
+   * because someone is signed in. Without a click, a phishing page could
+   * silently bind a victim's account to an attacker's Ray install.
+   */
+  function startAuthorize() {
+    if (!params || inFlight.current) return;
+
+    setError(null);
+    setRedirect(null);
     setStatus("working");
-    authorizeOnce(params, getToken)
+
+    const request = (async () => {
+      const token = await getToken();
+      if (!token) {
+        throw new ApiError(
+          401,
+          "unauthorized",
+          "Your session expired. Start sign-in again from the Ray app.",
+        );
+      }
+      const result = await authorizeDesktop(
+        token,
+        params.state,
+        params.challenge,
+      );
+      if (!isRayAuthRedirect(result.redirect)) {
+        throw new ApiError(
+          500,
+          "invalid_response",
+          "Ray returned an unexpected sign-in redirect.",
+        );
+      }
+      return result;
+    })();
+
+    inFlight.current = request;
+    request
       .then((result) => {
         setRedirect(result.redirect);
         setStatus("success");
@@ -146,23 +213,28 @@ function DesktopSignInInner() {
           status: caught instanceof ApiError ? caught.status : 0,
         });
         setStatus("error");
+      })
+      .finally(() => {
+        inFlight.current = null;
       });
-    // The shared promise means this effect can safely run twice under
-    // StrictMode; both callbacks settle the same request.
-  }, [params, isLoaded, isSignedIn, getToken, status]);
+  }
 
-  // Hand off once. The custom protocol may show a browser prompt instead of
-  // navigating, which is why the Open Ray button stays on screen.
-  useEffect(() => {
-    if (status !== "success" || !redirect) return;
-    if (opened.current === redirect) return;
-    opened.current = redirect;
+  /** Sign out here, then show Clerk's sign-in form again with the same params. */
+  async function useDifferentAccount() {
+    if (!params || signingOut) return;
+    setSigningOut(true);
+    setError(null);
+    setRedirect(null);
+    setStatus("idle");
     try {
-      window.location.href = redirect;
+      // Keep state/challenge in the URL through the sign-out redirect.
+      await signOut({ redirectUrl: desktopUrl });
     } catch {
-      // Custom schemes can be blocked; the button remains for a user gesture.
+      window.location.assign(desktopUrl);
+    } finally {
+      setSigningOut(false);
     }
-  }, [status, redirect]);
+  }
 
   if (!params) {
     return (
@@ -203,12 +275,14 @@ function DesktopSignInInner() {
   }
 
   if (!isSignedIn) {
-    const desktopUrl = `${window.location.origin}/desktop/sign-in?state=${encodeURIComponent(
+    // Carry state/challenge both inside Clerk's redirect URL and directly on
+    // the sign-up URL: an email-verification link can open in a fresh tab
+    // where sessionStorage is empty.
+    const signUpUrl = `${window.location.origin}/sign-up?state=${encodeURIComponent(
       params.state,
-    )}&challenge=${encodeURIComponent(params.challenge)}`;
-    const signUpUrl = `${window.location.origin}/sign-up?redirect_url=${encodeURIComponent(
-      desktopUrl,
-    )}`;
+    )}&challenge=${encodeURIComponent(
+      params.challenge,
+    )}&redirect_url=${encodeURIComponent(desktopUrl)}`;
 
     return (
       <AuthShell>
@@ -228,6 +302,7 @@ function DesktopSignInInner() {
               fallbackRedirectUrl={desktopUrl}
               signUpUrl={signUpUrl}
               signUpForceRedirectUrl={desktopUrl}
+              signUpFallbackRedirectUrl={desktopUrl}
             />
           </div>
           <p className="auth-hint">
@@ -242,10 +317,7 @@ function DesktopSignInInner() {
     return (
       <AuthShell>
         <div className="auth-card auth-message" role="status">
-          <span
-            className="auth-message-icon is-ok"
-            aria-hidden="true"
-          >
+          <span className="auth-message-icon is-ok" aria-hidden="true">
             <CheckIcon size={20} />
           </span>
           <h1>You&rsquo;re signed in. Return to Ray.</h1>
@@ -268,8 +340,24 @@ function DesktopSignInInner() {
     );
   }
 
+  if (status === "working") {
+    return (
+      <AuthShell>
+        <div className="auth-card auth-message" role="status">
+          <span className="spinner" aria-hidden="true" />
+          <h1>Finishing sign-in…</h1>
+          <p>
+            Holding the browser open while we hand your session back to Ray.
+          </p>
+        </div>
+      </AuthShell>
+    );
+  }
+
   if (status === "error" && error) {
-    const canRetry = error.status === 0 || error.status >= 500;
+    const canRetry =
+      error.status === 0 || error.status === 401 || error.status === 429 ||
+      error.status >= 500;
     return (
       <AuthShell>
         <div className="auth-card auth-message" role="alert">
@@ -295,6 +383,14 @@ function DesktopSignInInner() {
                 Try again
               </button>
             ) : null}
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => void useDifferentAccount()}
+              disabled={signingOut}
+            >
+              {signingOut ? "Signing out…" : "Use a different account"}
+            </button>
             <Link className="btn btn-secondary" to="/">
               Back to the site
             </Link>
@@ -305,18 +401,22 @@ function DesktopSignInInner() {
   }
 
   return (
-    <AuthShell>
-      <div className="auth-card auth-message" role="status">
-        <span className="spinner" aria-hidden="true" />
-        <h1>Finishing sign-in…</h1>
-        <p>Holding the browser open while we hand your session back to Ray.</p>
-      </div>
-    </AuthShell>
+    <ConsentView
+      email={email}
+      signingOut={signingOut}
+      onContinue={startAuthorize}
+      onUseDifferentAccount={() => void useDifferentAccount()}
+    />
   );
 }
 
 export function DesktopSignInPage() {
-  usePageTitle("Connect Ray");
+  usePageMeta({
+    title: "Desktop sign-in",
+    description: "Connect Ray for Windows to your Ray account.",
+    path: "/desktop/sign-in",
+    noindex: true,
+  });
   if (!clerkEnabled) return <AuthNotConfigured />;
   return <DesktopSignInInner />;
 }

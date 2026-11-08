@@ -6,11 +6,15 @@ import {
   REPOSITORY_URL,
 } from "../content";
 import { formatNumber } from "../lib/format";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { Link } from "../lib/router";
 
 export function TermsPage() {
-  usePageTitle("Terms");
+  usePageMeta({
+    title: "Terms",
+    description: "The terms that govern your use of Ray, its plans, and billing.",
+    path: "/terms",
+  });
 
   return (
     <LegalPage title="Terms of service" updated="November 8, 2026">
@@ -47,9 +51,9 @@ export function TermsPage() {
       <h2>Plans, billing, and cancellation</h2>
       <p>
         <strong>{PLANS.starter.name}</strong> is free and includes{" "}
-        {formatNumber(PLANS.starter.weeklyWords)} words per week, resetting every{" "}
-        {PLANS.starter.resetDay} at {PLANS.starter.resetTime}. A dictation that
-        crosses the limit is allowed to finish and is counted.
+        {formatNumber(PLANS.starter.weeklyWords)} words per week, resetting
+        every {PLANS.starter.resetDay} at {PLANS.starter.resetTime}. A
+        dictation that crosses the limit is allowed to finish and is counted.
       </p>
       <p>
         <strong>{PLANS.pro.name}</strong> is billed at ${PLANS.pro.monthly.price}
@@ -57,6 +61,13 @@ export function TermsPage() {
         annually (${PLANS.pro.annual.total}/year). Creem is our merchant of
         record and handles checkout, payment methods, invoices, and applicable
         tax. Subscriptions renew automatically until canceled.
+      </p>
+      <p>
+        Pro is marketed as unlimited, but it is subject to a fair-use limit that
+        protects the service for everyone. Ordinary personal dictation is not
+        affected; automated, abusive, or resold use is not fair use. If you
+        reach the fair-use limit, dictation pauses until the weekly reset on{" "}
+        {PLANS.starter.resetDay} at {PLANS.starter.resetTime}.
       </p>
       <p>
         You can cancel from Account → Manage billing. Cancellation stops future
@@ -109,8 +120,8 @@ export function TermsPage() {
         indirect, incidental, special, or consequential damages, or for lost
         data, profits, or business opportunity. Our total liability for any
         claim is limited to the amount you paid us in the twelve months before
-        the claim, or $50 if you are on the free plan. Some jurisdictions do not
-        allow these limits, so parts of this section may not apply to you.
+        the claim, or $50 if you are on the Starter plan. Some jurisdictions do
+        not allow these limits, so parts of this section may not apply to you.
       </p>
 
       <h2>Termination</h2>

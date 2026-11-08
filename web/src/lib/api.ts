@@ -26,6 +26,9 @@ const FALLBACK_MESSAGES: Record<number, string> = {
   500: "Something went wrong on our side. Please try again.",
 };
 
+const RATE_LIMITED_MESSAGE =
+  "Ray is getting a lot of requests right now. Wait a few seconds, then try again.";
+
 export function isSafeHttpUrl(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
@@ -64,13 +67,19 @@ async function requestJson<T>(
     } catch {
       // A non-JSON error page (proxy, outage) gets the status fallback.
     }
+    const code =
+      typeof body?.error === "string" ? body.error : "request_failed";
+    // `429 { error: "rate_limited" }` has no message of its own; give it a
+    // friendlier line than the generic status fallback.
+    const fallback =
+      response.status === 429 && code === "rate_limited"
+        ? RATE_LIMITED_MESSAGE
+        : (FALLBACK_MESSAGES[response.status] ??
+          "Something went wrong. Please try again.");
     const message =
       typeof body?.message === "string" && body.message.trim()
         ? body.message
-        : (FALLBACK_MESSAGES[response.status] ??
-          "Something went wrong. Please try again.");
-    const code =
-      typeof body?.error === "string" ? body.error : "request_failed";
+        : fallback;
     throw new ApiError(response.status, code, message);
   }
 
@@ -80,7 +89,8 @@ async function requestJson<T>(
 export interface MeResponse {
   user: {
     id: string;
-    email: string | null;
+    /** Never null: the API sends an empty string when the email is unknown. */
+    email: string;
     name: string | null;
   };
   plan: "starter" | "pro";
@@ -88,6 +98,8 @@ export interface MeResponse {
   status: string | null;
   cancel_at_period_end: boolean;
   current_period_end: string | null;
+  /** Present on a subscription that still exists but no longer grants Pro. */
+  billing_issue: "past_due" | "unpaid" | "paused" | null;
   usage: {
     words_used: number;
     words_limit: number | null;
@@ -113,6 +125,14 @@ export function createCheckout(
 
 export function createPortalSession(token: string) {
   return requestJson<{ url: string }>("/api/billing/portal", {
+    method: "POST",
+    token,
+  });
+}
+
+/** Revokes every desktop device token for the signed-in account. */
+export function revokeAllDevices(token: string) {
+  return requestJson<{ revoked: number }>("/api/devices/revoke-all", {
     method: "POST",
     token,
   });

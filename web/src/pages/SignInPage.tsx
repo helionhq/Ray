@@ -3,9 +3,10 @@ import { SignIn } from "@clerk/react";
 import { AuthShell } from "../components/AuthShell";
 import { AuthNotConfigured } from "../components/AuthNotConfigured";
 import { clerkEnabled } from "../lib/clerk";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { useLocation } from "../lib/router";
 import {
+  desktopRedirectFromSearch,
   readRememberedRedirect,
   rememberRedirect,
   safeRedirect,
@@ -28,8 +29,12 @@ function SignInInner() {
       ? location.pathname.slice(0, -1)
       : location.pathname;
   const inFlow = Boolean(location.hash) || exactPath !== "/sign-in";
+  // state/challenge may be on this URL when a Clerk email link opened in a
+  // new tab, where sessionStorage from the original tab isn't available.
+  const desktopRedirect = desktopRedirectFromSearch(location.search);
   const redirectUrl =
     safeRedirect(queryRedirect) ??
+    desktopRedirect ??
     (inFlow ? readRememberedRedirect() : null) ??
     "/account";
   const signUpUrl = `/sign-up?redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -51,7 +56,12 @@ function SignInInner() {
 }
 
 export function SignInPage() {
-  usePageTitle("Sign in");
+  usePageMeta({
+    title: "Sign in",
+    description: "Sign in to your Ray account.",
+    path: "/sign-in",
+    noindex: true,
+  });
   if (!clerkEnabled) return <AuthNotConfigured />;
   return <SignInInner />;
 }

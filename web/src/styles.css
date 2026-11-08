@@ -1661,6 +1661,80 @@ kbd {
   line-height: 1.5;
 }
 
+.account-success {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: var(--ok-bg);
+  color: var(--ok);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.account-devices > .btn {
+  margin-top: 14px;
+}
+
+.account-action {
+  margin-top: 16px;
+}
+
+.account-confirm {
+  margin-top: 14px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg);
+}
+
+.account-confirm p {
+  color: var(--ink-2);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.account-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.account-activating {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+.account-activating .spinner {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border-width: 2px;
+}
+
+.account-activating-title {
+  color: var(--ink);
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.account-activating .account-muted {
+  margin-top: 2px;
+}
+
+.account-activation-timeout {
+  margin: 12px 2px 0;
+}
+
+.auth-message > .auth-switch-account {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
 .account-details {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1710,6 +1784,12 @@ kbd {
 
 .upgrade-option:disabled {
   opacity: 0.6;
+}
+
+.upgrade-option.is-selected {
+  border-color: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--ink);
+  background: var(--surface);
 }
 
 .upgrade-head {

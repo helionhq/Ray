@@ -3,9 +3,10 @@ import { SignUp } from "@clerk/react";
 import { AuthShell } from "../components/AuthShell";
 import { AuthNotConfigured } from "../components/AuthNotConfigured";
 import { clerkEnabled } from "../lib/clerk";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { useLocation } from "../lib/router";
 import {
+  desktopRedirectFromSearch,
   readRememberedRedirect,
   rememberRedirect,
   safeRedirect,
@@ -26,8 +27,12 @@ function SignUpInner() {
       ? location.pathname.slice(0, -1)
       : location.pathname;
   const inFlow = Boolean(location.hash) || exactPath !== "/sign-up";
+  // The desktop hand-off puts state/challenge directly on this URL as well,
+  // so an email-verification link opened in a new tab keeps them.
+  const desktopRedirect = desktopRedirectFromSearch(location.search);
   const redirectUrl =
     safeRedirect(queryRedirect) ??
+    desktopRedirect ??
     (inFlow ? readRememberedRedirect() : null) ??
     "/account";
   const signInUrl = `/sign-in?redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -49,7 +54,12 @@ function SignUpInner() {
 }
 
 export function SignUpPage() {
-  usePageTitle("Create an account");
+  usePageMeta({
+    title: "Create an account",
+    description: "Create your Ray account and start dictating free.",
+    path: "/sign-up",
+    noindex: true,
+  });
   if (!clerkEnabled) return <AuthNotConfigured />;
   return <SignUpInner />;
 }

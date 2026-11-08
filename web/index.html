@@ -4,11 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
+    <!--
+      These are the landing-page defaults (and what a crawler that doesn't run
+      JS sees). `web/src/lib/head.ts` rewrites the title, description,
+      canonical, Open Graph/Twitter tags, and robots per client-side route.
+      The origin must match SITE_ORIGIN in web/src/content.ts.
+    -->
     <title>Ray — Fast, clean dictation for Windows</title>
     <meta
       name="description"
       content="Press a shortcut, speak, and polished text appears wherever you're typing. Ray is fast, clean dictation for Windows 10 and 11."
     />
+    <meta name="robots" content="index, follow" />
     <link rel="canonical" href="https://ray.helionhq.com/" />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />

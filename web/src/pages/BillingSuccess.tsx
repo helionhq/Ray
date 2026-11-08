@@ -2,7 +2,8 @@ import { useEffect } from "react";
 import { AuthShell } from "../components/AuthShell";
 import { ArrowRightIcon, CheckIcon } from "../components/Icons";
 import { BILLING_SUCCESS_DEEPLINK } from "../content";
-import { usePageTitle } from "../lib/hooks";
+import { rememberBillingActivation } from "../lib/billing-success";
+import { usePageMeta } from "../lib/head";
 import { Link } from "../lib/router";
 
 // One automatic hand-off per page load. StrictMode's first timer is cleared
@@ -10,9 +11,18 @@ import { Link } from "../lib/router";
 let attemptedThisLoad = false;
 
 export function BillingSuccessPage() {
-  usePageTitle("Billing success");
+  usePageMeta({
+    title: "Billing success",
+    description: "Your Ray Pro payment is being activated.",
+    path: "/billing/success",
+    noindex: true,
+  });
 
   useEffect(() => {
+    // The account page polls until Pro shows up. Keep the intent around even
+    // if a later redirect or reload drops the query parameter.
+    rememberBillingActivation();
+
     if (attemptedThisLoad) return;
     const timer = window.setTimeout(() => {
       if (attemptedThisLoad) return;
@@ -42,7 +52,7 @@ export function BillingSuccessPage() {
             Open Ray
             <ArrowRightIcon size={15} />
           </a>
-          <Link className="btn btn-secondary" to="/account">
+          <Link className="btn btn-secondary" to="/account?activated=1">
             Go to Account
           </Link>
         </div>

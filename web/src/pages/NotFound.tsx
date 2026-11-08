@@ -2,11 +2,16 @@ import { SiteFooter } from "../components/SiteFooter";
 import { SiteHeader } from "../components/SiteHeader";
 import { DownloadIcon } from "../components/Icons";
 import { DOWNLOAD_URL } from "../content";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { Link } from "../lib/router";
 
 export function NotFoundPage() {
-  usePageTitle("Page not found");
+  usePageMeta({
+    title: "Page not found",
+    description: "The page you were looking for doesn't exist.",
+    path: "/404",
+    noindex: true,
+  });
 
   return (
     <div className="site">

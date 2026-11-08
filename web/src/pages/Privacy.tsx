@@ -1,10 +1,15 @@
 import { LegalPage } from "../components/LegalPage";
 import { CONTACT_EMAIL, REPOSITORY_URL } from "../content";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { Link } from "../lib/router";
 
 export function PrivacyPage() {
-  usePageTitle("Privacy");
+  usePageMeta({
+    title: "Privacy",
+    description:
+      "How Ray handles your audio, transcripts, dictionary, and account data.",
+    path: "/privacy",
+  });
 
   return (
     <LegalPage title="Privacy policy" updated="November 8, 2026">
@@ -17,17 +22,20 @@ export function PrivacyPage() {
       <h2>Audio and transcripts</h2>
       <p>
         When you dictate, Ray records audio on your PC and sends it through our
-        Cloudflare Worker to <strong>AssemblyAI</strong>, which transcribes it
-        and runs the cleanup prompt. The audio and transcript pass through in
-        memory.
+        Cloudflare Worker to <strong>AssemblyAI</strong>, which transcribes it.
+        When Structured cleanup runs, Ray also sends the transcript, the terms
+        in your personal dictionary, and the name of the foreground app you are
+        dictating into to AssemblyAI&rsquo;s language model so it can rewrite the
+        text.
       </p>
       <p>
         <strong>
-          Ray&rsquo;s servers never store or log your audio or transcripts.
+          Ray&rsquo;s servers never store or log your audio, transcripts, or
+          cleanup inputs.
         </strong>{" "}
-        We do not use them to train models. AssemblyAI processes the audio
-        under its own terms and privacy policy as our speech-processing
-        provider.
+        They pass through in memory. We do not use them to train our own
+        models. AssemblyAI processes the audio and cleanup inputs under its own
+        terms and privacy policy as our speech-processing provider.
       </p>
 
       <h2>Account details</h2>
@@ -55,20 +63,21 @@ export function PrivacyPage() {
 
       <h2>What stays on your PC</h2>
       <p>
-        Your settings, dictionary, and dictation history live in the Ray app&rsquo;s
-        local data folder on your computer. They are not uploaded to our
+        Your settings, dictionary, and dictation History live in the Ray app&rsquo;s
+        local data folder on your computer. Your History is not uploaded to our
         servers. Deleting them from the app or the folder removes them.
       </p>
 
       <h2>What we do not do</h2>
       <ul>
         <li>We do not store audio or transcripts on Ray&rsquo;s servers.</li>
+        <li>We do not upload your local dictation History.</li>
         <li>We do not sell personal data.</li>
         <li>
           We do not use advertising cookies or third-party analytics on this
           site.
         </li>
-        <li>We do not use your dictation to train models.</li>
+        <li>We do not use your dictation to train our own models.</li>
       </ul>
 
       <h2>Where data lives</h2>
@@ -92,9 +101,10 @@ export function PrivacyPage() {
       <h2>Your choices and rights</h2>
       <p>
         You can sign out of a device at any time in the desktop app, which
-        revokes its token. Depending on where you live, you may have the right
-        to access, correct, export, or delete your personal data, or to object
-        to certain processing. Contact us at{" "}
+        revokes its token. You can also sign out every device from Account on
+        this site. Depending on where you live, you may have the right to
+        access, correct, export, or delete your personal data, or to object to
+        certain processing. Contact us at{" "}
         <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a> and we will
         respond as required by applicable law.
       </p>
