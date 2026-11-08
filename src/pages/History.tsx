@@ -246,7 +246,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
           <span>
             {query
               ? "Try a different word."
-              : "Press Right Alt, say what you mean, then press it again."}
+              : "Press your shortcut, say what you mean, then press it again."}
           </span>
         </div>
       ) : (

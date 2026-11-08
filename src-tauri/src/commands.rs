@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::audio::{self, InputDevice};
 use crate::config::CleanupMode;
-use crate::hotkey;
+use crate::hotkey::{self, Hotkey, HotkeyView};
 use crate::pipeline::Dictation;
 use crate::secrets;
 use crate::store::{self, HistoryEntry, Settings, Store};
@@ -29,7 +29,7 @@ pub struct Snapshot {
     pub keys: KeyStatus,
     pub devices: Vec<InputDevice>,
     pub launch_at_login: bool,
-    /// `None` when the Right Alt hook is healthy.
+    /// `None` when the dictation-shortcut hook is healthy.
     pub hotkey_error: Option<String>,
     pub version: String,
 }
@@ -183,7 +183,13 @@ pub async fn test_secret(
 }
 
 #[tauri::command]
-pub fn save_settings(settings: Settings, store: State<'_, Arc<Store>>) -> Result<Settings, String> {
+pub fn save_settings(
+    mut settings: Settings,
+    store: State<'_, Arc<Store>>,
+) -> Result<Settings, String> {
+    // The shortcut has dedicated commands; a whole-settings round-trip must
+    // never reset it (older frontends do not send the field at all).
+    settings.hotkey = store.settings().hotkey;
     let previous = windows_util::launch_at_login();
     let changed = previous != settings.launch_at_login;
     if changed {
@@ -309,6 +315,50 @@ pub fn reload_config(app: AppHandle, dictation: State<'_, Arc<Dictation>>) -> Re
 pub fn retry_hotkey() -> Result<Option<String>, String> {
     hotkey::reinstall()?;
     Ok(hotkey::status())
+}
+
+#[tauri::command]
+pub fn get_hotkey(store: State<'_, Arc<Store>>) -> HotkeyView {
+    HotkeyView::new(store.settings().hotkey)
+}
+
+#[tauri::command]
+pub fn start_hotkey_capture() -> Result<(), String> {
+    hotkey::start_capture()
+}
+
+#[tauri::command]
+pub fn cancel_hotkey_capture() {
+    hotkey::cancel_capture();
+}
+
+#[tauri::command]
+pub fn set_hotkey(
+    hotkey: String,
+    store: State<'_, Arc<Store>>,
+    app: AppHandle,
+) -> Result<HotkeyView, String> {
+    let hotkey = Hotkey::parse(&hotkey)?;
+    let saved = store.update_hotkey(hotkey)?;
+    apply_hotkey(&app, saved.hotkey)
+}
+
+#[tauri::command]
+pub fn reset_hotkey(store: State<'_, Arc<Store>>, app: AppHandle) -> Result<HotkeyView, String> {
+    let saved = store.update_hotkey(Hotkey::default())?;
+    apply_hotkey(&app, saved.hotkey)
+}
+
+/// Apply a persisted shortcut to the running hook and tell the UI. The tray
+/// tooltip names the shortcut, so it is refreshed at the same time.
+fn apply_hotkey(app: &AppHandle, hotkey: Hotkey) -> Result<HotkeyView, String> {
+    hotkey::set_hotkey(hotkey.clone());
+    let view = HotkeyView::new(hotkey);
+    if let Some(tray) = app.tray_by_id("ray-tray") {
+        let _ = tray.set_tooltip(Some(format!("Ray · {} to dictate", view.label)));
+    }
+    let _ = app.emit_to("main", "hotkey-changed", view.clone());
+    Ok(view)
 }
 
 #[tauri::command]

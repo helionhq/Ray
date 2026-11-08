@@ -165,7 +165,7 @@ export default function App() {
             <span className="banner-text">
               {missingKey && "Add an AssemblyAI key to start dictating."}
               {missingKey && hotkeyIssue && <span className="banner-sep" />}
-              {hotkeyIssue && "The Right Alt shortcut is unavailable."}
+              {hotkeyIssue && "Your dictation shortcut is unavailable."}
             </span>
             <button
               type="button"

@@ -15,7 +15,7 @@ import type {
 } from "../lib/bridge";
 import { api } from "../lib/bridge";
 import { applyTheme } from "../lib/theme";
-import { hotkeyLabel } from "../lib/format";
+import { ShortcutSetting } from "../components/ShortcutSetting";
 import {
   updatesSupported,
   type UpdateCheck,
@@ -659,13 +659,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
 
       <div className="group-label">General</div>
       <div className="card">
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">Dictation shortcut</div>
-            <div className="help">Press once to start, again to paste. Esc cancels.</div>
-          </div>
-          <kbd>{hotkeyLabel()}</kbd>
-        </div>
+        <ShortcutSetting notify={notify} />
 
         <div className="row">
           <div className="row-copy">

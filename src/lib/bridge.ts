@@ -20,6 +20,22 @@ export interface InputDevice {
 export type Theme = "system" | "light" | "dark";
 export type CleanupMode = "clean" | "structured";
 
+/**
+ * A shortcut in its canonical string form (`right_alt`, `f9`,
+ * `ctrl+shift+space`). Rust validates it; the UI only round-trips the value.
+ */
+export type Hotkey = string;
+
+/** The current shortcut plus the label Rust renders for it. */
+export interface HotkeyView {
+  hotkey: Hotkey;
+  label: string;
+}
+
+export interface HotkeyCaptureError {
+  message: string;
+}
+
 export interface Settings {
   launch_at_login: boolean;
   input_device: string | null;
@@ -28,6 +44,7 @@ export interface Settings {
   streaming_enabled: boolean;
   keep_raw: boolean;
   theme: Theme;
+  hotkey: Hotkey;
 }
 
 export interface KeyStatus {
@@ -83,6 +100,11 @@ export const api = {
   openMain: () => call<void>("open_main"),
   reloadConfig: () => call<void>("reload_config"),
   retryHotkey: () => call<string | null>("retry_hotkey"),
+  getHotkey: () => call<HotkeyView>("get_hotkey"),
+  startHotkeyCapture: () => call<void>("start_hotkey_capture"),
+  cancelHotkeyCapture: () => call<void>("cancel_hotkey_capture"),
+  setHotkey: (hotkey: Hotkey) => call<HotkeyView>("set_hotkey", { hotkey }),
+  resetHotkey: () => call<HotkeyView>("reset_hotkey"),
   quit: () => call<void>("quit"),
 };
 
