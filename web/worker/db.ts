@@ -95,6 +95,51 @@ export async function setCreemCustomerId(
   await setCreemCustomerIdStatement(db, userId, customerId).run();
 }
 
+/**
+ * Atomically claims the single in-flight checkout slot for a user. The
+ * returned result has `meta.changes > 0` when the slot was claimed (there was
+ * no pending row, or the previous one is older than `ttlSeconds`), and `0`
+ * when a recent checkout is still waiting for its webhook.
+ */
+export function claimPendingCheckoutStatement(
+  db: D1Database,
+  userId: string,
+  now: number,
+  ttlSeconds: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO pending_checkouts (user_id, created_at)
+       VALUES (?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET created_at = excluded.created_at
+       WHERE pending_checkouts.created_at <= ?`,
+    )
+    .bind(userId, now, now - ttlSeconds);
+}
+
+/** Releases a claim only if it is still the one this checkout created. */
+export function releasePendingCheckoutStatement(
+  db: D1Database,
+  userId: string,
+  createdAt: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      "DELETE FROM pending_checkouts WHERE user_id = ? AND created_at = ?",
+    )
+    .bind(userId, createdAt);
+}
+
+/** The subscription webhook proves the checkout completed (or was abandoned). */
+export function clearPendingCheckoutStatement(
+  db: D1Database,
+  userId: string,
+): D1PreparedStatement {
+  return db
+    .prepare("DELETE FROM pending_checkouts WHERE user_id = ?")
+    .bind(userId);
+}
+
 export async function getUsageWords(
   db: D1Database,
   userId: string,

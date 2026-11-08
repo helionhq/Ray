@@ -14,7 +14,8 @@ use base64::Engine;
 use bytes::Bytes;
 use serde_json::Value;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -61,11 +62,46 @@ impl std::fmt::Display for LiveError {
 
 impl std::error::Error for LiveError {}
 
+/// Shared progress of a live session: the end of the PCM already sent in
+/// successfully decoded segments (so the Worker has counted it), and the
+/// transcript produced so far. The batch fallback starts after the covered
+/// audio and joins this text, so a live failure does not transcribe (and
+/// count) the same audio twice (review decision on quota accuracy).
+#[derive(Debug, Default)]
+pub struct LiveProgress {
+    covered_bytes: AtomicUsize,
+    text: Mutex<String>,
+}
+
+impl LiveProgress {
+    /// PCM bytes covered by completed live segments. The next batch fallback
+    /// must start at this byte offset (always even: PCM16).
+    pub fn covered_bytes(&self) -> usize {
+        self.covered_bytes.load(Ordering::SeqCst)
+    }
+
+    fn partial_text(&self) -> Option<String> {
+        let text = self
+            .text
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .trim()
+            .to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn record(&self, covered_bytes: usize, text: &str) {
+        self.covered_bytes.store(covered_bytes, Ordering::SeqCst);
+        *self.text.lock().unwrap_or_else(|error| error.into_inner()) = text.to_string();
+    }
+}
+
 /// One live transcription session (Sync live is the only supported protocol).
 pub struct LiveSession {
     pub audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<Result<String, LiveError>>,
+    progress: Arc<LiveProgress>,
 }
 
 impl LiveSession {
@@ -73,15 +109,22 @@ impl LiveSession {
         self.audio_tx.clone()
     }
 
+    /// Progress shared with the live task. Read it after `finish` fails (or
+    /// times out) to find the audio the Worker already transcribed.
+    pub fn progress_handle(&self) -> Arc<LiveProgress> {
+        self.progress.clone()
+    }
+
     pub async fn finish(self, timeout: Duration) -> Result<String, LiveError> {
         let _ = self.stop_tx.send(true);
+        let progress = self.progress.clone();
         let mut task = self.task;
         tokio::select! {
             result = &mut task => match result {
                 Ok(result) => result,
                 Err(error) => Err(LiveError {
                     error: ApiError::other(format!("Sync live task failed: {error}")),
-                    partial: None,
+                    partial: progress.partial_text(),
                 }),
             },
             _ = tokio::time::sleep(timeout) => {
@@ -91,7 +134,7 @@ impl LiveSession {
                 task.abort();
                 Err(LiveError {
                     error: ApiError::other("Sync live did not finish in time"),
-                    partial: None,
+                    partial: progress.partial_text(),
                 })
             }
         }
@@ -114,16 +157,30 @@ pub fn spawn_live(
     let (stop_tx, stop_rx) = watch::channel(false);
     let base = api_base.to_string();
     let token = token.to_string();
+    let progress = Arc::new(LiveProgress::default());
+    let task_progress = progress.clone();
     let task = tokio::spawn(async move {
-        run_sync_live(&base, &token, &config, &keyterms, audio_rx, stop_rx, http).await
+        run_sync_live(
+            &base,
+            &token,
+            &config,
+            &keyterms,
+            audio_rx,
+            stop_rx,
+            http,
+            task_progress,
+        )
+        .await
     });
     LiveSession {
         audio_tx,
         stop_tx,
         task,
+        progress,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_sync_live(
     api_base: &str,
     token: &str,
@@ -132,6 +189,7 @@ async fn run_sync_live(
     mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stop_rx: watch::Receiver<bool>,
     http: reqwest::Client,
+    progress: Arc<LiveProgress>,
 ) -> Result<String, LiveError> {
     // Stay a little under the endpoint's 120 s audio cap per request.
     let segment_seconds = config.sync_live.max_audio_seconds.saturating_sub(2).max(1);
@@ -145,6 +203,9 @@ async fn run_sync_live(
     let overlap_bytes = (config.sample_rate as usize * 2).min(max_bytes / 4);
     let mut overlap: Option<Vec<u8>> = None;
     let mut audio_tail: Vec<u8> = Vec::new();
+    // End of the audio covered by completed segments. The overlap is re-sent
+    // but already counted, so it does not move this offset forward.
+    let mut covered = 0usize;
     loop {
         let boundary = boundary();
         let config_json =
@@ -178,8 +239,10 @@ async fn run_sync_live(
             )));
         let send_task = tokio::spawn(request.send());
         let _abort_on_drop = AbortOnDrop(send_task.abort_handle());
+        let overlap_len = overlap.as_ref().map_or(0, Vec::len);
+        let segment_start = covered.saturating_sub(overlap_len);
+        let mut sent = 0usize;
         let pump = async {
-            let mut sent = 0usize;
             if let Some(bytes) = overlap.take() {
                 sent += bytes.len();
                 keep_tail(&mut audio_tail, &bytes, overlap_bytes);
@@ -269,6 +332,14 @@ async fn run_sync_live(
         if !transcript.is_empty() {
             transcripts.push(transcript.to_string());
         }
+        // This segment's audio was transcribed and counted by the Worker, so
+        // the batch fallback must start after it. Record the joined text too:
+        // a client-side timeout still returns what was already transcribed.
+        let joined = transcripts.iter().fold(String::new(), |acc, next| {
+            join_segment_transcripts(&acc, next)
+        });
+        covered = segment_start + sent;
+        progress.record(covered, &joined);
         // Only finish when the pump itself saw the stop. If the stop arrived
         // while this segment was waiting for its response, `pending` and the
         // queued audio still have to go out in another segment.
@@ -334,7 +405,10 @@ fn normalize_word(word: &str) -> String {
 /// audio, so its transcript starts with words the first one already produced.
 /// Remove that overlap, and when the cut fell inside a word, let the complete
 /// word from the second segment replace the fragment at the end of the first.
-fn join_segment_transcripts(previous: &str, next: &str) -> String {
+///
+/// Also used to join live text with the batch fallback, which starts at the
+/// covered PCM offset (no overlap, but a word can be cut at the boundary).
+pub(crate) fn join_segment_transcripts(previous: &str, next: &str) -> String {
     let previous = previous.trim();
     let next = next.trim();
     if previous.is_empty() {

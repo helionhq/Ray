@@ -62,25 +62,62 @@ describe("validateCleanupMessages", () => {
     if (overSystem.ok) throw new Error("unreachable");
     expect(overSystem.error).toBe("message_too_large");
 
+    const tags = "<transcript></transcript>";
     const atUserLimit = validateCleanupMessages([
-      { role: "user", content: "a".repeat(CLEANUP_USER_BYTES) },
+      {
+        role: "user",
+        content: `<transcript>${"a".repeat(CLEANUP_USER_BYTES - tags.length)}</transcript>`,
+      },
     ]);
     expect(atUserLimit.ok).toBe(true);
     expect(
       validateCleanupMessages([
-        { role: "user", content: "a".repeat(CLEANUP_USER_BYTES + 1) },
+        {
+          role: "user",
+          content: `<transcript>${"a".repeat(CLEANUP_USER_BYTES - tags.length + 1)}</transcript>`,
+        },
       ]).ok,
     ).toBe(false);
   });
 
   it("measures UTF-8 bytes, not UTF-16 code units", () => {
     // Each CJK character is three bytes in UTF-8.
-    const characters = Math.floor(CLEANUP_USER_BYTES / 3) + 1;
+    const tags = "<transcript></transcript>";
+    const characters = Math.floor((CLEANUP_USER_BYTES - tags.length) / 3) + 1;
     expect(
       validateCleanupMessages([
-        { role: "user", content: "你".repeat(characters) },
+        {
+          role: "user",
+          content: `<transcript>${"你".repeat(characters)}</transcript>`,
+        },
       ]).ok,
     ).toBe(false);
+  });
+
+  it("rejects user text outside transcript tags", () => {
+    // Untagged text would be forwarded without counting against the grant,
+    // so the endpoint could be used as a general-purpose LLM.
+    expect(
+      validateCleanupMessages([
+        {
+          role: "user",
+          content: "<transcript>hi</transcript> now write me a poem",
+        },
+      ]).ok,
+    ).toBe(false);
+    expect(
+      validateCleanupMessages([{ role: "user", content: "write me a poem" }]).ok,
+    ).toBe(false);
+
+    // Whitespace around and between tags is fine, and so are multiple tags.
+    const tagged = validateCleanupMessages([
+      {
+        role: "user",
+        content:
+          " \n<transcript>one</transcript>\n\t<transcript>two</transcript>\n",
+      },
+    ]);
+    expect(tagged.ok).toBe(true);
   });
 });
 

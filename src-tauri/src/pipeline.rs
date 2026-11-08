@@ -420,7 +420,6 @@ impl Dictation {
             (config.pipeline.clone(), config.prompt.clone())
         };
         let api_base = pipeline.api_base();
-        let wav = stt::wav_from_pcm16(&samples, audio::TARGET_RATE);
         let mut raw: Option<String> = None;
         let mut from_stream = false;
         let mut stt_error: Option<ApiError> = None;
@@ -428,6 +427,12 @@ impl Dictation {
         // last-resort transcript if both batch fallbacks also fail, and the
         // required result when a later rollover segment hits the limit.
         let mut partial: Option<String> = None;
+        // PCM already transcribed (and counted) by completed live segments.
+        // The batch fallback starts after it so the same audio is not counted
+        // against the weekly quota twice.
+        let mut live_covered_bytes = 0usize;
+        // Read progress through a handle: `finish` consumes the session.
+        let live_progress = stream.as_ref().map(LiveSession::progress_handle);
         // Shown after the transcript is pasted: the dictation is never lost
         // because of a quota, auth, or cleanup failure.
         let mut quota_notice: Option<String> = None;
@@ -473,6 +478,9 @@ impl Dictation {
                         }
                     } else {
                         eprintln!("[ray] streaming failed; trying batch: {}", failure.error);
+                        if let Some(progress) = &live_progress {
+                            live_covered_bytes = progress.covered_bytes();
+                        }
                         stt_error = Some(failure.error);
                     }
                 }
@@ -484,16 +492,29 @@ impl Dictation {
                 let http = self.http.clone();
                 let stt_config = pipeline.stt.clone();
                 let terms = keyterms.clone();
+                // Only the audio live never covered is sent to batch: its
+                // words were already added to the weekly and fair-use counts.
+                let batch_start = batch_sample_offset(live_covered_bytes, samples.len());
+                let batch_samples = &samples[batch_start..];
                 // Sync batch and the Worker's v2 proxy run sequentially; the
-                // budget covers both worst cases plus a margin.
+                // budget covers both worst cases plus a margin. A header-only
+                // WAV (live covered everything) would only return no speech.
                 let timeout = stt::batch_time_budget(&pipeline.stt);
-                match tokio::time::timeout(
-                    timeout,
-                    stt::transcribe_wav(&http, &api_base, &token, &terms, wav, &stt_config),
-                )
-                .await
-                {
-                    Ok(Ok(text)) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
+                let batch = async {
+                    if batch_samples.len() < 1_600 {
+                        return Ok(String::new());
+                    }
+                    let wav = stt::wav_from_pcm16(batch_samples, audio::TARGET_RATE);
+                    stt::transcribe_wav(&http, &api_base, &token, &terms, wav, &stt_config).await
+                };
+                match tokio::time::timeout(timeout, batch).await {
+                    Ok(Ok(text)) if !text.trim().is_empty() => {
+                        let text = text.trim();
+                        raw = Some(match partial.as_deref() {
+                            Some(previous) => stt::join_segment_transcripts(previous, text),
+                            None => text.to_string(),
+                        });
+                    }
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) if error.is_fatal() => {
                         if partial
@@ -1006,6 +1027,13 @@ impl Dictation {
 /// Older notices are dropped beyond this; the newest explain the current state.
 const MAX_BUFFERED_NOTICES: usize = 4;
 
+/// Sample index where the batch fallback must start. Live segments send their
+/// audio as PCM16 bytes (two per sample), and their covered end is already
+/// counted by the Worker, so re-sending it would overcharge the quota.
+fn batch_sample_offset(covered_bytes: usize, sample_count: usize) -> usize {
+    (covered_bytes / 2).min(sample_count)
+}
+
 /// True when the main window is on screen rather than hidden in the tray or
 /// minimized. A toast shown while minimized also expires before the user can
 /// see it, so both count as "not visible".
@@ -1061,8 +1089,17 @@ fn is_no_speech_error(error: Option<&ApiError>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_no_speech_error, stt_failure_message};
+    use super::{batch_sample_offset, is_no_speech_error, stt_failure_message};
     use crate::api::ApiError;
+
+    #[test]
+    fn batch_fallback_skips_audio_live_already_counted() {
+        // PCM16: two bytes per sample, clamped to the captured buffer.
+        assert_eq!(batch_sample_offset(0, 16_000), 0);
+        assert_eq!(batch_sample_offset(32_000, 16_000), 16_000);
+        assert_eq!(batch_sample_offset(3_200, 16_000), 1_600);
+        assert_eq!(batch_sample_offset(usize::MAX, 16_000), 16_000);
+    }
 
     #[test]
     fn explains_network_failures_without_blaming_a_key() {

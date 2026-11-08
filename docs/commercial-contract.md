@@ -163,7 +163,7 @@ Otherwise they're Starter.
 | 401 | `unauthorized` | invalid/revoked device token or Clerk session; the desktop signs out |
 | 402 | `quota_exceeded` | Starter weekly limit (STT only) |
 | 403 | `no_cleanup_grant` | no unexpired cleanup grant, or the tagged transcript exceeds the granted words + 25 |
-| 409 | `billing_issue`, `already_subscribed`, `no_billing_account` | checkout/portal state |
+| 409 | `billing_issue`, `already_subscribed`, `no_billing_account`, `checkout_pending` | checkout/portal state |
 | 413 | `payload_too_large` (request/audio body) or `message_too_large` (cleanup system/user message) | input over its cap |
 | 429 | `fair_use` | Pro hidden fair-use cap (STT only); this is a quota, not a rate limit |
 | 429 | `too_many_requests` | STT concurrency lease, weekly failure budget, or any rate-limit binding (all rate limits use this code) |
@@ -233,6 +233,9 @@ it requires an unexpired **cleanup grant** earned by a just-counted transcriptio
   model `gemma-4-31b` is the default allowlist entry;
 - only `model`, `messages`, `temperature`, `max_tokens` (clamped to ≤ 4000) and
   `stream: false` are forwarded; every other field is dropped;
+- the user message may contain only whitespace and `<transcript>…</transcript>` tags
+  (`400 invalid_messages`); untagged text would be forwarded without counting against
+  the grant and turn the endpoint into a general-purpose LLM;
 - no unexpired grant, no calls left, or more than `grant.words + 25` words inside the
   last user message's `<transcript>…</transcript>` tags → `403 { "error": "no_cleanup_grant" }`;
 - upstream failures are mapped to `502 upstream_error` / `503 upstream_busy` like STT.
@@ -346,3 +349,7 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
 16. **Billing success:** after `ray://billing/success`, the desktop polls `/api/me` (1 s, 2 s, 4 s, …, ~45 s
     total) until `plan == "pro"`, showing "Activating Pro…". The site's `/account` refreshes on
     focus/visibility and polls the same way when arriving from `/billing/success`.
+    `/api/billing/checkout` records the in-flight checkout in D1 (`pending_checkouts`) and clears it
+    from the subscription webhook (15-minute TTL), answering `409 checkout_pending` for a second
+    attempt, so a delayed webhook cannot lead to a second subscription or charge. Both clients also
+    disable the upgrade CTAs while activation is pending.

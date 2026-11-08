@@ -137,7 +137,9 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
         <div>
           <h1>Settings</h1>
           <p className="sub">
-            Everything stays on this PC. Only audio and text go to Ray.
+            Only audio, the transcript, your dictionary terms, and the
+            foreground app name go to Ray, which sends them to AssemblyAI for
+            transcription and cleanup. History stays on this PC.
           </p>
         </div>
       </header>

@@ -170,6 +170,10 @@ function AccountView({
   const annual = PLANS.pro.annual;
   const resetsAt = formatResetAt(me.usage.resets_at);
   const { busy, actionError } = actions;
+  // A checkout is in flight until the webhook flips the plan (or the poll
+  // times out). Starting another one can create a second subscription and
+  // charge, so the CTAs stay disabled; the server enforces the same rule.
+  const upgradeBlocked = actions.activating || actions.activationTimedOut;
 
   return (
     <AccountFrame>
@@ -362,7 +366,7 @@ function AccountView({
                     actions.preferredInterval === "monthly" ? " is-selected" : ""
                   }`}
                   onClick={() => actions.onCheckout("monthly")}
-                  disabled={busy !== null}
+                  disabled={busy !== null || upgradeBlocked}
                   aria-busy={busy === "monthly" || undefined}
                 >
                   <span className="upgrade-head">
@@ -385,7 +389,7 @@ function AccountView({
                     actions.preferredInterval === "annual" ? " is-selected" : ""
                   }`}
                   onClick={() => actions.onCheckout("annual")}
-                  disabled={busy !== null}
+                  disabled={busy !== null || upgradeBlocked}
                   aria-busy={busy === "annual" || undefined}
                 >
                   <span className="upgrade-head">
@@ -736,6 +740,13 @@ function AccountPageInner() {
           if (caught.code === "billing_issue") {
             // The existing subscription needs a payment-method fix first.
             await openPortal();
+            return;
+          }
+          if (caught.code === "checkout_pending") {
+            // The first checkout is still waiting for its webhook. Refresh in
+            // case it has just landed; otherwise the message explains it.
+            setActionError(caught.message);
+            setReload((value) => value + 1);
             return;
           }
           // Already subscribed in another tab: refresh instead of a dead end.

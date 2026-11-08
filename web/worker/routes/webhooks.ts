@@ -21,6 +21,7 @@
 import type { Hono } from "hono";
 import type { AppContext, Env } from "../env";
 import {
+  clearPendingCheckoutStatement,
   deleteOldWebhookEvents,
   deleteUserAuthCodesStatement,
   findUserByCreemCustomerId,
@@ -124,6 +125,9 @@ async function subscriptionStatements(
       updated_at: event.eventTimestamp,
     }),
   );
+  // The subscription now exists, so the checkout that created it is no longer
+  // in flight; a new one would be a duplicate charge.
+  statements.push(clearPendingCheckoutStatement(env.DB, userId));
   return { applied: true, statements };
 }
 

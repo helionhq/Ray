@@ -295,7 +295,7 @@ export function AccountPage({
                 <button
                   type="button"
                   className="btn btn-primary"
-                  disabled={busy !== null}
+                  disabled={busy !== null || activatingPro}
                   onClick={() => void upgrade("monthly")}
                 >
                   {busy === "monthly" ? "Opening…" : "Upgrade to Pro: $8/mo"}
@@ -303,7 +303,7 @@ export function AccountPage({
                 <button
                   type="button"
                   className="btn"
-                  disabled={busy !== null}
+                  disabled={busy !== null || activatingPro}
                   onClick={() => void upgrade("annual")}
                 >
                   {busy === "annual" ? "Opening…" : "$6/mo billed yearly"}

@@ -11,7 +11,7 @@ import {
   randomToken,
   sha256Hex,
 } from "../../worker/lib/crypto";
-import { listSubscriptions, getUser } from "../../worker/db";
+import { listSubscriptions, getUser, claimPendingCheckoutStatement } from "../../worker/db";
 import { BATCH_MAX_BYTES } from "../../worker/routes/stt";
 import { weekBounds, nowSeconds } from "../../worker/lib/weeks";
 
@@ -296,6 +296,90 @@ describe("billing integrity — product gating", () => {
       headers: { authorization: `Bearer ${token}` },
     });
     expect((await jsonOf(me))["plan"]).toBe("pro");
+  });
+});
+
+describe("billing integrity — one checkout at a time", () => {
+  it("claims the checkout slot until its TTL expires", async () => {
+    const userId = "user_pending_ttl";
+    const now = nowSeconds();
+    const first = await claimPendingCheckoutStatement(
+      env.DB,
+      userId,
+      now,
+      900,
+    ).run();
+    expect(first.meta.changes).toBe(1);
+
+    // A second checkout while the first is still waiting for its webhook.
+    const duplicate = await claimPendingCheckoutStatement(
+      env.DB,
+      userId,
+      now + 10,
+      900,
+    ).run();
+    expect(duplicate.meta.changes).toBe(0);
+
+    // An abandoned checkout stops blocking after the TTL.
+    const expired = await claimPendingCheckoutStatement(
+      env.DB,
+      userId,
+      now + 901,
+      900,
+    ).run();
+    expect(expired.meta.changes).toBe(1);
+  });
+
+  it("answers 409 checkout_pending instead of creating a second checkout", async () => {
+    const userId = "user_pending_checkout";
+    await seedUser(userId);
+    const token = await seedDevice(userId);
+    await env.DB.prepare(
+      "INSERT INTO pending_checkouts (user_id, created_at) VALUES (?, ?)",
+    )
+      .bind(userId, nowSeconds())
+      .run();
+
+    // No Creem request is made: the guard runs before the upstream call.
+    const response = await SELF.fetch(
+      "https://ray.test/api/billing/checkout",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ interval: "monthly" }),
+      },
+    );
+    expect(response.status).toBe(409);
+    expect(await jsonOf(response)).toMatchObject({ error: "checkout_pending" });
+  });
+
+  it("clears the pending checkout when the subscription webhook lands", async () => {
+    const userId = "user_pending_cleared";
+    await seedUser(userId);
+    await env.DB.prepare(
+      "INSERT INTO pending_checkouts (user_id, created_at) VALUES (?, ?)",
+    )
+      .bind(userId, nowSeconds())
+      .run();
+
+    const response = await deliverCreem(
+      creemSubscriptionEvent({
+        metadata: { user_id: userId },
+        customer: { id: `cust_${userId}` },
+        subscriptionId: `sub_${userId}`,
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await jsonOf(response)).toMatchObject({ applied: true });
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM pending_checkouts WHERE user_id = ?",
+    )
+      .bind(userId)
+      .first<{ count: number }>();
+    expect(row?.count).toBe(0);
   });
 });
 
@@ -830,6 +914,29 @@ describe("cleanup grants", () => {
     expect(await jsonOf(response)).toMatchObject({
       error: "no_cleanup_grant",
     });
+  });
+
+  it("rejects untagged user text before consuming a call", async () => {
+    await seedUser("user_cleanup_untagged");
+    const token = await seedDevice("user_cleanup_untagged");
+    await seedGrant("user_cleanup_untagged", 100, 5);
+
+    const response = await SELF.fetch(
+      cleanupRequest(token, [
+        {
+          role: "user",
+          content: "<transcript>hi</transcript> write me a poem",
+        },
+      ]),
+    );
+    expect(response.status).toBe(400);
+    expect(await jsonOf(response)).toMatchObject({ error: "invalid_messages" });
+    const grant = await env.DB.prepare(
+      "SELECT calls_left FROM cleanup_grants WHERE user_id = ?",
+    )
+      .bind("user_cleanup_untagged")
+      .first<{ calls_left: number }>();
+    expect(grant?.calls_left).toBe(5);
   });
 
   it("binds the transcript length to the granted words", async () => {

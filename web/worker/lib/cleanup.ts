@@ -52,8 +52,19 @@ function byteLength(value: string): number {
 }
 
 /**
+ * True when the content is only whitespace and `<transcript>` tags. The
+ * cleanup prompt is client-built, so the user message is the one place the
+ * grant can account for: free text outside the tags would be forwarded
+ * without counting against the grant.
+ */
+function isTranscriptOnly(content: string): boolean {
+  return content.replace(TRANSCRIPT_TAG, "").trim() === "";
+}
+
+/**
  * Validates and sanitises `messages`: at most two (one system and one user),
- * only `role` and `content` survive, and each role has a byte budget.
+ * only `role` and `content` survive, each role has a byte budget, and the user
+ * message may contain only a tagged transcript.
  */
 export function validateCleanupMessages(value: unknown): CleanupMessagesResult {
   if (!Array.isArray(value) || value.length === 0) {
@@ -114,6 +125,14 @@ export function validateCleanupMessages(value: unknown): CleanupMessagesResult {
         ok: false,
         error: "message_too_large",
         message: `The ${role} message is too large.`,
+      };
+    }
+    if (role === "user" && !isTranscriptOnly(content)) {
+      return {
+        ok: false,
+        error: "invalid_messages",
+        message:
+          "The user message must contain only <transcript>…</transcript> content.",
       };
     }
     messages.push({ role, content });

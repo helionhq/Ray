@@ -6,7 +6,11 @@
 import type { Hono } from "hono";
 import type { AppContext, Env } from "../env";
 import { requireEither } from "../auth";
-import { listSubscriptions } from "../db";
+import {
+  claimPendingCheckoutStatement,
+  listSubscriptions,
+  releasePendingCheckoutStatement,
+} from "../db";
 import {
   entitledProductIds,
   resolveBillingIssue,
@@ -21,6 +25,13 @@ import {
   readBodyLimited,
   upstreamErrorMessage,
 } from "../http";
+
+/**
+ * How long a created checkout blocks another one. The subscription webhook
+ * normally clears it within seconds; this only covers an abandoned checkout or
+ * a delayed delivery, and expires so the user can try again.
+ */
+export const PENDING_CHECKOUT_TTL_SECONDS = 15 * 60;
 
 interface CreemSuccess {
   ok: true;
@@ -135,6 +146,41 @@ export function registerBillingRoutes(app: Hono<AppContext>): void {
         );
       }
 
+      // Record the in-flight checkout before Creem creates it. A delayed
+      // subscription webhook then cannot let another tab or device start a
+      // second subscription and charge the account twice.
+      const claimedAt = nowSeconds();
+      const claim = await claimPendingCheckoutStatement(
+        c.env.DB,
+        user.id,
+        claimedAt,
+        PENDING_CHECKOUT_TTL_SECONDS,
+      ).run();
+      if ((claim.meta.changes ?? 0) === 0) {
+        return c.json(
+          {
+            error: "checkout_pending",
+            message:
+              "A checkout was already started for this account. Finish it, or try again in a few minutes.",
+          },
+          409,
+        );
+      }
+
+      // The slot is cleared by the subscription webhook; this only handles a
+      // Creem failure so the user can retry immediately.
+      const releaseClaim = async (): Promise<void> => {
+        try {
+          await releasePendingCheckoutStatement(
+            c.env.DB,
+            user.id,
+            claimedAt,
+          ).run();
+        } catch {
+          // Best effort: the TTL releases the slot even if this fails.
+        }
+      };
+
       const payload: Record<string, unknown> = {
         product_id: productId,
         // One idempotency-ish key per attempt; retries by the user create a
@@ -152,6 +198,7 @@ export function registerBillingRoutes(app: Hono<AppContext>): void {
 
       const result = await creemPost(c.env, "/checkouts", payload);
       if (!result.ok) {
+        await releaseClaim();
         return c.json(
           { error: "billing_unavailable", message: result.message },
           502,
@@ -159,6 +206,7 @@ export function registerBillingRoutes(app: Hono<AppContext>): void {
       }
       const url = result.data["checkout_url"];
       if (typeof url !== "string" || url === "") {
+        await releaseClaim();
         return c.json(
           {
             error: "billing_unavailable",

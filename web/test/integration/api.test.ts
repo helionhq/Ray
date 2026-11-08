@@ -431,7 +431,7 @@ describe("quota enforcement", () => {
         },
         body: JSON.stringify({
           model: "gemma-4-31b",
-          messages: [{ role: "user", content: "hi" }],
+          messages: [{ role: "user", content: "<transcript>hi</transcript>" }],
         }),
       },
     );
