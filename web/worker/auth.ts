@@ -25,27 +25,99 @@ import { isDeviceToken, parseBearer } from "./lib/validation";
 /** Refresh last_used_at at most once every five minutes per device. */
 const DEVICE_TOUCH_INTERVAL_SECONDS = 300;
 
-export function authorizedParties(siteUrl: string): string[] {
-  const parties = new Set<string>();
+/**
+ * Returns the configured site origin, or null when `SITE_URL` is missing or
+ * invalid. Decision 12: callers must turn null into a 500 config error, never
+ * an empty authorized-parties list.
+ */
+export function siteOrigin(siteUrl: string | undefined | null): string | null {
+  const trimmed = (siteUrl ?? "").trim();
+  if (trimmed === "") return null;
   try {
-    const site = new URL(siteUrl);
-    parties.add(site.origin);
-    const local =
-      site.hostname === "localhost" ||
-      site.hostname === "127.0.0.1" ||
-      site.hostname === "[::1]";
-    if (local) {
-      // Vite's default port and wrangler dev's port, whichever loopback
-      // spelling the browser uses.
-      for (const hostname of ["localhost", "127.0.0.1"]) {
-        parties.add(`${site.protocol}//${hostname}:5173`);
-        parties.add(`${site.protocol}//${hostname}:8787`);
-      }
-    }
+    const url = new URL(trimmed);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    if (url.hostname === "") return null;
+    return url.origin;
   } catch {
-    // Invalid SITE_URL: fail closed by returning no authorized parties.
+    return null;
+  }
+}
+
+/**
+ * Clerk's `iss` claim is the Frontend API URL. The publishable key encodes it
+ * as base64url(`<frontendApi>$`); deriving the issuer from that key pins
+ * `iss` without another configured value. Returns null when the key is absent
+ * or unparseable (e.g. a placeholder), in which case only authorizedParties
+ * is enforced.
+ */
+export function clerkIssuer(
+  publishableKey: string | undefined | null,
+): string | null {
+  const key = (publishableKey ?? "").trim();
+  if (!key.startsWith("pk_test_") && !key.startsWith("pk_live_")) {
+    return null;
+  }
+  const parts = key.split("_");
+  if (parts.length !== 3 || !parts[2]) return null;
+  const encoded = parts[2];
+  const padded =
+    encoded + "=".repeat((4 - (encoded.length % 4)) % 4);
+  let decoded: string;
+  try {
+    decoded = atob(padded);
+  } catch {
+    return null;
+  }
+  if (!decoded.endsWith("$")) return null;
+  const frontendApi = decoded.slice(0, -1).trim().replace(/\/+$/u, "");
+  if (frontendApi === "" || frontendApi.includes("$")) return null;
+  const hostPart = frontendApi.replace(/^https?:\/\//iu, "");
+  if (
+    !/^[A-Za-z0-9.-]+(?::\d+)?(?:\/[A-Za-z0-9._~/-]*)?$/u.test(hostPart)
+  ) {
+    return null;
+  }
+  return /^https?:\/\//iu.test(frontendApi)
+    ? frontendApi
+    : `https://${frontendApi}`;
+}
+
+/**
+ * Returns the Clerk authorized parties, or null when `SITE_URL` is invalid.
+ * Same-origin production only; loopback dev origins are added when SITE_URL
+ * is itself a loopback origin.
+ */
+export function authorizedParties(
+  siteUrl: string | undefined | null,
+): string[] | null {
+  const origin = siteOrigin(siteUrl);
+  if (!origin) return null;
+  const site = new URL(origin);
+  const parties = new Set<string>([site.origin]);
+  const local =
+    site.hostname === "localhost" ||
+    site.hostname === "127.0.0.1" ||
+    site.hostname === "[::1]";
+  if (local) {
+    // Vite's default port and wrangler dev's port, whichever loopback
+    // spelling the browser uses.
+    for (const hostname of ["localhost", "127.0.0.1"]) {
+      parties.add(`${site.protocol}//${hostname}:5173`);
+      parties.add(`${site.protocol}//${hostname}:8787`);
+    }
   }
   return [...parties];
+}
+
+function configError(c: Context<AppContext>): Response {
+  console.error("SITE_URL is missing or invalid; refusing Clerk verification");
+  return c.json(
+    {
+      error: "config_error",
+      message: "The server is not configured correctly.",
+    },
+    500,
+  );
 }
 
 function unauthorized(c: Context<AppContext>): Response {
@@ -108,15 +180,18 @@ async function resolveClerkUser(
 
 async function authenticateClerk(
   c: Context<AppContext>,
+  parties: string[],
 ): Promise<boolean> {
   const token = parseBearer(c.req.header("authorization"));
   if (!token) return false;
 
   let subject: string | null = null;
   try {
+    const issuer = clerkIssuer(c.env.CLERK_PUBLISHABLE_KEY);
     const payload = await verifyToken(token, {
       secretKey: c.env.CLERK_SECRET_KEY,
-      authorizedParties: authorizedParties(c.env.SITE_URL),
+      authorizedParties: parties,
+      ...(issuer === null ? {} : { issuer }),
     });
     subject = typeof payload.sub === "string" ? payload.sub : null;
   } catch {
@@ -169,7 +244,9 @@ export const requireClerk: MiddlewareHandler<AppContext> = async (
   c,
   next,
 ) => {
-  if (!(await authenticateClerk(c))) return unauthorized(c);
+  const parties = authorizedParties(c.env.SITE_URL);
+  if (parties === null) return configError(c);
+  if (!(await authenticateClerk(c, parties))) return unauthorized(c);
   await next();
 };
 
@@ -186,9 +263,12 @@ export const requireEither: MiddlewareHandler<AppContext> = async (
   next,
 ) => {
   const token = parseBearer(c.req.header("authorization"));
-  const ok = token?.startsWith("ray_")
-    ? await authenticateDevice(c)
-    : await authenticateClerk(c);
-  if (!ok) return unauthorized(c);
+  if (token?.startsWith("ray_")) {
+    if (!(await authenticateDevice(c))) return unauthorized(c);
+  } else {
+    const parties = authorizedParties(c.env.SITE_URL);
+    if (parties === null) return configError(c);
+    if (!(await authenticateClerk(c, parties))) return unauthorized(c);
+  }
   await next();
 };

@@ -7,13 +7,19 @@ import type {
   UserRow,
 } from "./env";
 
+/** At most this many in-flight STT requests per user (decision 3). */
+export const STT_LEASE_LIMIT = 2;
+/** Leases older than this are ignored even if a release was lost. */
+export const STT_LEASE_TTL_SECONDS = 6 * 60;
+
 export async function getUser(
   db: D1Database,
   id: string,
 ): Promise<UserRow | null> {
   return db
     .prepare(
-      "SELECT id, email, name, creem_customer_id, created_at FROM users WHERE id = ?",
+      `SELECT id, email, name, creem_customer_id, created_at
+       FROM users WHERE id = ? AND deleted_at IS NULL`,
     )
     .bind(id)
     .first<UserRow>();
@@ -26,12 +32,12 @@ export interface UpsertUserInput {
   createdAt: number;
 }
 
-/** Inserts a user or fills in a missing email/name without clobbering them. */
-export async function upsertUser(
+/** The user upsert used by Clerk auth and webhook ingestion. */
+export function upsertUserStatement(
   db: D1Database,
   input: UpsertUserInput,
-): Promise<UserRow | null> {
-  await db
+): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO users (id, email, name, created_at)
        VALUES (?, ?, ?, ?)
@@ -39,8 +45,15 @@ export async function upsertUser(
          email = COALESCE(users.email, excluded.email),
          name = COALESCE(users.name, excluded.name)`,
     )
-    .bind(input.id, input.email, input.name, input.createdAt)
-    .run();
+    .bind(input.id, input.email, input.name, input.createdAt);
+}
+
+/** Inserts a user or fills in a missing email/name without clobbering them. */
+export async function upsertUser(
+  db: D1Database,
+  input: UpsertUserInput,
+): Promise<UserRow | null> {
+  await upsertUserStatement(db, input).run();
   return getUser(db, input.id);
 }
 
@@ -58,18 +71,20 @@ export async function findUserByCreemCustomerId(
     .first<UserRow>();
 }
 
-export async function findUserByEmail(
+/**
+ * Webhooks map users by metadata.user_id, then creem_customer_id. Email is
+ * deliberately not used (decision 8): it is not a verified account binding.
+ */
+export function setCreemCustomerIdStatement(
   db: D1Database,
-  email: string,
-): Promise<UserRow | null> {
+  userId: string,
+  customerId: string,
+): D1PreparedStatement {
   return db
     .prepare(
-      `SELECT id, email, name, creem_customer_id, created_at
-       FROM users WHERE email IS NOT NULL AND LOWER(email) = LOWER(?)
-       ORDER BY created_at ASC LIMIT 1`,
+      "UPDATE users SET creem_customer_id = ? WHERE id = ? AND (creem_customer_id IS NULL OR creem_customer_id != ?)",
     )
-    .bind(email)
-    .first<UserRow>();
+    .bind(customerId, userId, customerId);
 }
 
 export async function setCreemCustomerId(
@@ -77,12 +92,7 @@ export async function setCreemCustomerId(
   userId: string,
   customerId: string,
 ): Promise<void> {
-  await db
-    .prepare(
-      "UPDATE users SET creem_customer_id = ? WHERE id = ? AND (creem_customer_id IS NULL OR creem_customer_id != ?)",
-    )
-    .bind(customerId, userId, customerId)
-    .run();
+  await setCreemCustomerIdStatement(db, userId, customerId).run();
 }
 
 export async function getUsageWords(
@@ -137,16 +147,31 @@ export async function listSubscriptions(
   return result.results ?? [];
 }
 
+export async function getSubscription(
+  db: D1Database,
+  id: string,
+): Promise<SubscriptionRow | null> {
+  return db
+    .prepare(
+      `SELECT id, user_id, product_id, interval, status,
+              current_period_end, cancel_at_period_end, updated_at
+       FROM subscriptions WHERE id = ?`,
+    )
+    .bind(id)
+    .first<SubscriptionRow>();
+}
+
 /**
- * Applies a subscription snapshot only when the event is at least as new as
- * the stored row (`updated_at` is unix milliseconds). Returns false when an
- * older event was ignored.
+ * Subscription snapshot upsert. An older `updated_at` is ignored. On an equal
+ * `updated_at`, terminal statuses (revoked/expired/unpaid) win so a refund or
+ * dispute cannot be overwritten by an `active` event sharing its timestamp.
+ * Keep the rank expression in sync with `terminalStatusRank` in lib/plan.ts.
  */
-export async function upsertSubscriptionIfNewer(
+export function upsertSubscriptionStatement(
   db: D1Database,
   subscription: SubscriptionRow,
-): Promise<boolean> {
-  const result = await db
+): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO subscriptions
          (id, user_id, product_id, interval, status,
@@ -160,7 +185,23 @@ export async function upsertSubscriptionIfNewer(
          current_period_end = excluded.current_period_end,
          cancel_at_period_end = excluded.cancel_at_period_end,
          updated_at = excluded.updated_at
-       WHERE excluded.updated_at >= subscriptions.updated_at`,
+       WHERE excluded.updated_at > subscriptions.updated_at
+          OR (
+            excluded.updated_at = subscriptions.updated_at
+            AND CASE excluded.status
+                  WHEN 'revoked' THEN 3
+                  WHEN 'expired' THEN 2
+                  WHEN 'unpaid' THEN 1
+                  ELSE 0
+                END
+                >=
+                CASE subscriptions.status
+                  WHEN 'revoked' THEN 3
+                  WHEN 'expired' THEN 2
+                  WHEN 'unpaid' THEN 1
+                  ELSE 0
+                END
+          )`,
     )
     .bind(
       subscription.id,
@@ -171,35 +212,33 @@ export async function upsertSubscriptionIfNewer(
       subscription.current_period_end,
       subscription.cancel_at_period_end,
       subscription.updated_at,
-    )
-    .run();
+    );
+}
+
+/**
+ * Applies a subscription snapshot only when it is at least as new as the
+ * stored row. Returns false when an older event was ignored.
+ */
+export async function upsertSubscriptionIfNewer(
+  db: D1Database,
+  subscription: SubscriptionRow,
+): Promise<boolean> {
+  const result = await upsertSubscriptionStatement(db, subscription).run();
   return (result.meta.changes ?? 0) > 0;
 }
 
-/** Returns true when this event id was not seen before. */
-export async function recordWebhookEvent(
+/** Idempotency marker used inside the same D1 batch as the state change. */
+export function insertWebhookEventStatement(
   db: D1Database,
   id: string,
   now: number,
-): Promise<boolean> {
-  const result = await db
+): D1PreparedStatement {
+  return db
     .prepare(
       `INSERT INTO webhook_events (id, received_at) VALUES (?, ?)
        ON CONFLICT(id) DO NOTHING`,
     )
-    .bind(id, now)
-    .run();
-  return (result.meta.changes ?? 0) > 0;
-}
-
-export async function deleteWebhookEvent(
-  db: D1Database,
-  id: string,
-): Promise<void> {
-  await db
-    .prepare("DELETE FROM webhook_events WHERE id = ?")
-    .bind(id)
-    .run();
+    .bind(id, now);
 }
 
 export async function deleteOldWebhookEvents(
@@ -337,5 +376,191 @@ export async function revokeDevice(
       "UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
     )
     .bind(now, deviceId)
+    .run();
+}
+
+export function revokeAllDevicesStatement(
+  db: D1Database,
+  userId: string,
+  now: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE devices SET revoked_at = ?
+       WHERE user_id = ? AND revoked_at IS NULL`,
+    )
+    .bind(now, userId);
+}
+
+/** Revokes every device for a user (decision 10 / Clerk user.deleted). */
+export async function revokeAllDevices(
+  db: D1Database,
+  userId: string,
+  now: number,
+): Promise<number> {
+  const result = await revokeAllDevicesStatement(db, userId, now).run();
+  return result.meta.changes ?? 0;
+}
+
+/** Soft-deletes a user; `getUser` stops returning the row immediately. */
+export function markUserDeletedStatement(
+  db: D1Database,
+  userId: string,
+  now: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      "UPDATE users SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(now, userId);
+}
+
+export function deleteUserAuthCodesStatement(
+  db: D1Database,
+  userId: string,
+): D1PreparedStatement {
+  return db
+    .prepare("DELETE FROM auth_codes WHERE user_id = ?")
+    .bind(userId);
+}
+
+export interface CleanupGrantRow {
+  words: number;
+  calls_left: number;
+  expires_at: number;
+}
+
+/**
+ * Every counted STT response earns cleanup capacity (decision 1): words
+ * accumulate inside the 15-minute window, calls regenerate up to the cap, and
+ * an expired grant restarts from the latest transcription.
+ */
+export async function grantCleanup(
+  db: D1Database,
+  userId: string,
+  words: number,
+  now: number,
+  callsPerTranscription: number,
+  maxCalls: number,
+  ttlSeconds: number,
+): Promise<void> {
+  if (words <= 0) return;
+  await db
+    .prepare(
+      `INSERT INTO cleanup_grants (user_id, words, calls_left, expires_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         words = CASE
+           WHEN cleanup_grants.expires_at <= ? THEN excluded.words
+           ELSE cleanup_grants.words + excluded.words
+         END,
+         calls_left = CASE
+           WHEN cleanup_grants.expires_at <= ? THEN excluded.calls_left
+           ELSE MIN(cleanup_grants.calls_left + excluded.calls_left, ?)
+         END,
+         expires_at = excluded.expires_at`,
+    )
+    .bind(
+      userId,
+      words,
+      callsPerTranscription,
+      now + ttlSeconds,
+      now,
+      now,
+      maxCalls,
+    )
+    .run();
+}
+
+/**
+ * Atomically consumes one cleanup call and returns the grant's word budget,
+ * or null when there is no unexpired grant with calls left.
+ */
+export async function consumeCleanupGrant(
+  db: D1Database,
+  userId: string,
+  now: number,
+): Promise<{ words: number } | null> {
+  return db
+    .prepare(
+      `UPDATE cleanup_grants SET calls_left = calls_left - 1
+       WHERE user_id = ? AND calls_left > 0 AND expires_at > ?
+       RETURNING words`,
+    )
+    .bind(userId, now)
+    .first<{ words: number }>();
+}
+
+/**
+ * Acquires a concurrency lease only when the user has fewer than `max`
+ * unexpired leases. One SQL statement, so two concurrent requests cannot both
+ * pass the count check.
+ */
+export async function acquireSttLease(
+  db: D1Database,
+  leaseId: string,
+  userId: string,
+  now: number,
+  expiresAt: number,
+  max: number,
+): Promise<boolean> {
+  const results = await db.batch([
+    db
+      .prepare(
+        "DELETE FROM stt_leases WHERE user_id = ? AND expires_at <= ?",
+      )
+      .bind(userId, now),
+    db
+      .prepare(
+        `INSERT INTO stt_leases (id, user_id, expires_at)
+         SELECT ?, ?, ?
+         WHERE (
+           SELECT COUNT(*) FROM stt_leases
+           WHERE user_id = ? AND expires_at > ?
+         ) < ?`,
+      )
+      .bind(leaseId, userId, expiresAt, userId, now, max),
+  ]);
+  return (results[1]?.meta.changes ?? 0) > 0;
+}
+
+export async function releaseSttLease(
+  db: D1Database,
+  leaseId: string,
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM stt_leases WHERE id = ?")
+    .bind(leaseId)
+    .run();
+}
+
+export async function getSttFailures(
+  db: D1Database,
+  userId: string,
+  weekStart: number,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      "SELECT failures FROM stt_failures WHERE user_id = ? AND week_start = ?",
+    )
+    .bind(userId, weekStart)
+    .first<{ failures: number }>();
+  return row?.failures ?? 0;
+}
+
+/** Failed transcriptions do not consume words, so count them separately. */
+export async function addSttFailure(
+  db: D1Database,
+  userId: string,
+  weekStart: number,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO stt_failures (user_id, week_start, failures)
+       VALUES (?, ?, 1)
+       ON CONFLICT(user_id, week_start) DO UPDATE SET
+         failures = stt_failures.failures + 1`,
+    )
+    .bind(userId, weekStart)
     .run();
 }

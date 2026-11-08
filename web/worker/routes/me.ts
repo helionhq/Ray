@@ -2,7 +2,11 @@ import type { Hono } from "hono";
 import type { AppContext } from "../env";
 import { getUsageWords, listSubscriptions } from "../db";
 import { requireEither } from "../auth";
-import { resolvePlan } from "../lib/plan";
+import {
+  entitledProductIds,
+  resolveBillingIssue,
+  resolvePlan,
+} from "../lib/plan";
 import { quotaLimits } from "../lib/quota";
 import { isoFromUnixSeconds, nowSeconds, weekBounds } from "../lib/weeks";
 
@@ -15,13 +19,18 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
       listSubscriptions(c.env.DB, user.id),
       getUsageWords(c.env.DB, user.id, week.weekStart),
     ]);
-    const plan = resolvePlan(subscriptions, now);
+    const plan = resolvePlan(
+      subscriptions,
+      now,
+      entitledProductIds(c.env),
+    );
     const limits = quotaLimits(c.env);
 
     return c.json({
       user: {
         id: user.id,
-        email: user.email,
+        // Decision 9: never null; the empty string means "unknown".
+        email: user.email ?? "",
         name: user.name,
       },
       plan: plan.plan,
@@ -32,6 +41,7 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
         plan.current_period_end === null
           ? null
           : isoFromUnixSeconds(plan.current_period_end),
+      billing_issue: resolveBillingIssue(plan),
       usage: {
         words_used: wordsUsed,
         // The Pro fair-use cap is deliberately hidden from clients.

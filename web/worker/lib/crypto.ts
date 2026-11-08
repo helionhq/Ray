@@ -91,21 +91,48 @@ export function randomToken(byteLength = 32): string {
   return base64UrlEncode(bytes);
 }
 
-export async function hmacSha256Hex(
-  secret: string,
+/** Standard base64 with padding (Svix signatures use this, not base64url). */
+export function base64Encode(bytes: Uint8Array): string {
+  return btoa(bytesToBinary(bytes));
+}
+
+/** Standard base64 decoder; returns null for malformed input. */
+export function base64Decode(value: string): Uint8Array | null {
+  try {
+    const binary = atob(value);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export async function hmacSha256Bytes(
+  key: string | Uint8Array,
   message: string,
-): Promise<string> {
-  const key = await crypto.subtle.importKey(
+): Promise<Uint8Array> {
+  const keyBytes = typeof key === "string" ? encoder.encode(key) : key;
+  const imported = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(secret),
+    keyBytes,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
   const signature = await crypto.subtle.sign(
     "HMAC",
-    key,
+    imported,
     encoder.encode(message),
   );
-  return bytesToHex(new Uint8Array(signature));
+  return new Uint8Array(signature);
+}
+
+export async function hmacSha256Hex(
+  secret: string,
+  message: string,
+): Promise<string> {
+  return bytesToHex(await hmacSha256Bytes(secret, message));
 }

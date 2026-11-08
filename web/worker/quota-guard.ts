@@ -7,7 +7,7 @@
 import type { MiddlewareHandler } from "hono";
 import type { AppContext } from "./env";
 import { getUsageWords, listSubscriptions } from "./db";
-import { resolvePlan } from "./lib/plan";
+import { entitledProductIds, resolvePlan } from "./lib/plan";
 import { decideQuota, quotaLimits } from "./lib/quota";
 import { isoFromUnixSeconds, nowSeconds, weekBounds } from "./lib/weeks";
 
@@ -19,7 +19,11 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
     listSubscriptions(c.env.DB, user.id),
     getUsageWords(c.env.DB, user.id, week.weekStart),
   ]);
-  const plan = resolvePlan(subscriptions, now);
+  const plan = resolvePlan(
+    subscriptions,
+    now,
+    entitledProductIds(c.env),
+  );
   const decision = decideQuota(
     plan.plan,
     wordsUsed,

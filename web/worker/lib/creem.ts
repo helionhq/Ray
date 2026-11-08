@@ -12,7 +12,11 @@ import {
   hmacSha256Hex,
   timingSafeEqualBytes,
 } from "./crypto";
-import { normalizeInterval, type PlanInterval } from "./plan";
+import {
+  normalizeInterval,
+  terminalStatusRank,
+  type PlanInterval,
+} from "./plan";
 
 export const DEFAULT_CREEM_API_BASE = "https://api.creem.io/v1";
 export const CREEM_SIGNATURE_HEADER = "creem-signature";
@@ -27,13 +31,15 @@ export function creemApiBase(raw: string | undefined | null): string {
 /**
  * Creem signs the raw request body with HMAC-SHA256 and sends the lowercase
  * hex digest in `creem-signature`. Comparison is constant time.
+ *
+ * A missing/blank secret always fails closed.
  */
 export async function verifyCreemSignature(
   rawBody: string,
   signatureHeader: string | null | undefined,
-  secret: string,
+  secret: string | null | undefined,
 ): Promise<boolean> {
-  if (!signatureHeader || secret === "") return false;
+  if (!signatureHeader || !secret || secret.trim() === "") return false;
   const signature = signatureHeader.trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/u.test(signature)) return false;
   const provided = hexToBytes(signature);
@@ -220,6 +226,81 @@ function buildSubscriptionEvent(
 }
 
 /**
+ * `refund.created` and `dispute.created` carry the subscription nested under
+ * `object.subscription` (the transaction only repeats its id). Both revoke
+ * entitlement immediately: status `revoked`, never entitled.
+ *
+ * Payload shape verified against https://docs.creem.io/code/webhooks:
+ * object = { id, object, status, transaction: {...}, subscription: {id,
+ * product, customer, current_period_end_date, updated_at, metadata?},
+ * checkout?: {metadata?}, customer: {id, email}, created_at }.
+ */
+function parseRevocationEvent(
+  eventType: string,
+  object: Record<string, unknown>,
+  envelopeTimestamp: number | null,
+  options: BuildOptions,
+): ParsedWebhookEvent {
+  const subscription = recordAt(object, "subscription");
+  if (!subscription) {
+    return { kind: "ignored", reason: "revocation_without_subscription" };
+  }
+  const transaction = recordAt(object, "transaction");
+  const subscriptionId =
+    stringAt(subscription, "id") ??
+    stringAt(transaction, "subscription");
+  if (!subscriptionId) {
+    return { kind: "ignored", reason: "missing_subscription_id" };
+  }
+
+  const checkout = recordAt(object, "checkout");
+  const order = recordAt(object, "order");
+  const customer = recordAt(object, "customer");
+  const productId =
+    stringAt(subscription, "product") ??
+    stringAt(checkout, "product") ??
+    stringAt(order, "product");
+
+  const checkoutMetadata = recordAt(checkout, "metadata");
+  const subscriptionMetadata = recordAt(subscription, "metadata");
+  const metadata =
+    checkoutMetadata || subscriptionMetadata
+      ? {
+          ...(checkoutMetadata ?? {}),
+          ...(subscriptionMetadata ?? {}),
+        }
+      : null;
+
+  return {
+    kind: "subscription",
+    subscription: {
+      subscriptionId,
+      status: "revoked",
+      productId,
+      interval: inferInterval(productId, null, options),
+      customerId:
+        stringAt(customer, "id") ??
+        stringAt(transaction, "customer") ??
+        stringAt(subscription, "customer"),
+      customerEmail: stringAt(customer, "email"),
+      metadataUserId:
+        stringAt(metadata, "user_id") ??
+        stringAt(metadata, "userId"),
+      currentPeriodEnd: toUnixSeconds(
+        subscription["current_period_end_date"] ??
+          subscription["current_period_end"],
+      ),
+      cancelAtPeriodEnd: false,
+      eventTimestamp:
+        toUnixMillis(subscription["updated_at"]) ??
+        toUnixMillis(object["created_at"]) ??
+        envelopeTimestamp ??
+        0,
+    },
+  };
+}
+
+/**
  * Turns a verified Creem webhook envelope into the state we persist.
  * Unknown event types are acknowledged and ignored.
  */
@@ -271,6 +352,10 @@ export function parseCreemWebhook(
     });
   }
 
+  if (eventType === "refund.created" || eventType === "dispute.created") {
+    return parseRevocationEvent(eventType, object, envelopeTimestamp, options);
+  }
+
   if (eventType.startsWith("subscription.")) {
     const product = recordAt(object, "product");
     return buildSubscriptionEvent({
@@ -291,15 +376,25 @@ export function parseCreemWebhook(
 
 /**
  * Out-of-order protection: only apply an event whose state timestamp is at
- * least as new as the stored one. Equal timestamps are allowed because
- * different event types for one transition share an `updated_at`.
+ * least as new as the stored one (`updated_at` is unix milliseconds).
+ *
+ * Equal timestamps are normally allowed because different event types for one
+ * transition share an `updated_at`. Terminal statuses (revoked/expired/unpaid)
+ * win ties so an `active` event can never overwrite a refund or dispute that
+ * carries the same timestamp.
  */
 export function shouldApplyUpdate(
   existingUpdatedAt: number | null | undefined,
   incomingUpdatedAt: number,
+  existingStatus?: string | null,
+  incomingStatus?: string | null,
 ): boolean {
   if (existingUpdatedAt === null || existingUpdatedAt === undefined) {
     return true;
   }
-  return incomingUpdatedAt >= existingUpdatedAt;
+  if (incomingUpdatedAt > existingUpdatedAt) return true;
+  if (incomingUpdatedAt < existingUpdatedAt) return false;
+  return (
+    terminalStatusRank(incomingStatus) >= terminalStatusRank(existingStatus)
+  );
 }

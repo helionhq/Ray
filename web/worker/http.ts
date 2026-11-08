@@ -151,6 +151,105 @@ export async function readBodyLimited(
   return { ok: true, text: new TextDecoder().decode(bytes) };
 }
 
+export interface UpstreamFailure {
+  status: 502 | 503;
+  error: "upstream_error" | "upstream_busy";
+  message: string;
+}
+
+/**
+ * Decision 4: upstream auth/rate-limit/5xx statuses must never look like Ray
+ * errors. 401/402/403 (and 5xx) become `upstream_error` 502; upstream 429
+ * becomes `upstream_busy` 503. Other statuses (e.g. a 400 for bad audio) are
+ * passed through unchanged.
+ */
+export function mapUpstreamFailure(
+  status: number,
+): UpstreamFailure | null {
+  if (status === 429) {
+    return {
+      status: 503,
+      error: "upstream_busy",
+      message: "The speech service is busy. Try again.",
+    };
+  }
+  if (status === 401 || status === 402 || status === 403 || status >= 500) {
+    return {
+      status: 502,
+      error: "upstream_error",
+      message: "The upstream service returned an error.",
+    };
+  }
+  return null;
+}
+
+/** The response used when the upstream cannot be reached or times out. */
+export function upstreamUnavailable(): UpstreamFailure {
+  return {
+    status: 502,
+    error: "upstream_error",
+    message: "The upstream service is unavailable.",
+  };
+}
+
+export interface LimitedRequestBody {
+  /** The stream to hand to `fetch`; errors once `maxBytes` is exceeded. */
+  stream: ReadableStream<Uint8Array>;
+  bytesRead(): number;
+  tooLarge(): boolean;
+}
+
+/**
+ * Wraps a request body so it can be streamed upstream while enforcing a byte
+ * cap. No unbounded buffer is ever allocated: the cap is checked per chunk
+ * (covers a missing or lying `Content-Length`).
+ */
+export function createLimitedBody(
+  body: ReadableStream<Uint8Array>,
+  maxBytes: number,
+): LimitedRequestBody {
+  const reader = body.getReader();
+  let total = 0;
+  let exceeded = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        total += value.byteLength;
+        if (total > maxBytes) {
+          exceeded = true;
+          try {
+            await reader.cancel();
+          } catch {
+            // The source is already gone; nothing else to clean up.
+          }
+          controller.error(new Error("payload_too_large"));
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      reader.cancel(reason).catch(() => {
+        // Best effort; the consumer cancelled the upload.
+      });
+    },
+  });
+
+  return {
+    stream,
+    bytesRead: () => total,
+    tooLarge: () => exceeded,
+  };
+}
+
 /** Extracts a short human-readable message from an upstream error body. */
 export function upstreamErrorMessage(
   text: string,

@@ -1,14 +1,18 @@
 import { describe, expect, it } from "vitest";
 import type { SubscriptionRow } from "../worker/env";
 import {
+  entitledProductIds,
   isEntitled,
   normalizeInterval,
+  resolveBillingIssue,
   resolvePlan,
+  terminalStatusRank,
 } from "../worker/lib/plan";
 
 const NOW = Math.floor(Date.parse("2026-11-08T12:00:00Z") / 1000);
 const FUTURE = NOW + 10 * 86_400;
 const PAST = NOW - 10 * 86_400;
+const PRODUCTS = ["prod_monthly", "prod_annual"];
 
 function subscription(
   overrides: Partial<SubscriptionRow> = {},
@@ -26,10 +30,34 @@ function subscription(
   };
 }
 
+describe("entitledProductIds", () => {
+  it("keeps only the two configured Pro products", () => {
+    expect(
+      entitledProductIds({
+        CREEM_PRODUCT_PRO_MONTHLY: "prod_monthly",
+        CREEM_PRODUCT_PRO_ANNUAL: "prod_annual",
+      }),
+    ).toEqual(["prod_monthly", "prod_annual"]);
+  });
+
+  it("discards blank and placeholder product ids (fails closed)", () => {
+    expect(
+      entitledProductIds({
+        CREEM_PRODUCT_PRO_MONTHLY: "",
+        CREEM_PRODUCT_PRO_ANNUAL: "prod_REPLACE_ANNUAL",
+      }),
+    ).toEqual([]);
+  });
+});
+
 describe("isEntitled", () => {
   it("grants Pro for active and trialing subscriptions", () => {
-    expect(isEntitled(subscription({ status: "active" }), NOW)).toBe(true);
-    expect(isEntitled(subscription({ status: "trialing" }), NOW)).toBe(true);
+    expect(
+      isEntitled(subscription({ status: "active" }), NOW, PRODUCTS),
+    ).toBe(true);
+    expect(
+      isEntitled(subscription({ status: "trialing" }), NOW, PRODUCTS),
+    ).toBe(true);
   });
 
   it("grants Pro for canceled/scheduled_cancel before period end", () => {
@@ -37,6 +65,7 @@ describe("isEntitled", () => {
       isEntitled(
         subscription({ status: "canceled", current_period_end: FUTURE }),
         NOW,
+        PRODUCTS,
       ),
     ).toBe(true);
     expect(
@@ -46,6 +75,7 @@ describe("isEntitled", () => {
           current_period_end: FUTURE,
         }),
         NOW,
+        PRODUCTS,
       ),
     ).toBe(true);
   });
@@ -55,12 +85,14 @@ describe("isEntitled", () => {
       isEntitled(
         subscription({ status: "canceled", current_period_end: PAST }),
         NOW,
+        PRODUCTS,
       ),
     ).toBe(false);
     expect(
       isEntitled(
         subscription({ status: "canceled", current_period_end: null }),
         NOW,
+        PRODUCTS,
       ),
     ).toBe(false);
   });
@@ -72,20 +104,40 @@ describe("isEntitled", () => {
       "unpaid",
       "paused",
       "scheduled_cancel",
+      "revoked",
     ]) {
       expect(
         isEntitled(
           subscription({ status, current_period_end: PAST }),
           NOW,
+          PRODUCTS,
         ),
       ).toBe(false);
     }
+  });
+
+  it("never grants Pro for a product outside the allowlist", () => {
+    for (const productId of ["prod_other", "prod_free", null]) {
+      expect(
+        isEntitled(
+          subscription({ product_id: productId, status: "active" }),
+          NOW,
+          PRODUCTS,
+        ),
+      ).toBe(false);
+    }
+  });
+
+  it("fails closed when no Pro products are configured", () => {
+    expect(
+      isEntitled(subscription({ status: "active" }), NOW, []),
+    ).toBe(false);
   });
 });
 
 describe("resolvePlan", () => {
   it("returns Starter with nulls when there are no subscriptions", () => {
-    expect(resolvePlan([], NOW)).toEqual({
+    expect(resolvePlan([], NOW, PRODUCTS)).toEqual({
       plan: "starter",
       interval: null,
       status: null,
@@ -96,7 +148,7 @@ describe("resolvePlan", () => {
   });
 
   it("returns Pro for an active monthly subscription", () => {
-    const view = resolvePlan([subscription()], NOW);
+    const view = resolvePlan([subscription()], NOW, PRODUCTS);
     expect(view.plan).toBe("pro");
     expect(view.interval).toBe("monthly");
     expect(view.status).toBe("active");
@@ -121,6 +173,7 @@ describe("resolvePlan", () => {
         }),
       ],
       NOW,
+      PRODUCTS,
     );
     expect(view.plan).toBe("pro");
     expect(view.subscription_id).toBe("sub_active");
@@ -129,8 +182,14 @@ describe("resolvePlan", () => {
 
   it("reports cancel_at_period_end for a scheduled cancellation", () => {
     const view = resolvePlan(
-      [subscription({ status: "scheduled_cancel", cancel_at_period_end: 1 })],
+      [
+        subscription({
+          status: "scheduled_cancel",
+          cancel_at_period_end: 1,
+        }),
+      ],
       NOW,
+      PRODUCTS,
     );
     expect(view.plan).toBe("pro");
     expect(view.cancel_at_period_end).toBe(true);
@@ -147,6 +206,7 @@ describe("resolvePlan", () => {
         }),
       ],
       NOW,
+      PRODUCTS,
     );
     expect(view.plan).toBe("starter");
     expect(view.status).toBe("canceled");
@@ -158,14 +218,26 @@ describe("resolvePlan", () => {
       resolvePlan(
         [subscription({ status: "expired", current_period_end: PAST })],
         NOW,
+        PRODUCTS,
       ).plan,
     ).toBe("starter");
     expect(
       resolvePlan(
         [subscription({ status: "past_due", current_period_end: FUTURE })],
         NOW,
+        PRODUCTS,
       ).plan,
     ).toBe("starter");
+  });
+
+  it("returns Starter for an active subscription on another product", () => {
+    const view = resolvePlan(
+      [subscription({ product_id: "prod_other", status: "active" })],
+      NOW,
+      PRODUCTS,
+    );
+    expect(view.plan).toBe("starter");
+    expect(view.status).toBe("active");
   });
 
   it("shows the most recently updated row when nothing is entitled", () => {
@@ -186,21 +258,102 @@ describe("resolvePlan", () => {
         }),
       ],
       NOW,
+      PRODUCTS,
     );
     expect(view.plan).toBe("starter");
     expect(view.subscription_id).toBe("sub_new");
     expect(view.interval).toBe("annual");
   });
 
+  it("prefers a terminal status on an updated_at tie", () => {
+    const view = resolvePlan(
+      [
+        subscription({
+          id: "sub_active",
+          status: "active",
+          product_id: "prod_other",
+          updated_at: NOW,
+        }),
+        subscription({
+          id: "sub_revoked",
+          status: "revoked",
+          product_id: "prod_other",
+          updated_at: NOW,
+        }),
+      ],
+      NOW,
+      PRODUCTS,
+    );
+    expect(view.plan).toBe("starter");
+    expect(view.subscription_id).toBe("sub_revoked");
+  });
+
   it("normalises stored intervals", () => {
     const view = resolvePlan(
       [subscription({ interval: "annual" })],
       NOW,
+      PRODUCTS,
     );
     expect(view.interval).toBe("annual");
     expect(
-      resolvePlan([subscription({ interval: "week" })], NOW).interval,
+      resolvePlan(
+        [subscription({ interval: "week" })],
+        NOW,
+        PRODUCTS,
+      ).interval,
     ).toBeNull();
+  });
+});
+
+describe("resolveBillingIssue", () => {
+  it("reports past_due, unpaid and paused for a Starter account", () => {
+    for (const status of ["past_due", "unpaid", "paused"]) {
+      const view = resolvePlan(
+        [subscription({ status })],
+        NOW,
+        PRODUCTS,
+      );
+      expect(view.plan).toBe("starter");
+      expect(resolveBillingIssue(view)).toBe(status);
+    }
+  });
+
+  it("returns null for entitled Pro and other Starter states", () => {
+    expect(
+      resolveBillingIssue(resolvePlan([subscription()], NOW, PRODUCTS)),
+    ).toBeNull();
+    for (const status of ["expired", "revoked", "canceled"]) {
+      expect(
+        resolveBillingIssue(
+          resolvePlan(
+            [
+              subscription({
+                status,
+                current_period_end: PAST,
+              }),
+            ],
+            NOW,
+            PRODUCTS,
+          ),
+        ),
+      ).toBeNull();
+    }
+  });
+});
+
+describe("terminalStatusRank", () => {
+  it("ranks revoked above expired above unpaid above everything else", () => {
+    expect(terminalStatusRank("revoked")).toBeGreaterThan(
+      terminalStatusRank("expired"),
+    );
+    expect(terminalStatusRank("expired")).toBeGreaterThan(
+      terminalStatusRank("unpaid"),
+    );
+    expect(terminalStatusRank("unpaid")).toBeGreaterThan(
+      terminalStatusRank("active"),
+    );
+    expect(terminalStatusRank(null)).toBe(0);
+    expect(terminalStatusRank(undefined)).toBe(0);
   });
 });
 
