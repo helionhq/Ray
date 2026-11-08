@@ -155,6 +155,42 @@ describe("desktop hand-off", () => {
     });
   });
 
+  it("consumes a code exactly once under concurrent requests", async () => {
+    await seedUser("user_concurrent");
+    const verifier = randomToken();
+    const code = randomToken();
+    const challenge = await pkceChallenge(verifier);
+    await env.DB.prepare(
+      `INSERT INTO auth_codes (code_hash, user_id, challenge, state, expires_at, used_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+    )
+      .bind(
+        await sha256Hex(code),
+        "user_concurrent",
+        challenge,
+        "state_value",
+        nowSeconds() + 300,
+      )
+      .run();
+
+    const exchange = () =>
+      SELF.fetch("https://ray.test/api/desktop/token", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code, verifier }),
+      });
+
+    const responses = await Promise.all([
+      exchange(),
+      exchange(),
+      exchange(),
+    ]);
+    const statuses = responses
+      .map((response) => response.status)
+      .sort((a, b) => a - b);
+    expect(statuses).toEqual([200, 400, 400]);
+  });
+
   it("revokes a device on sign-out", async () => {
     await seedUser("user_signout");
     const token = await seedDevice("user_signout");
