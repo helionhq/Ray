@@ -5,6 +5,7 @@ import type { Env } from "../../worker/env";
 import { randomToken, sha256Hex } from "../../worker/lib/crypto";
 import {
   getSttFailures,
+  getUsage,
   getUsageWords,
 } from "../../worker/db";
 import { BATCH_MAX_BYTES } from "../../worker/routes/stt";
@@ -66,6 +67,8 @@ function workerEnv(): Env {
     CREEM_PRODUCT_PRO_ANNUAL: env.CREEM_PRODUCT_PRO_ANNUAL,
     STARTER_WEEKLY_WORDS: env.STARTER_WEEKLY_WORDS,
     FAIR_USE_WEEKLY_WORDS: env.FAIR_USE_WEEKLY_WORDS,
+    STARTER_WEEKLY_AUDIO_SECONDS: env.STARTER_WEEKLY_AUDIO_SECONDS,
+    FAIR_USE_WEEKLY_AUDIO_SECONDS: env.FAIR_USE_WEEKLY_AUDIO_SECONDS,
     CLEANUP_MODELS: env.CLEANUP_MODELS,
     CLERK_SECRET_KEY: env.CLERK_SECRET_KEY,
     ASSEMBLYAI_API_KEY: env.ASSEMBLYAI_API_KEY,
@@ -95,7 +98,17 @@ function stubFetch(
   return calls;
 }
 
-function syncRequest(token: string, body = "audio"): Request {
+/** Consumes a streamed request body like a real upstream would. */
+async function drainBody(init: RequestInit | undefined): Promise<void> {
+  const body = init?.body as ReadableStream<Uint8Array> | undefined;
+  if (!body) return;
+  const reader = body.getReader();
+  while (!(await reader.read()).done) {
+    // Drain until the limiter closes the stream.
+  }
+}
+
+function syncRequest(token: string, body: BodyInit = "audio"): Request {
   return new Request("https://ray.test/v1/stt/sync", {
     method: "POST",
     headers: {
@@ -358,6 +371,126 @@ describe("word counting and cleanup grants on STT responses", () => {
         weekBounds(nowSeconds()).weekStart,
       ),
     ).toBe(2);
+  });
+});
+
+describe("audio metering (AssemblyAI bills audio time)", () => {
+  it("counts streamed audio seconds even when words are counted", async () => {
+    await seedUser("user_audio_meter");
+    const token = await seedDevice("user_audio_meter");
+    stubFetch(async (_url, init) => {
+      await drainBody(init);
+      return new Response(
+        JSON.stringify({ text: "word", words: [{}] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    // 64,000 PCM16 bytes plus the 44-byte WAV header is exactly 2 seconds.
+    const response = await app.request(
+      syncRequest(token, new Uint8Array(64_044)),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(200);
+
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    expect(await getUsage(env.DB, "user_audio_meter", weekStart)).toEqual({
+      words: 1,
+      audioSeconds: 2,
+    });
+  });
+
+  it("counts audio for a zero-word response", async () => {
+    await seedUser("user_audio_zero_words");
+    const token = await seedDevice("user_audio_zero_words");
+    stubFetch(async (_url, init) => {
+      await drainBody(init);
+      return new Response(JSON.stringify({ text: "" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    await app.request(
+      syncRequest(token, new Uint8Array(32_044)),
+      undefined,
+      workerEnv(),
+    );
+
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    expect(await getUsage(env.DB, "user_audio_zero_words", weekStart)).toEqual({
+      words: 0,
+      audioSeconds: 1,
+    });
+  });
+
+  it("counts audio when the upstream request fails", async () => {
+    await seedUser("user_audio_upstream_fail");
+    const token = await seedDevice("user_audio_upstream_fail");
+    stubFetch(async (_url, init) => {
+      await drainBody(init);
+      return new Response("boom", { status: 500 });
+    });
+
+    const response = await app.request(
+      syncRequest(token, new Uint8Array(32_044)),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(502);
+
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    expect(
+      await getUsage(env.DB, "user_audio_upstream_fail", weekStart),
+    ).toEqual({ words: 0, audioSeconds: 1 });
+    expect(
+      await getSttFailures(env.DB, "user_audio_upstream_fail", weekStart),
+    ).toBe(1);
+  });
+
+  it("counts batch audio seconds", async () => {
+    await seedUser("user_audio_batch");
+    const token = await seedDevice("user_audio_batch");
+    stubFetch(async (url, init) => {
+      if (url.endsWith("/upload")) {
+        await drainBody(init);
+        return new Response(JSON.stringify({ upload_url: "https://u.test/a" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          id: "tran_audio",
+          status: "completed",
+          text: "hello world",
+          words: [{}, {}],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    // 96,000 PCM16 bytes plus the WAV header is 3 seconds.
+    const response = await app.request(
+      new Request("https://ray.test/v1/stt/batch", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "audio/wav",
+        },
+        body: new Uint8Array(96_044),
+      }),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(200);
+
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    expect(await getUsage(env.DB, "user_audio_batch", weekStart)).toEqual({
+      words: 2,
+      audioSeconds: 3,
+    });
   });
 });
 

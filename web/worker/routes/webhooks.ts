@@ -68,10 +68,13 @@ interface SubscriptionStatements {
   applied: boolean;
   ignored?: string;
   statements: D1PreparedStatement[];
+  /** Index of the subscription upsert in `statements`; -1 when not applied. */
+  subscriptionStatementIndex: number;
   /**
    * Set only when the event activates Pro (`active`/`trialing`): the user id
-   * whose in-flight checkout this event proves completed. A late or duplicate
-   * event for an old subscription must not release the claim.
+   * whose in-flight checkout this event proves completed. The claim is
+   * released only if the subscription upsert also changed a row, so a late
+   * event for an old subscription cannot release a newer claim.
    */
   checkoutCompletedFor: string | null;
 }
@@ -104,6 +107,7 @@ async function subscriptionStatements(
       applied: false,
       ignored: "product_not_allowed",
       statements: [],
+      subscriptionStatementIndex: -1,
       checkoutCompletedFor: null,
     };
   }
@@ -125,6 +129,7 @@ async function subscriptionStatements(
       applied: false,
       ignored: "user_not_found",
       statements: [],
+      subscriptionStatementIndex: -1,
       checkoutCompletedFor: null,
     };
   }
@@ -145,6 +150,7 @@ async function subscriptionStatements(
       setCreemCustomerIdStatement(env.DB, userId, event.customerId),
     );
   }
+  const subscriptionStatementIndex = statements.length;
   statements.push(
     upsertSubscriptionStatement(env.DB, {
       id: event.subscriptionId,
@@ -165,6 +171,7 @@ async function subscriptionStatements(
   return {
     applied: true,
     statements,
+    subscriptionStatementIndex,
     checkoutCompletedFor: activatesPro ? userId : null,
   };
 }
@@ -229,6 +236,7 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
       let applied = false;
       let ignored: string | undefined;
       let statements: D1PreparedStatement[] = [];
+      let subscriptionStatementIndex = -1;
       let checkoutCompletedFor: string | null = null;
       try {
         const parsed = parseCreemWebhook(event, {
@@ -243,6 +251,7 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
           applied = result.applied;
           ignored = result.ignored;
           statements = result.statements;
+          subscriptionStatementIndex = result.subscriptionStatementIndex;
           checkoutCompletedFor = result.checkoutCompletedFor;
         } else {
           ignored = parsed.reason;
@@ -260,6 +269,7 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
 
       const now = nowSeconds();
       let duplicate = false;
+      let subscriptionChanged = false;
       try {
         // State first, idempotency marker last, in one transaction. If the
         // batch fails, neither the state nor the marker is written, so
@@ -270,6 +280,11 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
         ]);
         const marker = results[results.length - 1];
         duplicate = (marker?.meta.changes ?? 0) === 0;
+        // The subscription upsert is a no-op when the stored row is newer, so
+        // `meta.changes` is the proof that this event really changed state.
+        subscriptionChanged =
+          subscriptionStatementIndex >= 0 &&
+          (results[subscriptionStatementIndex]?.meta.changes ?? 0) > 0;
       } catch {
         console.error("creem webhook batch failed");
         return c.json(
@@ -286,10 +301,11 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
       }
 
       // The slot is released only when this event was newly applied (the
-      // marker above proves it was not a duplicate) and it activates Pro.
-      // Releasing it for any other event would reopen the double-checkout
-      // window this claim exists to close.
-      if (checkoutCompletedFor !== null) {
+      // marker above proves it was not a duplicate), it activates Pro, and
+      // the subscription upsert actually changed the stored row. A late
+      // activation for a subscription the store already superseded must not
+      // reopen the double-checkout window this claim exists to close.
+      if (checkoutCompletedFor !== null && subscriptionChanged) {
         try {
           await clearPendingCheckoutStatement(
             c.env.DB,

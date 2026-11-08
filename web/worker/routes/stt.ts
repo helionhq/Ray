@@ -2,7 +2,8 @@
  * Speech-to-text proxies.
  *
  * Audio and transcripts pass through memory only. Nothing in this file logs a
- * request or response body, and only word counts are written to D1.
+ * request or response body, and only word counts and streamed audio seconds
+ * (metered from bytes, never the audio itself) are written to D1.
  *
  * `/v1/stt/sync-live` forwards the original streamed multipart body without
  * buffering it. `/v1/stt/batch` implements the v2 upload/create/poll fallback
@@ -12,7 +13,7 @@
 import type { Context, Hono } from "hono";
 import type { AppContext } from "../env";
 import { requireDevice } from "../auth";
-import { addSttFailure, addWords, grantCleanup } from "../db";
+import { addSttFailure, addUsage, grantCleanup } from "../db";
 import { quotaGuard } from "../quota-guard";
 import { sttGuard } from "../stt-guard";
 import { rateLimitUser } from "../lib/rate-limit";
@@ -51,20 +52,32 @@ const MAX_KEYTERMS = 1_000;
  */
 export const BATCH_MAX_BYTES = 12 * 1024 * 1024;
 const DEFAULT_SPEECH_MODELS = ["universal-3-5-pro", "universal-2"];
+/** PCM16 mono 16 kHz is 32,000 bytes per second. */
+const AUDIO_BYTES_PER_SECOND = 32_000;
+/** WAV files carry a 44-byte header before the PCM samples. */
+const WAV_HEADER_BYTES = 44;
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function recordUsage(
+function audioSecondsFromBytes(bytes: number): number {
+  return Math.ceil(
+    Math.max(0, bytes - WAV_HEADER_BYTES) / AUDIO_BYTES_PER_SECOND,
+  );
+}
+
+/**
+ * Counts a transcript's words. An empty transcript (silence, noise) still
+ * costs an upstream transcription but consumes no quota, so it counts against
+ * the weekly failure budget instead.
+ */
+async function recordWords(
   c: Context<AppContext>,
   weekStart: number,
   words: number,
 ): Promise<void> {
   if (words <= 0) {
-    // Audio that produced no words (silence, noise) still costs an upstream
-    // transcription but never consumes quota, so it counts against the same
-    // weekly failure budget instead of running unmetered.
     try {
       await addSttFailure(c.env.DB, c.get("user").id, weekStart);
     } catch {
@@ -72,7 +85,7 @@ async function recordUsage(
     }
     return;
   }
-  await addWords(c.env.DB, c.get("user").id, weekStart, words);
+  await addUsage(c.env.DB, c.get("user").id, weekStart, words);
   try {
     // Every counted transcription earns cleanup capacity (decision 1).
     await grantCleanup(
@@ -88,6 +101,26 @@ async function recordUsage(
     // Cleanup will fail closed (403) if the grant cannot be stored; a
     // transcript that was already produced must still reach the user.
     console.error("failed to update cleanup grant");
+  }
+}
+
+/**
+ * Meters the audio that actually reached upstream, in seconds. AssemblyAI
+ * bills audio time, so this is charged for every request, including ones that
+ * return an empty transcript or fail upstream. Best effort: metering must
+ * never mask the response.
+ */
+async function recordAudioUsage(
+  c: Context<AppContext>,
+  weekStart: number,
+  bytes: number,
+): Promise<void> {
+  const seconds = audioSecondsFromBytes(bytes);
+  if (seconds <= 0) return;
+  try {
+    await addUsage(c.env.DB, c.get("user").id, weekStart, 0, seconds);
+  } catch {
+    console.error("failed to record stt audio usage");
   }
 }
 
@@ -113,55 +146,61 @@ async function proxySync(
   // cannot push an unbounded body (and an unbounded upstream bill) through.
   const limited = createLimitedBody(body, BATCH_MAX_BYTES);
 
-  const headers = new Headers();
-  headers.set("authorization", c.env.ASSEMBLYAI_API_KEY);
-  const contentType = c.req.header("content-type");
-  if (contentType) headers.set("content-type", contentType);
-  const model = c.req.header("x-aai-model");
-  if (model) headers.set("X-AAI-Model", model);
-
-  let upstream: Response;
   try {
-    // Forward the incoming stream directly. Do not call text()/json() on the
-    // request before this line: that would buffer the audio.
-    upstream = await fetch(upstreamUrl, {
-      method: "POST",
-      headers,
-      body: limited.stream,
-      redirect: "manual",
-    });
-  } catch {
+    const headers = new Headers();
+    headers.set("authorization", c.env.ASSEMBLYAI_API_KEY);
+    const contentType = c.req.header("content-type");
+    if (contentType) headers.set("content-type", contentType);
+    const model = c.req.header("x-aai-model");
+    if (model) headers.set("X-AAI-Model", model);
+
+    let upstream: Response;
+    try {
+      // Forward the incoming stream directly. Do not call text()/json() on the
+      // request before this line: that would buffer the audio.
+      upstream = await fetch(upstreamUrl, {
+        method: "POST",
+        headers,
+        body: limited.stream,
+        redirect: "manual",
+      });
+    } catch {
+      if (limited.tooLarge()) return payloadTooLarge(c);
+      const failure = upstreamUnavailable();
+      return c.json(
+        { error: failure.error, message: failure.message },
+        failure.status,
+      );
+    }
     if (limited.tooLarge()) return payloadTooLarge(c);
-    const failure = upstreamUnavailable();
-    return c.json(
-      { error: failure.error, message: failure.message },
-      failure.status,
-    );
-  }
-  if (limited.tooLarge()) return payloadTooLarge(c);
 
-  const text = await upstream.text();
-  if (upstream.ok) {
-    await recordUsage(
-      c,
-      weekStart,
-      countTranscriptWords(parseJsonObject(text)),
-    );
-  }
+    const text = await upstream.text();
+    if (upstream.ok) {
+      await recordWords(
+        c,
+        weekStart,
+        countTranscriptWords(parseJsonObject(text)),
+      );
+    }
 
-  // Decision 4: upstream auth/rate-limit/5xx never look like Ray errors.
-  const failure = mapUpstreamFailure(upstream.status);
-  if (failure) {
-    return c.json(
-      { error: failure.error, message: failure.message },
-      failure.status,
-    );
-  }
+    // Decision 4: upstream auth/rate-limit/5xx never look like Ray errors.
+    const failure = mapUpstreamFailure(upstream.status);
+    if (failure) {
+      return c.json(
+        { error: failure.error, message: failure.message },
+        failure.status,
+      );
+    }
 
-  return new Response(text, {
-    status: upstream.status,
-    headers: passthroughHeaders(upstream),
-  });
+    return new Response(text, {
+      status: upstream.status,
+      headers: passthroughHeaders(upstream),
+    });
+  } finally {
+    // Charge the audio that reached upstream even when the transcript was
+    // empty or the request failed.
+    await recordAudioUsage(c, weekStart, limited.bytesRead());
+  }
 }
 
 interface KeytermsResult {
@@ -268,6 +307,7 @@ function prependChunk(
 
 async function batchTranscribe(
   c: Context<AppContext>,
+  weekStart: number,
   limited: LimitedRequestBody,
   keyterms: string[],
   speechModels: string[],
@@ -412,9 +452,9 @@ async function batchTranscribe(
 
   while (true) {
     if (status === "completed") {
-      await recordUsage(
+      await recordWords(
         c,
-        weekBounds(nowSeconds()).weekStart,
+        weekStart,
         countTranscriptWords(finalPayload),
       );
       return c.json({ text });
@@ -574,7 +614,20 @@ export function registerSttRoutes(app: Hono<AppContext>): void {
         prependChunk(first.value, reader),
         BATCH_MAX_BYTES,
       );
-      return batchTranscribe(c, limited, keyterms.terms, speechModels);
+      const weekStart = weekBounds(nowSeconds()).weekStart;
+      try {
+        return await batchTranscribe(
+          c,
+          weekStart,
+          limited,
+          keyterms.terms,
+          speechModels,
+        );
+      } finally {
+        // Charge the audio that reached upstream even when transcription
+        // failed or produced no text.
+        await recordAudioUsage(c, weekStart, limited.bytesRead());
+      }
     },
   );
 }

@@ -6,7 +6,7 @@
 
 import type { MiddlewareHandler } from "hono";
 import type { AppContext } from "./env";
-import { getUsageWords, listSubscriptions } from "./db";
+import { getUsage, listSubscriptions } from "./db";
 import { entitledProductIds, resolvePlan } from "./lib/plan";
 import { decideQuota, quotaLimits } from "./lib/quota";
 import { isoFromUnixSeconds, nowSeconds, weekBounds } from "./lib/weeks";
@@ -15,9 +15,9 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
   const user = c.get("user");
   const now = nowSeconds();
   const week = weekBounds(now);
-  const [subscriptions, wordsUsed] = await Promise.all([
+  const [subscriptions, usage] = await Promise.all([
     listSubscriptions(c.env.DB, user.id),
-    getUsageWords(c.env.DB, user.id, week.weekStart),
+    getUsage(c.env.DB, user.id, week.weekStart),
   ]);
   const plan = resolvePlan(
     subscriptions,
@@ -26,7 +26,8 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
   );
   const decision = decideQuota(
     plan.plan,
-    wordsUsed,
+    usage.words,
+    usage.audioSeconds,
     quotaLimits(c.env),
     week.resetsAt,
   );

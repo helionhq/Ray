@@ -87,15 +87,17 @@ placeholder before deploying.
 | `ASSEMBLYAI_API_KEY` | secret | AssemblyAI key used for STT and the LLM gateway |
 | `CREEM_API_KEY` | secret | Creem API key (`creem_test_…` / `creem_…`) |
 | `CREEM_WEBHOOK_SECRET` | secret | Creem webhook signing secret (`whsec_…`). Missing/blank means every Creem webhook is rejected with 401. |
-| `CLERK_WEBHOOK_SECRET` | secret (optional) | Svix signing secret for Clerk webhooks. When unset, `POST /api/webhooks/clerk` answers 503 and nothing else changes. |
+| `CLERK_WEBHOOK_SECRET` | secret (required) | Svix signing secret for Clerk webhooks. Required for account deletion: when unset, `POST /api/webhooks/clerk` answers 503 and deleted accounts keep their PII, device access and Creem subscription. |
 | `CREEM_API_BASE` | var | `https://test-api.creem.io` or `https://api.creem.io` |
 | `CREEM_PRODUCT_PRO_MONTHLY` | var | Creem product id for Pro Monthly ($8/mo) |
 | `CREEM_PRODUCT_PRO_ANNUAL` | var | Creem product id for Pro Annual ($72/yr) |
 | `STARTER_WEEKLY_WORDS` | var | Starter weekly allowance, default `1000` |
 | `FAIR_USE_WEEKLY_WORDS` | var | Hidden Pro fair-use cap, default `100000` |
+| `STARTER_WEEKLY_AUDIO_SECONDS` | var | Hidden Starter weekly audio budget, default `3600` (60 minutes). Audio seconds are metered from bytes streamed to AssemblyAI. |
+| `FAIR_USE_WEEKLY_AUDIO_SECONDS` | var | Hidden Pro weekly audio fair-use cap, default `54000` (15 hours) |
 | `CLEANUP_MODELS` | var | Comma-separated model allowlist, default `gemma-4-31b` |
 
-Set the four required secrets in production (and optionally the Clerk one):
+Set the five required secrets in production:
 
 ```bash
 cd web
@@ -103,8 +105,8 @@ wrangler secret put CLERK_SECRET_KEY
 wrangler secret put ASSEMBLYAI_API_KEY
 wrangler secret put CREEM_API_KEY
 wrangler secret put CREEM_WEBHOOK_SECRET
-# Optional: enables the Clerk user.deleted webhook.
-# wrangler secret put CLERK_WEBHOOK_SECRET
+# Required: enables the Clerk user.deleted webhook (account deletion).
+wrangler secret put CLERK_WEBHOOK_SECRET
 ```
 
 `wrangler dev` reads `.dev.vars`; keep that file out of git (it is ignored).
@@ -140,11 +142,12 @@ passing `authorizedParties` derived from `SITE_URL` (an empty/invalid
 publishable key is parseable, the `issuer` derived from its Frontend API
 host. It fetches the user's email/name from Clerk the first time it sees them.
 
-### Optional: Clerk `user.deleted` webhook
+### Clerk `user.deleted` webhook (required for account deletion)
 
 Create a Clerk webhook pointing at `{SITE_URL}/api/webhooks/clerk`, subscribe
 to `user.deleted`, and store the Svix signing secret as
-`CLERK_WEBHOOK_SECRET`. The endpoint verifies `svix-id`,
+`CLERK_WEBHOOK_SECRET`. Account deletion depends on this webhook, so treat it
+and the secret as required launch steps. The endpoint verifies `svix-id`,
 `svix-timestamp` (five-minute tolerance) and `svix-signature` over the raw
 body. On `user.deleted` it cancels any still-renewing Creem subscriptions
 (best effort, `POST /v1/subscriptions/{id}/cancel` with `mode: "immediate"`),
@@ -152,7 +155,8 @@ revokes every device token, deletes outstanding desktop sign-in codes, and
 soft-deletes the user so device tokens and Clerk sessions stop working
 immediately. A Creem cancellation failure is logged (without user ids) and
 never fails the webhook, so deletion always proceeds. Without the secret the
-endpoint answers 503 and is effectively disabled. Other Clerk event types are
+endpoint answers 503 and deletion does not run, so the privacy policy's
+deletion promise would not be honored. Other Clerk event types are
 acknowledged and ignored.
 
 ## Creem setup
@@ -214,7 +218,9 @@ pnpm db:migrate:remote     # the real database
 Schema lives in `migrations/`. Add new migrations as
 `0002_description.sql`, etc. `0002_review_round.sql` adds
 `cleanup_grants`, `stt_leases`, `stt_failures`, `users.deleted_at` and the
-unique `creem_customer_id` index; `0001_init.sql` is never edited.
+unique `creem_customer_id` index; `0003_pending_checkout.sql` adds
+`pending_checkouts`; `0004_audio_metering.sql` adds
+`usage_weeks.audio_seconds`; `0001_init.sql` is never edited.
 
 ## Build and deploy
 
@@ -249,14 +255,15 @@ Deployment checklist:
       key, Creem product ids)
 - [ ] `VITE_CLERK_PUBLISHABLE_KEY` set for the build and equal to the Worker's
       `CLERK_PUBLISHABLE_KEY`
-- [ ] all four required secrets set with `wrangler secret put` (and
-      `CLERK_WEBHOOK_SECRET` if using the Clerk webhook)
-- [ ] `wrangler d1 create` + `pnpm db:migrate:remote` (includes `0002`)
+- [ ] all five required secrets set with `wrangler secret put`, including
+      `CLERK_WEBHOOK_SECRET`
+- [ ] `wrangler d1 create` + `pnpm db:migrate:remote` (includes `0002`-`0004`)
 - [ ] Clerk authorized parties include the production origin
 - [ ] Creem webhook points at `{SITE_URL}/api/webhooks/creem`, subscribes to
       refunds/disputes, and the signing secret matches
-- [ ] optional: Clerk webhook points at `{SITE_URL}/api/webhooks/clerk` for
-      `user.deleted`
+- [ ] Clerk webhook points at `{SITE_URL}/api/webhooks/clerk`, subscribes to
+      `user.deleted`, and its signing secret matches — required for account
+      deletion
 - [ ] `pnpm typecheck` and `pnpm test` pass
 - [ ] `/v1/ping` returns 204 and `/api/me` returns 401 anonymously
 
@@ -328,7 +335,7 @@ sign-in (the browser hand-off checks `SITE_URL`).
 | POST | `/api/billing/checkout` | either | Creem checkout URL |
 | POST | `/api/billing/portal` | either | Creem customer portal URL |
 | POST | `/api/webhooks/creem` | Creem signature | subscription/refund/dispute lifecycle |
-| POST | `/api/webhooks/clerk` | Svix signature | optional `user.deleted` |
+| POST | `/api/webhooks/clerk` | Svix signature | `user.deleted` (required for account deletion) |
 | POST | `/v1/stt/sync-live` | device | streamed AssemblyAI Sync live proxy (12 MB cap) |
 | POST | `/v1/stt/sync` | device | AssemblyAI Sync batch proxy (12 MB cap) |
 | POST | `/v1/stt/batch` | device | v2 upload/create/poll fallback (12 MB cap) |

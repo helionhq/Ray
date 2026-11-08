@@ -146,39 +146,60 @@ export function clearPendingCheckoutStatement(
     .bind(userId);
 }
 
+export interface WeeklyUsage {
+  words: number;
+  audioSeconds: number;
+}
+
+/** This week's metered usage. Audio seconds stay internal (never in /api/me). */
+export async function getUsage(
+  db: D1Database,
+  userId: string,
+  weekStart: number,
+): Promise<WeeklyUsage> {
+  const row = await db
+    .prepare(
+      `SELECT words, audio_seconds FROM usage_weeks
+       WHERE user_id = ? AND week_start = ?`,
+    )
+    .bind(userId, weekStart)
+    .first<{ words: number; audio_seconds: number }>();
+  return {
+    words: row?.words ?? 0,
+    audioSeconds: row?.audio_seconds ?? 0,
+  };
+}
+
 export async function getUsageWords(
   db: D1Database,
   userId: string,
   weekStart: number,
 ): Promise<number> {
-  const row = await db
-    .prepare(
-      "SELECT words FROM usage_weeks WHERE user_id = ? AND week_start = ?",
-    )
-    .bind(userId, weekStart)
-    .first<{ words: number }>();
-  return row?.words ?? 0;
+  return (await getUsage(db, userId, weekStart)).words;
 }
 
 /**
  * Atomic UPSERT so concurrent dictations cannot lose counts:
- * INSERT ... ON CONFLICT DO UPDATE SET words = words + excluded.words.
+ * INSERT ... ON CONFLICT DO UPDATE SET words = words + excluded.words,
+ * audio_seconds = audio_seconds + excluded.audio_seconds.
  */
-export async function addWords(
+export async function addUsage(
   db: D1Database,
   userId: string,
   weekStart: number,
   words: number,
+  audioSeconds = 0,
 ): Promise<void> {
-  if (words <= 0) return;
+  if (words <= 0 && audioSeconds <= 0) return;
   await db
     .prepare(
-      `INSERT INTO usage_weeks (user_id, week_start, words)
-       VALUES (?, ?, ?)
+      `INSERT INTO usage_weeks (user_id, week_start, words, audio_seconds)
+       VALUES (?, ?, ?, ?)
        ON CONFLICT(user_id, week_start) DO UPDATE SET
-         words = usage_weeks.words + excluded.words`,
+         words = usage_weeks.words + excluded.words,
+         audio_seconds = usage_weeks.audio_seconds + excluded.audio_seconds`,
     )
-    .bind(userId, weekStart, words)
+    .bind(userId, weekStart, words, audioSeconds)
     .run();
 }
 

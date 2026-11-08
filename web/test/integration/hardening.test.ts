@@ -200,6 +200,8 @@ function workerEnv(overrides: Partial<Env> = {}): Env {
     CREEM_PRODUCT_PRO_ANNUAL: env.CREEM_PRODUCT_PRO_ANNUAL,
     STARTER_WEEKLY_WORDS: env.STARTER_WEEKLY_WORDS,
     FAIR_USE_WEEKLY_WORDS: env.FAIR_USE_WEEKLY_WORDS,
+    STARTER_WEEKLY_AUDIO_SECONDS: env.STARTER_WEEKLY_AUDIO_SECONDS,
+    FAIR_USE_WEEKLY_AUDIO_SECONDS: env.FAIR_USE_WEEKLY_AUDIO_SECONDS,
     CLEANUP_MODELS: env.CLEANUP_MODELS,
     CLERK_SECRET_KEY: env.CLERK_SECRET_KEY,
     ASSEMBLYAI_API_KEY: env.ASSEMBLYAI_API_KEY,
@@ -436,6 +438,55 @@ describe("billing integrity — one checkout at a time", () => {
       .run();
     const duplicate = await deliverCreem(event);
     expect(await jsonOf(duplicate)).toMatchObject({ duplicate: true });
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM pending_checkouts WHERE user_id = ?",
+    )
+      .bind(userId)
+      .first<{ count: number }>();
+    expect(row?.count).toBe(1);
+  });
+
+  it("keeps the claim when an old subscription activates with a stale snapshot", async () => {
+    const userId = "user_pending_stale_activation";
+    await seedUser(userId);
+    const newer = Date.now();
+    const older = newer - 60_000;
+
+    // The old subscription is stored canceled at the newer timestamp.
+    expect(
+      await jsonOf(
+        await deliverCreem(
+          creemSubscriptionEvent({
+            eventType: "subscription.canceled",
+            status: "canceled",
+            updatedAtMs: newer,
+            metadata: { user_id: userId },
+            customer: { id: `cust_${userId}` },
+            subscriptionId: `sub_old_${userId}`,
+          }),
+        ),
+      ),
+    ).toMatchObject({ applied: true });
+
+    await env.DB.prepare(
+      "INSERT INTO pending_checkouts (user_id, created_at) VALUES (?, ?)",
+    )
+      .bind(userId, nowSeconds())
+      .run();
+
+    // A new event id, but an older snapshot: the subscription upsert is a
+    // no-op, so this activation must not release the newer checkout claim.
+    const response = await deliverCreem(
+      creemSubscriptionEvent({
+        updatedAtMs: older,
+        metadata: { user_id: userId },
+        customer: { id: `cust_${userId}` },
+        subscriptionId: `sub_old_${userId}`,
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await jsonOf(response)).toMatchObject({ applied: true });
+
     const row = await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM pending_checkouts WHERE user_id = ?",
     )

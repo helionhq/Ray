@@ -11,6 +11,12 @@ deviate, keep the deviation minimal and record it in your final report.
     (default 100,000 words/week, env `FAIR_USE_WEEKLY_WORDS`) protects costs. Never
     advertise the number; show a polite "fair-use limit reached, resets Monday" message only
     when it is actually hit.
+  - Audio abuse budget: AssemblyAI bills audio time, not words, so the Worker also meters
+    the bytes streamed to it. Hidden weekly caps: Starter **60 minutes**
+    (`STARTER_WEEKLY_AUDIO_SECONDS`) and Pro **15 hours** (`FAIR_USE_WEEKLY_AUDIO_SECONDS`).
+    1,000 words is roughly 8-10 minutes of speech, so these only catch silent or
+    near-empty audio abuse. Never advertise them; over either cap STT returns the normal
+    `quota_exceeded` / `fair_use` shapes.
   - Pro price: **$8/month billed monthly**, or **$6/month billed annually ($72/year)**.
 - Auth: **Clerk**, with **email** (code or password, whichever Clerk defaults to) and **Google**.
 - Payments: **Creem** (https://docs.creem.io). Two Creem products: Pro Monthly, Pro Annual.
@@ -18,7 +24,8 @@ deviate, keep the deviation minimal and record it in your final report.
   **one Worker** (Workers Static Assets for the site, `/api/*` and `/v1/*` handled in code).
 - Privacy: audio and transcripts **pass through** the Worker in memory to AssemblyAI and are
   **never stored or logged**. D1 holds only users, device sessions, subscriptions, and
-  weekly **word counts**. Do not `console.log` request or response bodies anywhere.
+  weekly **word counts and audio-second counters**. Do not `console.log` request or
+  response bodies anywhere.
 - The user's own AssemblyAI key is gone. The server holds `ASSEMBLYAI_API_KEY` as a secret.
 - Desktop: no "stream while I speak" toggle (streaming is always on); no Clean mode
   (Structured is the only cleanup mode, with no selector); no API key fields; the
@@ -71,6 +78,8 @@ Worker vars (wrangler `vars`) and secrets:
 | `CREEM_PRODUCT_PRO_ANNUAL` | var | Creem product id |
 | `STARTER_WEEKLY_WORDS` | var | default `1000` |
 | `FAIR_USE_WEEKLY_WORDS` | var | default `100000` |
+| `STARTER_WEEKLY_AUDIO_SECONDS` | var | hidden Starter audio budget, default `3600` (60 min) |
+| `FAIR_USE_WEEKLY_AUDIO_SECONDS` | var | hidden Pro audio fair-use cap, default `54000` (15 h) |
 | `CLEANUP_MODELS` | var | comma-separated allowlist, default `gemma-4-31b` |
 
 Desktop: the API origin lives in `src-tauri/config/pipeline.json` as
@@ -120,7 +129,7 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
 | POST | `/api/billing/checkout` | either | body `{ interval: "monthly" \| "annual" }` → `{ url }` (Creem checkout) |
 | POST | `/api/billing/portal` | either | → `{ url }` (Creem customer portal) |
 | POST | `/api/webhooks/creem` | Creem signature | subscription lifecycle |
-| POST | `/api/webhooks/clerk` | Svix signature | optional Clerk `user.deleted`: cancels still-renewing Creem subscriptions (best effort), revokes devices, soft-deletes the user; `503 not_configured` when `CLERK_WEBHOOK_SECRET` is unset |
+| POST | `/api/webhooks/clerk` | Svix signature | **required** Clerk `user.deleted`: cancels still-renewing Creem subscriptions (best effort), revokes devices, soft-deletes the user; `503 not_configured` when `CLERK_WEBHOOK_SECRET` is unset |
 | POST | `/v1/stt/sync-live` | device | streaming proxy for AssemblyAI Sync live |
 | POST | `/v1/stt/sync` | device | proxy for AssemblyAI Sync batch |
 | POST | `/v1/stt/batch` | device | server-side v2 fallback: body is a WAV (≤ 12 MB); Worker uploads, creates, polls; returns `{ text }` |
@@ -146,6 +155,9 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
 }
 ```
 
+Audio seconds are metered into the same weekly usage row but are **not** part of this
+response (never expose the audio caps).
+
 `user.email` is always a string (`""` when unknown). `billing_issue` is set for a
 non-entitled subscription that still exists and needs a payment-method fix; both UIs
 show "Payment issue: update your card" with the portal button instead of the upgrade
@@ -161,11 +173,11 @@ Otherwise they're Starter.
 |---|---|---|
 | 400 | `invalid_request`, `invalid_messages`, `model_not_allowed`, `invalid_keyterms`, `invalid_interval`, `invalid_audio` | malformed request |
 | 401 | `unauthorized` | invalid/revoked device token or Clerk session; the desktop signs out |
-| 402 | `quota_exceeded` | Starter weekly limit (STT only) |
+| 402 | `quota_exceeded` | Starter weekly word or audio limit (STT only) |
 | 403 | `no_cleanup_grant` | no unexpired cleanup grant, or the tagged transcript exceeds the granted words + 25 |
 | 409 | `billing_issue`, `already_subscribed`, `no_billing_account`, `checkout_pending` | checkout/portal state |
 | 413 | `payload_too_large` (request/audio body) or `message_too_large` (cleanup system/user message) | input over its cap |
-| 429 | `fair_use` | Pro hidden fair-use cap (STT only); this is a quota, not a rate limit |
+| 429 | `fair_use` | Pro hidden word or audio fair-use cap (STT only); this is a quota, not a rate limit |
 | 429 | `too_many_requests` | STT concurrency lease, weekly failure budget, or any rate-limit binding (all rate limits use this code) |
 | 500 | `config_error`, `internal_error`, `billing_not_configured` | server configuration or unexpected failure |
 | 502 | `upstream_error` | upstream 401/402/403/5xx, unreachable, or timed out |
@@ -213,7 +225,13 @@ rate-limited and shows a friendly retry message.
 - Failed transcriptions count against a generous weekly budget (`stt_failures`, 200 per
   week); over it STT answers `429 { "error": "too_many_requests", "resets_at": … }`.
   A successful response that counted zero words (silence or noise) counts the same way:
-  it costs an upstream transcription but consumes no quota.
+  it costs an upstream transcription but consumes no word quota.
+- Audio metering: every STT request adds the bytes streamed to AssemblyAI to
+  `usage_weeks.audio_seconds` (PCM16 mono 16 kHz = 32,000 bytes/s; the 44-byte WAV
+  header is subtracted and the result is rounded up). It is charged on every request
+  that reaches upstream, including empty transcripts and upstream failures. Quota
+  checks compare both words and audio seconds against the plan's limits and return the
+  same `402 quota_exceeded` / `429 fair_use` shapes.
 - Upstream failures never look like Ray errors: upstream 401/402/403/5xx and
   unreachable/timeout become `502 { "error": "upstream_error" }`; an upstream 429 becomes
   `503 { "error": "upstream_busy" }`.
@@ -252,7 +270,7 @@ Cleanup words are **not** counted (STT already counted them).
 - `devices(id TEXT PK, user_id TEXT, token_hash TEXT UNIQUE, created_at INTEGER, last_used_at INTEGER, revoked_at INTEGER)`
 - `auth_codes(code_hash TEXT PK, user_id TEXT, challenge TEXT, state TEXT, expires_at INTEGER, used_at INTEGER)`
 - `subscriptions(id TEXT PK /* creem subscription id */, user_id TEXT, product_id TEXT, interval TEXT, status TEXT, current_period_end INTEGER, cancel_at_period_end INTEGER, updated_at INTEGER)`
-- `usage_weeks(user_id TEXT, week_start INTEGER /* unix seconds, Monday 00:00 UTC */, words INTEGER, PRIMARY KEY(user_id, week_start))`
+- `usage_weeks(user_id TEXT, week_start INTEGER /* unix seconds, Monday 00:00 UTC */, words INTEGER, audio_seconds INTEGER /* internal, never in /api/me */, PRIMARY KEY(user_id, week_start))`
 - `webhook_events(id TEXT PK, received_at INTEGER)` for idempotency
 
 ## Desktop UI expectations
@@ -360,3 +378,9 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
     from the subscription webhook (15-minute TTL), answering `409 checkout_pending` for a second
     attempt, so a delayed webhook cannot lead to a second subscription or charge. Both clients also
     disable the upgrade CTAs while activation is pending.
+17. **Audio cost metering.** AssemblyAI bills audio time, not words, so `usage_weeks` also stores
+    `audio_seconds`, incremented from the bytes streamed upstream on every STT request (empty
+    transcripts and upstream failures included). Starter and Pro each have a hidden weekly audio
+    budget (`STARTER_WEEKLY_AUDIO_SECONDS` = 3,600; `FAIR_USE_WEEKLY_AUDIO_SECONDS` = 54,000)
+    enforced alongside the word limits, with the existing `quota_exceeded` / `fair_use` shapes.
+    Audio numbers are never exposed in `/api/me`.

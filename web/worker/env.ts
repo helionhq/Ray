@@ -20,6 +20,8 @@ export interface Env {
   CREEM_PRODUCT_PRO_ANNUAL: string;
   STARTER_WEEKLY_WORDS: string;
   FAIR_USE_WEEKLY_WORDS: string;
+  STARTER_WEEKLY_AUDIO_SECONDS: string;
+  FAIR_USE_WEEKLY_AUDIO_SECONDS: string;
   CLEANUP_MODELS: string;
 
   // Secrets (wrangler secret put / .dev.vars).

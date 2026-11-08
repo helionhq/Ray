@@ -21,6 +21,32 @@ import { registerWebhookRoutes } from "./routes/webhooks";
 
 const app = new Hono<AppContext>();
 
+// Account deletion (PII clearing, device revocation, Creem cancellation) runs
+// through the Clerk `user.deleted` webhook. Warn once per isolate when a
+// non-local deployment is missing its secret, so a launch-configuration gap is
+// visible in the Worker logs instead of surfacing only when a user deletes.
+let warnedAboutMissingClerkWebhook = false;
+app.use("*", async (c, next) => {
+  const secret = c.env.CLERK_WEBHOOK_SECRET;
+  if (
+    !warnedAboutMissingClerkWebhook &&
+    (secret === undefined || secret.trim() === "")
+  ) {
+    warnedAboutMissingClerkWebhook = true;
+    const siteUrl = c.env.SITE_URL ?? "";
+    const isLocal =
+      siteUrl.startsWith("http://localhost") ||
+      siteUrl.startsWith("http://127.0.0.1") ||
+      siteUrl.startsWith("http://[::1]");
+    if (!isLocal) {
+      console.error(
+        "CLERK_WEBHOOK_SECRET is not set: Clerk user.deleted webhooks (account deletion) are disabled",
+      );
+    }
+  }
+  await next();
+});
+
 app.use("*", securityHeaders);
 app.use("*", corsHeaders);
 

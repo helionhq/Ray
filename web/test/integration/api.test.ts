@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import {
-  addWords,
+  addUsage,
   getUsageWords,
   listSubscriptions,
 } from "../../worker/db";
@@ -223,14 +223,14 @@ describe("desktop hand-off", () => {
 describe("usage weeks", () => {
   it("accumulates words atomically in the current week", async () => {
     const weekStart = weekBounds(nowSeconds()).weekStart;
-    await addWords(env.DB, "user_usage", weekStart, 400);
-    await addWords(env.DB, "user_usage", weekStart, 12);
+    await addUsage(env.DB, "user_usage", weekStart, 400);
+    await addUsage(env.DB, "user_usage", weekStart, 12);
     expect(await getUsageWords(env.DB, "user_usage", weekStart)).toBe(412);
 
     // Concurrent UPSERTs must not lose updates.
     await Promise.all(
       Array.from({ length: 20 }, () =>
-        addWords(env.DB, "user_usage", weekStart, 5),
+        addUsage(env.DB, "user_usage", weekStart, 5),
       ),
     );
     expect(await getUsageWords(env.DB, "user_usage", weekStart)).toBe(512);
@@ -395,7 +395,7 @@ describe("quota enforcement", () => {
     await seedUser("user_quota");
     const token = await seedDevice("user_quota");
     const weekStart = weekBounds(nowSeconds()).weekStart;
-    await addWords(env.DB, "user_quota", weekStart, 1_000);
+    await addUsage(env.DB, "user_quota", weekStart, 1_000);
 
     const response = await SELF.fetch("https://ray.test/v1/stt/sync", {
       method: "POST",
@@ -419,7 +419,7 @@ describe("quota enforcement", () => {
     await seedUser("user_quota_cleanup");
     const token = await seedDevice("user_quota_cleanup");
     const weekStart = weekBounds(nowSeconds()).weekStart;
-    await addWords(env.DB, "user_quota_cleanup", weekStart, 1_000);
+    await addUsage(env.DB, "user_quota_cleanup", weekStart, 1_000);
 
     const response = await SELF.fetch(
       "https://ray.test/v1/cleanup/chat/completions",
@@ -464,7 +464,7 @@ describe("quota enforcement", () => {
         now,
       )
       .run();
-    await addWords(env.DB, "user_fair", weekBounds(now).weekStart, 100_000);
+    await addUsage(env.DB, "user_fair", weekBounds(now).weekStart, 100_000);
 
     const me = await SELF.fetch("https://ray.test/api/me", {
       headers: { authorization: `Bearer ${token}` },
@@ -486,5 +486,73 @@ describe("quota enforcement", () => {
     const body = await jsonOf(response);
     expect(body["error"]).toBe("fair_use");
     expect(typeof body["resets_at"]).toBe("string");
+  });
+
+  it("returns 402 when the Starter weekly audio budget is spent", async () => {
+    await seedUser("user_audio_quota");
+    const token = await seedDevice("user_audio_quota");
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    await addUsage(env.DB, "user_audio_quota", weekStart, 0, 3_600);
+
+    // Audio usage is internal: /api/me never exposes it.
+    const me = await SELF.fetch("https://ray.test/api/me", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const meBody = (await jsonOf(me)) as { usage?: Record<string, unknown> };
+    expect(meBody.usage).toBeDefined();
+    expect(meBody.usage).not.toHaveProperty("audio_seconds");
+
+    const response = await SELF.fetch("https://ray.test/v1/stt/sync", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+      },
+      body: "audio",
+    });
+    expect(response.status).toBe(402);
+    expect(await jsonOf(response)).toMatchObject({
+      error: "quota_exceeded",
+      plan: "starter",
+    });
+  });
+
+  it("returns fair_use when the Pro weekly audio fair-use cap is spent", async () => {
+    await seedUser("user_audio_fair");
+    const token = await seedDevice("user_audio_fair");
+    const now = nowSeconds();
+    await env.DB.prepare(
+      `INSERT INTO subscriptions
+         (id, user_id, product_id, interval, status, current_period_end, cancel_at_period_end, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+    )
+      .bind(
+        "sub_audio_fair",
+        "user_audio_fair",
+        "prod_test_monthly",
+        "monthly",
+        "active",
+        now + 30 * 86_400,
+        now,
+      )
+      .run();
+    await addUsage(
+      env.DB,
+      "user_audio_fair",
+      weekBounds(now).weekStart,
+      0,
+      54_000,
+    );
+
+    const response = await SELF.fetch("https://ray.test/v1/stt/sync", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+      },
+      body: "audio",
+    });
+    expect(response.status).toBe(429);
+    expect((await jsonOf(response))["error"]).toBe("fair_use");
   });
 });
