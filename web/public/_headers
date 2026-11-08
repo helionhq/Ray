@@ -5,9 +5,11 @@
 #
 # Clerk runs its own Frontend API (FAPI). Development instances use
 # https://<slug>.clerk.accounts.dev; a production instance normally uses a
-# custom host such as https://clerk.helionhq.com. If the Clerk dashboard shows
-# a different Frontend API URL, update the FAPI hosts in script-src and
-# connect-src below.
+# custom host such as https://clerk.helionhq.com. `helionhq.com` is a
+# PLACEHOLDER: when the real domain and Clerk FAPI host are chosen, update the
+# FAPI hosts in script-src and connect-src below together with SITE_URL (see
+# "Changing the domain" in web/README.md). If the Clerk dashboard shows a
+# different Frontend API URL, use that host instead.
 #
 # CSP source notes:
 #   'self'                      site assets, self-hosted Geist fonts, same-origin API

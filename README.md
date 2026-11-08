@@ -129,9 +129,14 @@ The embedded cleanup settings are the researched Structured values:
 }
 ```
 
-`cleanup.providers` is an ordered list of `{ "id", "model", "extra_body"? }`.
-All of them go to Ray's cleanup proxy; the `model` id is passed through
-verbatim. A second entry keeps the existing hedge/fallback behavior.
+`cleanup.providers` is an ordered list of `{ "id", "model" }`. All of them go
+to Ray's cleanup proxy; the `model` id is passed through verbatim. The proxy
+forwards a strict whitelist (`model`, `messages`, `temperature`, `max_tokens`,
+`stream`), so extra request-body fields (an old override's `extra_body`) are
+ignored. A second entry keeps the existing hedge/fallback behavior. If the
+expanded system prompt would exceed the proxy's 24 KB cap (a full 200-term
+dictionary), Ray keeps the first dictionary terms that fit and logs the
+truncation.
 
 ## Headless verification
 

@@ -257,6 +257,61 @@ Deployment checklist:
 - [ ] `pnpm typecheck` and `pnpm test` pass
 - [ ] `/v1/ping` returns 204 and `/api/me` returns 401 anonymously
 
+## Changing the domain
+
+`ray.helionhq.com` is a **placeholder** until the real domain is chosen. A
+domain change touches more than `SITE_URL`; work through this list in one
+commit so the Worker, the site, the CSP and the desktop stay in sync.
+
+1. **Worker origin** — `web/wrangler.jsonc`, `vars.SITE_URL`. This drives
+   Clerk's `authorizedParties`, CORS, the Creem `success_url` and the
+   security headers.
+2. **Cloudflare** — add the custom domain to the Worker (Workers → `ray-web` →
+   Settings → Domains & Routes, or a `routes` entry), and point the DNS record
+   at it.
+3. **Site constants** — `web/src/content.ts`:
+   - `SITE_ORIGIN` (canonical, Open Graph and Twitter URLs);
+   - `CONTACT_EMAIL` (`privacy@helionhq.com`) if the mail domain changes;
+   - `DOWNLOAD_URL` / `REPOSITORY_URL` only if the GitHub organisation changes
+     (these are not the site domain).
+4. **Static HTML defaults** — `web/index.html`: the `rel="canonical"` link and
+   the `og:url`, `og:image` and `twitter:image` URLs (what a crawler that does
+   not run JavaScript sees; `web/src/lib/head.ts` rewrites them per route from
+   `SITE_ORIGIN`).
+5. **CSP / security headers** — `web/public/_headers`. The Content-Security
+   Policy names the placeholder Clerk Frontend API (FAPI) hosts
+   `clerk.helionhq.com` and `*.helionhq.com` in both `script-src` and
+   `connect-src`. Replace them with the production Clerk FAPI host
+   (`https://clerk.<real-domain>` or the custom FAPI domain shown in the Clerk
+   dashboard) and the matching wildcard. Keep `https://*.clerk.accounts.dev`
+   for development instances, and `https://challenges.cloudflare.com` /
+   `https://*.protect.clerk.com` for Clerk bot protection. If sign-in shows a
+   CSP violation in the browser console, the FAPI host is the first thing to
+   check.
+6. **Desktop defaults** — `src-tauri/config/pipeline.json`
+   (`api.base_url` and `api.site_url`) and `src-tauri/src/config.rs`
+   (`DEFAULT_API_BASE`, the fallback for an old override with no `api`
+   object). Release builds otherwise keep pointing at the placeholder.
+7. **Clerk dashboard** — add the new origin to the application's allowed
+   origins / authorized parties. The publishable key does not change; it
+   already encodes the Clerk FAPI domain.
+8. **Creem dashboard** — point the webhook at
+   `https://<new-origin>/api/webhooks/creem` and let checkout return to
+   `https://<new-origin>/billing/success` (the Worker builds this from
+   `SITE_URL`).
+9. **Local dev** — update `SITE_URL` in `web/.dev.vars` only if you are
+   testing against that host locally (the example uses
+   `http://localhost:5173`).
+10. **Docs and tests (cosmetic)** — the placeholder also appears as an example
+    in the root `README.md`, this file, `docs/commercial-contract.md`, and in
+    test fixtures (`web/test/auth.test.ts`, `src-tauri/src/api.rs`,
+    `src-tauri/src/auth.rs`, `src-tauri/src/config.rs`). Update them for
+    consistency; they do not affect production behaviour.
+
+Verify after the change: `pnpm typecheck && pnpm test`, then a `wrangler dev`
+smoke test (`/` 200 with the new CSP host, `/api/me` 401), and a desktop
+sign-in (the browser hand-off checks `SITE_URL`).
+
 ## API summary
 
 | Method | Path | Auth | Purpose |
@@ -316,7 +371,10 @@ Plans: **Starter** (1,000 words/week, resets Monday 00:00 UTC) and **Pro**
   `temperature`, `max_tokens` (clamped to 4000) and `stream: false` are
   forwarded. `n`, `max_completion_tokens`, tools and every other field are
   dropped. At most one system + one user message, system ≤ 24 KB, user ≤ 40 KB,
-  whole body ≤ 64 KB.
+  whole body ≤ 64 KB. The desktop keeps the rendered Structured prompt under
+  this cap by truncating the dictionary to the first terms that fit (200 terms
+  of 80 characters would otherwise exceed it); normal dictionaries are sent
+  unchanged.
 - **STT concurrency lease (decision 3).** At most 2 in-flight STT requests per
   user, tracked in D1 `stt_leases` with a 6-minute expiry and released in a
   `finally`. Over the cap: `429 too_many_requests`.

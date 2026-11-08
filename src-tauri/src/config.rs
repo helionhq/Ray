@@ -261,21 +261,20 @@ impl Default for CleanupConfig {
             providers: vec![CleanupProvider {
                 id: "ray".into(),
                 model: "gemma-4-31b".into(),
-                extra_body: None,
             }],
         }
     }
 }
 
-/// One cleanup model. The endpoint and auth are fixed by the Ray API; only the
-/// model id (passed through verbatim) and an optional extra request body can
-/// differ.
+/// One cleanup model. The endpoint and auth are fixed by the Ray API and only
+/// the model id (passed through verbatim) can differ. The proxy is a strict
+/// whitelist (`model`, `messages`, `temperature`, `max_tokens`, `stream`), so
+/// extra request-body fields are not supported; an old override that still
+/// carries `extra_body` loads but the field is ignored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CleanupProvider {
     pub id: String,
     pub model: String,
-    #[serde(default)]
-    pub extra_body: Option<serde_json::Value>,
 }
 
 /// Files a user can drop into the app-data directory to override the embedded

@@ -69,10 +69,12 @@ async function requestJson<T>(
     }
     const code =
       typeof body?.error === "string" ? body.error : "request_failed";
-    // `429 { error: "rate_limited" }` has no message of its own; give it a
-    // friendlier line than the generic status fallback.
+    // The Worker's rate-limit middleware and its STT concurrency/failure
+    // brakes all send `429 { error: "too_many_requests" }` (older builds used
+    // `rate_limited`). Treat any 429 without its own message as rate-limited
+    // so the user gets a friendly retry line instead of the generic fallback.
     const fallback =
-      response.status === 429 && code === "rate_limited"
+      response.status === 429
         ? RATE_LIMITED_MESSAGE
         : (FALLBACK_MESSAGES[response.status] ??
           "Something went wrong. Please try again.");
@@ -132,10 +134,13 @@ export function createPortalSession(token: string) {
 
 /** Revokes every desktop device token for the signed-in account. */
 export function revokeAllDevices(token: string) {
-  return requestJson<{ revoked: number }>("/api/devices/revoke-all", {
-    method: "POST",
-    token,
-  });
+  return requestJson<{ ok: boolean; revoked: number }>(
+    "/api/devices/revoke-all",
+    {
+      method: "POST",
+      token,
+    },
+  );
 }
 
 export interface DesktopAuthorizeResponse {

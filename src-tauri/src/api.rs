@@ -94,7 +94,10 @@ impl ApiError {
     }
 
     /// Build a non-fatal error for an HTTP response, retaining its JSON code
-    /// so billing can react to `already_subscribed` / `billing_issue`.
+    /// so billing can react to `already_subscribed` / `billing_issue`. When
+    /// the body carries a human `message`, that is shown as-is (no technical
+    /// "HTTP 429:" prefix in the billing UI); otherwise the status is kept for
+    /// debugging.
     pub fn from_http(status: u16, body: &str) -> Self {
         if let Some(mut error) = Self::from_response(status, body) {
             // Fatal Ray codes are already the most useful error.
@@ -103,10 +106,12 @@ impl ApiError {
             }
             return error;
         }
+        let message = json_message(body)
+            .unwrap_or_else(|| format!("HTTP {status}: {}", message_from_body(body)));
         Self {
             kind: ApiErrorKind::Other,
             status: Some(status),
-            message: Some(format!("HTTP {status}: {}", message_from_body(body))),
+            message: Some(message),
             resets_at: None,
             code: error_code(body),
         }
@@ -149,6 +154,16 @@ pub fn error_code(body: &str) -> Option<String> {
         .get("error")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The human `message` from a JSON error body, if it has one.
+fn json_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body.trim()).ok()?;
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("message").and_then(Value::as_str))?;
+    (!message.trim().is_empty()).then(|| message.to_string())
 }
 
 /// The most useful human string from an error body: the Ray API's
@@ -260,6 +275,25 @@ mod tests {
             );
         }
         assert!(!ApiError::other("network down").is_fatal());
+    }
+
+    #[test]
+    fn rate_limits_are_not_fatal_and_keep_a_sensible_message() {
+        // The Worker's rate-limit middleware, STT lease and failure budget all
+        // send `429 too_many_requests`. The desktop must not treat it as a
+        // quota/auth failure, and billing/authorize callers surface the
+        // server's message.
+        let error = ApiError::from_http(
+            429,
+            r#"{"error":"too_many_requests","message":"Too many requests. Try again in a moment."}"#,
+        );
+        assert_eq!(error.kind, ApiErrorKind::Other);
+        assert!(!error.is_fatal());
+        assert_eq!(error.code.as_deref(), Some("too_many_requests"));
+        assert_eq!(
+            error.to_string(),
+            "Too many requests. Try again in a moment."
+        );
     }
 
     #[test]

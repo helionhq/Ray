@@ -8,6 +8,10 @@
 //! drops the user's words. Only a Ray `unauthorized` is fatal; the pipeline
 //! still pastes the raw transcript before asking the user to sign in again.
 //!
+//! The request body is a strict whitelist (`model`, `messages`,
+//! `temperature`, `max_tokens`, `stream: false`): the Worker drops every other
+//! field, so nothing else from the config is sent.
+//!
 //! Structured is the only cleanup mode, so its guard is the only answer guard.
 
 use std::future::Future;
@@ -60,6 +64,13 @@ struct ChatMessage {
     content: Option<String>,
 }
 
+/// The Worker's `CLEANUP_SYSTEM_BYTES` cap. Keep the rendered prompt just
+/// under it: a full personal dictionary (200 terms, up to 80 characters each)
+/// would otherwise push the system message over 24 KB and make every cleanup
+/// fail with `413 message_too_large`. Truncating the dictionary here keeps the
+/// server-side guard unchanged and still sends the most relevant terms first.
+pub const CLEANUP_SYSTEM_PROMPT_LIMIT_BYTES: usize = 23 * 1024;
+
 pub fn build_system_prompt(
     template: &str,
     dictionary: &[String],
@@ -69,14 +80,42 @@ pub fn build_system_prompt(
     // Reference data is attacker-influenced (the app name comes from the
     // foreground window), so it is embedded as JSON data and can never break
     // out of its literal.
-    let dictionary = serde_json::to_string(dictionary).unwrap_or_else(|_| "[]".to_string());
     let known_names = serde_json::to_string(known_names).unwrap_or_else(|_| "[]".to_string());
     let app_name = serde_json::to_string(app_name).unwrap_or_else(|_| "\"\"".to_string());
-    strip_markdown_title(template)
-        .replace("{{DICTIONARY}}", &dictionary)
-        .replace("{{KNOWN_NAMES}}", &known_names)
-        .replace("{{APP_NAME}}", &app_name)
-        .replace("{{TRANSCRIPT}}", "(the transcript)")
+    let template = strip_markdown_title(template);
+    let render = |entries: &[String]| -> String {
+        let dictionary = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
+        template
+            .replace("{{DICTIONARY}}", &dictionary)
+            .replace("{{KNOWN_NAMES}}", &known_names)
+            .replace("{{APP_NAME}}", &app_name)
+            .replace("{{TRANSCRIPT}}", "(the transcript)")
+    };
+
+    let full = render(dictionary);
+    if full.len() <= CLEANUP_SYSTEM_PROMPT_LIMIT_BYTES || dictionary.is_empty() {
+        return full;
+    }
+
+    // The rendered length grows with every dictionary entry, so binary-search
+    // the largest prefix that still fits. Terms earlier in the list are kept:
+    // the store appends new terms, and older/first entries are the ones the
+    // user curated first.
+    let (mut low, mut high) = (0usize, dictionary.len() - 1);
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        if render(&dictionary[..middle]).len() <= CLEANUP_SYSTEM_PROMPT_LIMIT_BYTES {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    eprintln!(
+        "[ray] dictionary truncated from {} to {} terms to fit the cleanup prompt limit",
+        dictionary.len(),
+        low
+    );
+    render(&dictionary[..low])
 }
 
 /// The checked-in prompt file starts with a Markdown title written for people
@@ -379,11 +418,9 @@ async fn call_provider(
     body.insert("temperature".into(), json!(config.temperature));
     body.insert("max_tokens".into(), json!(config.max_tokens));
     body.insert("stream".into(), json!(false));
-    if let Some(Value::Object(extra)) = &provider.extra_body {
-        for (key, value) in extra {
-            body.insert(key.clone(), value.clone());
-        }
-    }
+    // Deliberately no extra_body: the Worker forwards only the fields above,
+    // so anything else would be silently dropped (and could hide a config
+    // mistake).
     let body = Value::Object(body);
     let attempts = config.retries.saturating_add(1).max(1);
 
@@ -1147,6 +1184,35 @@ mod tests {
         assert_eq!(
             prompt,
             "Words: [\"Helion HQ\",\"Kubernetes\"]. Names: [\"Ray\",\"Tauri\"]. App: \"Notepad\". (the transcript)"
+        );
+    }
+
+    #[test]
+    fn a_full_dictionary_is_truncated_to_fit_the_worker_prompt_cap() {
+        // The store allows 200 terms of up to 80 characters each; with the
+        // real Structured prompt that is ~32 KB, over the Worker's 24 KB
+        // system-message cap.
+        let dictionary: Vec<String> = (0..200)
+            .map(|index| format!("{index:03}{}", "x".repeat(77)))
+            .collect();
+        let prompt = build_system_prompt(
+            crate::config::EMBEDDED_PROMPT,
+            &dictionary,
+            &["Ray".into()],
+            "Notepad",
+        );
+        assert!(prompt.len() <= CLEANUP_SYSTEM_PROMPT_LIMIT_BYTES);
+        assert!(prompt.len() > CLEANUP_SYSTEM_PROMPT_LIMIT_BYTES - 1_000);
+        // The earliest terms are kept; later ones are dropped.
+        assert!(prompt.contains(&dictionary[0]));
+        assert!(!prompt.contains(&dictionary[199]));
+
+        // A small dictionary is rendered unchanged, so normal prompts are not
+        // affected by the cap.
+        let small = vec!["Helion HQ".to_string()];
+        assert_eq!(
+            build_system_prompt("Words: {{DICTIONARY}}.", &small, &[], "Notepad"),
+            "Words: [\"Helion HQ\"]."
         );
     }
 

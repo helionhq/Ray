@@ -116,13 +116,15 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
 | POST | `/api/desktop/authorize` | clerk | step 2 above |
 | POST | `/api/desktop/token` | none | step 4 above |
 | POST | `/api/desktop/signout` | device | revoke this device token |
+| POST | `/api/devices/revoke-all` | clerk | revoke every device token for the user → `{ "ok": true, "revoked": n }` |
 | POST | `/api/billing/checkout` | either | body `{ interval: "monthly" \| "annual" }` → `{ url }` (Creem checkout) |
 | POST | `/api/billing/portal` | either | → `{ url }` (Creem customer portal) |
 | POST | `/api/webhooks/creem` | Creem signature | subscription lifecycle |
+| POST | `/api/webhooks/clerk` | Svix signature | optional Clerk `user.deleted`; `503 not_configured` when `CLERK_WEBHOOK_SECRET` is unset |
 | POST | `/v1/stt/sync-live` | device | streaming proxy for AssemblyAI Sync live |
 | POST | `/v1/stt/sync` | device | proxy for AssemblyAI Sync batch |
-| POST | `/v1/stt/batch` | device | server-side v2 fallback: body is a WAV; Worker uploads, creates, polls; returns `{ text }` |
-| POST | `/v1/cleanup/chat/completions` | device | OpenAI-compatible proxy to the AssemblyAI LLM gateway |
+| POST | `/v1/stt/batch` | device | server-side v2 fallback: body is a WAV (≤ 12 MB); Worker uploads, creates, polls; returns `{ text }` |
+| POST | `/v1/cleanup/chat/completions` | device | OpenAI-compatible proxy to the AssemblyAI LLM gateway (cleanup-grant gated) |
 
 `GET /api/me` response:
 
@@ -134,6 +136,7 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
   "status": null,                    // null | "active" | "trialing" | "past_due" | "canceled" ...
   "cancel_at_period_end": false,
   "current_period_end": null,        // ISO string or null
+  "billing_issue": null,             // null | "past_due" | "unpaid" | "paused"
   "usage": {
     "words_used": 412,
     "words_limit": 1000,             // null for Pro (do NOT expose the fair-use cap)
@@ -143,9 +146,37 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
 }
 ```
 
+`user.email` is always a string (`""` when unknown). `billing_issue` is set for a
+non-entitled subscription that still exists and needs a payment-method fix; both UIs
+show "Payment issue: update your card" with the portal button instead of the upgrade
+CTA, and `/api/billing/checkout` answers `409 { "error": "billing_issue" }`.
+
 A user is **Pro** when they have a subscription with status `active` or `trialing`, or one
 that is `canceled`/`scheduled_cancel` but whose `current_period_end` is still in the future.
 Otherwise they're Starter.
+
+### Common error codes
+
+| status | `error` | meaning |
+|---|---|---|
+| 400 | `invalid_request`, `invalid_messages`, `model_not_allowed`, `invalid_keyterms`, `invalid_interval`, `invalid_audio` | malformed request |
+| 401 | `unauthorized` | invalid/revoked device token or Clerk session; the desktop signs out |
+| 402 | `quota_exceeded` | Starter weekly limit (STT only) |
+| 403 | `no_cleanup_grant` | no unexpired cleanup grant, or the tagged transcript exceeds the granted words + 25 |
+| 409 | `billing_issue`, `already_subscribed`, `no_billing_account` | checkout/portal state |
+| 413 | `payload_too_large` (request/audio body) or `message_too_large` (cleanup system/user message) | input over its cap |
+| 429 | `fair_use` | Pro hidden fair-use cap (STT only); this is a quota, not a rate limit |
+| 429 | `too_many_requests` | STT concurrency lease, weekly failure budget, or any rate-limit binding (all rate limits use this code) |
+| 500 | `config_error`, `internal_error`, `billing_not_configured` | server configuration or unexpected failure |
+| 502 | `upstream_error` | upstream 401/402/403/5xx, unreachable, or timed out |
+| 503 | `upstream_busy` | upstream 429 |
+
+There is no separate `rate_limited` code: every rate limit is
+`429 { "error": "too_many_requests" }`. The desktop classifies Ray errors by the JSON
+`error` code, not by status, so all `429 too_many_requests` (and `502`/`503`
+`upstream_*`) follow the normal batch-fallback path; only `unauthorized` signs out and
+only `quota_exceeded`/`fair_use` skip the fallback. The site treats any 429 as
+rate-limited and shows a friendly retry message.
 
 ### STT proxy details
 
@@ -155,16 +186,33 @@ Otherwise they're Starter.
   the body, then forwards the streamed body (`request.body`) upstream with
   `authorization: <ASSEMBLYAI_API_KEY>`, forwarding only `content-type` and `X-AAI-Model`.
   It reads the upstream JSON, counts words in `text`, adds them to this week's usage, and
-  returns the upstream status + body unchanged.
+  returns the upstream status + body unchanged (except the upstream-error mapping below).
+  Sync live accepts up to 120 s per request; the desktop rolls over to a new request at
+  118 s, and the segment transcripts are joined.
 - `/v1/stt/sync`: same, for `https://sync.assemblyai.com/v1/transcribe` (non-streamed body).
-- `/v1/stt/batch`: request body is `audio/wav`, optional header `X-Ray-Keyterms` with a
-  JSON array of strings (base64url-encoded JSON, since headers can't hold arbitrary
-  Unicode), plus optional `X-Ray-Speech-Models` (comma-separated). The Worker does
-  upload → create transcript → poll (700 ms) up to 45 s, counts words, and returns
-  `{ "text": "…" }`.
-- Word count = number of whitespace-separated tokens in the final transcript text.
+- `/v1/stt/batch`: request body is `audio/wav` (maximum **12 MB**, enforced on
+  `Content-Length` and chunk by chunk while streaming; over the cap is
+  `413 payload_too_large`, an empty body is `400 invalid_audio`), optional header
+  `X-Ray-Keyterms` with a JSON array of strings (base64url-encoded JSON, since headers
+  can't hold arbitrary Unicode), plus optional `X-Ray-Speech-Models` (comma-separated).
+  The Worker does upload → create transcript → poll (700 ms) up to 45 s, counts words, and
+  returns `{ "text": "…" }`. The 5-minute desktop recording is 9.6 MB of 16 kHz mono
+  PCM16 WAV plus the header, so it fits comfortably.
+- Word count = the length of AssemblyAI's `words` array when present; otherwise
+  whitespace-separated tokens, with each CJK/Hiragana/Katakana/Hangul character counted
+  as one word.
 - Quota is checked **before** the upstream call. Going over mid-dictation is allowed (the
   dictation that crosses the line completes and is counted).
+- Concurrency: at most **2 in-flight STT requests per user** (D1 `stt_leases`, 6-minute
+  expiry, released in `finally` even when a client stream ends or the handler fails).
+  Over the cap: `429 { "error": "too_many_requests" }`. Live rollover segments are
+  sequential (the desktop reads one segment's response before starting the next), so a
+  normal long dictation never holds two leases.
+- Failed transcriptions count against a generous weekly budget (`stt_failures`, 200 per
+  week); over it STT answers `429 { "error": "too_many_requests", "resets_at": … }`.
+- Upstream failures never look like Ray errors: upstream 401/402/403/5xx and
+  unreachable/timeout become `502 { "error": "upstream_error" }`; an upstream 429 becomes
+  `503 { "error": "upstream_busy" }`.
 
 Quota errors (no fallback should be attempted by the desktop for these):
 - `402 { "error": "quota_exceeded", "message": "…", "plan": "starter", "words_used", "words_limit", "resets_at" }`
@@ -175,10 +223,21 @@ Quota errors (no fallback should be attempted by the desktop for these):
 
 `/v1/cleanup/chat/completions` forwards to
 `https://llm-gateway.assemblyai.com/v1/chat/completions` with
-`authorization: Bearer <ASSEMBLYAI_API_KEY>`. Abuse guards: `model` must be in
-`CLEANUP_MODELS`; `max_tokens` is clamped to ≤ 4000; the body must be ≤ 64 KB; `stream`
-is forced false; the user must be within quota (same 402/429). Cleanup words are **not**
-counted (STT already counted them).
+`authorization: Bearer <ASSEMBLYAI_API_KEY>`. It no longer checks the weekly quota;
+it requires an unexpired **cleanup grant** earned by a just-counted transcription
+(see review decision 1). Abuse guards:
+
+- the body must be ≤ 64 KB, at most one system + one user message, system ≤ 24 KB,
+  user ≤ 40 KB (`413 message_too_large`, `400 invalid_messages`);
+- `model` must be in `CLEANUP_MODELS` (`400 model_not_allowed`); the shipped desktop
+  model `gemma-4-31b` is the default allowlist entry;
+- only `model`, `messages`, `temperature`, `max_tokens` (clamped to ≤ 4000) and
+  `stream: false` are forwarded; every other field is dropped;
+- no unexpired grant, no calls left, or more than `grant.words + 25` words inside the
+  last user message's `<transcript>…</transcript>` tags → `403 { "error": "no_cleanup_grant" }`;
+- upstream failures are mapped to `502 upstream_error` / `503 upstream_busy` like STT.
+
+Cleanup words are **not** counted (STT already counted them).
 
 ## D1 schema (minimum)
 
@@ -220,7 +279,11 @@ counted (STT already counted them).
 - Visual language: monochrome, Geist / Geist Mono, generous whitespace, Linear/Notion
   restraint, matching the desktop app's look. Responsive down to 360px.
 
-## Review-round decisions (binding for the fix round)
+## Review-round decisions (implemented)
+
+**Status: implemented.** These decisions are binding, and the commercial-launch branch
+implements every one of them; the HTTP API section above was updated to match the built
+API. Where a decision names a cap or code, that value is the shipped behaviour.
 
 1. **Cleanup grants (replaces the quota check on cleanup).** `/v1/cleanup/chat/completions` no longer
    checks the weekly quota. Instead it requires an unexpired *cleanup grant* earned by a
@@ -235,7 +298,8 @@ counted (STT already counted them).
    used as a general LLM.
 2. **Cleanup body whitelist.** Forward only `model`, `messages`, `temperature`, `max_tokens`
    (clamped ≤ 4000), and `stream: false`. Drop everything else (`n`, `max_completion_tokens`, tools…).
-   Max 2 messages (system + user); system ≤ 24 KB, user ≤ 40 KB.
+   Max 2 messages (system + user); system ≤ 24 KB, user ≤ 40 KB. The desktop truncates its
+   dictionary so the expanded Structured prompt stays under the system cap.
 3. **Per-user STT concurrency lease.** At most 2 in-flight STT requests per user (D1 `stt_leases`
    with a 6-min expiry, released in `finally`). Over the cap: `429 { error: "too_many_requests" }`.
 4. **Upstream errors never look like Ray errors.** The Worker maps any upstream 401/402/403/429 (and
