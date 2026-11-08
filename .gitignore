@@ -12,3 +12,7 @@ src-tauri/gen/
 .vite/
 *.pdb
 *.tsbuildinfo
+
+# web worker
+web/.dev.vars
+web/.wrangler/

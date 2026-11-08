@@ -1,0 +1,34 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ray-web",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-15",
+  // Static site (Vite build output). The Worker only runs first for API routes.
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/v1/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ray",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Public configuration. Replace the placeholders before deploying.
+  "vars": {
+    "SITE_URL": "https://ray.helionhq.com",
+    "CLERK_PUBLISHABLE_KEY": "pk_test_REPLACE_ME",
+    "CREEM_API_BASE": "https://test-api.creem.io",
+    "CREEM_PRODUCT_PRO_MONTHLY": "prod_REPLACE_MONTHLY",
+    "CREEM_PRODUCT_PRO_ANNUAL": "prod_REPLACE_ANNUAL",
+    "STARTER_WEEKLY_WORDS": "1000",
+    "FAIR_USE_WEEKLY_WORDS": "100000",
+    "CLEANUP_MODELS": "gemma-4-31b"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
