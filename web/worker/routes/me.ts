@@ -23,6 +23,10 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
       subscriptions,
       now,
       entitledProductIds(c.env),
+      {
+        startedAt: user.trial_started_at,
+        freeBlocked: user.free_blocked_at !== null,
+      },
     );
     const limits = quotaLimits(c.env);
 
@@ -42,9 +46,18 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
           ? null
           : isoFromUnixSeconds(plan.current_period_end),
       billing_issue: resolveBillingIssue(plan),
+      // The no-card trial resolves as Pro but is never a subscription:
+      // `interval`/`status` stay null while `trial` is present.
+      trial:
+        plan.trial_ends_at === null
+          ? null
+          : { ends_at: isoFromUnixSeconds(plan.trial_ends_at) },
+      // Set when this account is over the per-PC free-account limit.
+      free_blocked: user.free_blocked_at !== null,
       usage: {
         words_used: wordsUsed,
-        // The Pro fair-use cap is deliberately hidden from clients.
+        // The Pro fair-use and trial audio caps are deliberately hidden from
+        // clients; only Starter has a visible word limit.
         words_limit:
           plan.plan === "starter" ? limits.starterWeeklyWords : null,
         week_start: isoFromUnixSeconds(week.weekStart),

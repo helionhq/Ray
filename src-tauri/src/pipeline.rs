@@ -468,6 +468,10 @@ impl Dictation {
                                 ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
                                     quota_notice = Some(failure.error.to_string());
                                 }
+                                ApiErrorKind::DeviceLimit => {
+                                    quota_notice =
+                                        Some("Free limit reached on this PC".to_string());
+                                }
                                 ApiErrorKind::Other => {}
                             }
                         } else {
@@ -534,6 +538,10 @@ impl Dictation {
                                 }
                                 ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
                                     quota_notice = Some(error.to_string());
+                                }
+                                ApiErrorKind::DeviceLimit => {
+                                    quota_notice =
+                                        Some("Free limit reached on this PC".to_string());
                                 }
                                 ApiErrorKind::Other => {}
                             }
@@ -632,6 +640,9 @@ impl Dictation {
                             }
                             ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
                                 quota_notice = Some(error.to_string());
+                            }
+                            ApiErrorKind::DeviceLimit => {
+                                quota_notice = Some("Free limit reached on this PC".to_string());
                             }
                             ApiErrorKind::Other => {}
                         }
@@ -899,6 +910,7 @@ impl Dictation {
                 .message
                 .clone()
                 .unwrap_or_else(|| "Fair-use limit reached, resets Monday".into()),
+            ApiErrorKind::DeviceLimit => "Free limit reached on this PC".to_string(),
             ApiErrorKind::Other => error.to_string(),
         };
         match kind {
@@ -907,7 +919,7 @@ impl Dictation {
                     self.show_main();
                 }
             }
-            ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+            ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse | ApiErrorKind::DeviceLimit => {
                 self.open_main_on("account");
                 // The proxy's count is authoritative; refresh the meter.
                 auth::refresh_shared(&self.app, &self.auth, &self.http, &self.api_base());

@@ -53,6 +53,14 @@ pub struct Usage {
     pub resets_at: Option<String>,
 }
 
+/// The no-card trial, present only while it is active. `plan` is `"pro"` then,
+/// but `interval`/`status` stay empty because there is no subscription.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Trial {
+    pub ends_at: Option<String>,
+}
+
 /// The `/api/me` response.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -67,14 +75,24 @@ pub struct Account {
     /// Set when a non-entitled subscription still exists and needs a payment
     /// method fix: "past_due", "unpaid", or "paused".
     pub billing_issue: Option<String>,
+    /// The active no-card trial; null for paid subscriptions and Starter.
+    pub trial: Option<Trial>,
+    /// This PC is over the free-account limit and has no paid plan.
+    pub free_blocked: bool,
     pub usage: Usage,
 }
 
 impl Account {
-    /// True when a Starter account has no words left this week. Pro's limit is
-    /// deliberately absent, so this never blocks a Pro account.
+    /// True while the account is on the no-card trial.
+    pub fn trial_active(&self) -> bool {
+        self.trial.is_some()
+    }
+
+    /// True when a Starter account has no words left this week. Pro and trial
+    /// accounts have no visible word limit, so this never blocks them.
     pub fn starter_is_over_limit(&self) -> bool {
         self.plan.eq_ignore_ascii_case("starter")
+            && !self.trial_active()
             && self
                 .usage
                 .words_limit
@@ -586,7 +604,9 @@ async fn poll_for_pro(
         }
         match fetch_me(http, api_base, &token).await {
             Ok(account) => {
-                let is_pro = account.plan.eq_ignore_ascii_case("pro");
+                // A trial also resolves as Pro; activation is only complete
+                // once a paid subscription replaces it.
+                let is_pro = account.plan.eq_ignore_ascii_case("pro") && account.trial.is_none();
                 auth.set_account(account);
                 state = auth.state();
                 emit_account_changed(app, &state);
@@ -617,9 +637,16 @@ pub async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<String, ApiError> {
+    let mut payload = json!({ "code": code, "verifier": verifier });
+    // Omitted when the registry value cannot be read: sign-in still succeeds,
+    // the Worker simply grants no trial without a device id. The raw GUID is
+    // never sent or logged.
+    if let Some(device_id) = crate::device::device_id() {
+        payload["device_id"] = Value::String(device_id);
+    }
     let response = http
         .post(api::endpoint(api_base, "/api/desktop/token"))
-        .json(&json!({ "code": code, "verifier": verifier }))
+        .json(&payload)
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -1115,6 +1142,41 @@ mod tests {
         assert!(!pro.starter_is_over_limit());
         // A missing plan must not lock the user out.
         assert!(!Account::default().starter_is_over_limit());
+    }
+
+    #[test]
+    fn a_trial_is_treated_as_pro_and_never_blocked() {
+        let account = Account {
+            plan: "pro".into(),
+            trial: Some(Trial {
+                ends_at: Some("2026-11-23T12:00:00Z".into()),
+            }),
+            usage: Usage {
+                words_used: 500_000,
+                words_limit: None,
+                ..Usage::default()
+            },
+            ..Account::default()
+        };
+        assert!(account.trial_active());
+        assert!(!account.starter_is_over_limit());
+
+        // The new `/api/me` fields must deserialize and be optional for old
+        // or partial responses.
+        let parsed: Account = serde_json::from_str(
+            r#"{"plan":"pro","trial":{"ends_at":"2026-11-23T12:00:00Z"},"free_blocked":true,"user":{"id":"u","email":""}}"#,
+        )
+        .expect("trial fields must deserialize");
+        assert!(parsed.trial_active());
+        assert_eq!(
+            parsed.trial.unwrap().ends_at.as_deref(),
+            Some("2026-11-23T12:00:00Z")
+        );
+        assert!(parsed.free_blocked);
+        let legacy: Account =
+            serde_json::from_str(r#"{"plan":"starter","user":{"id":"u"}}"#).unwrap();
+        assert!(!legacy.trial_active());
+        assert!(!legacy.free_blocked);
     }
 
     #[test]

@@ -60,6 +60,11 @@ export interface Usage {
   resets_at: string | null;
 }
 
+export interface Trial {
+  /** ISO timestamp when the no-card Pro trial ends. */
+  ends_at: string | null;
+}
+
 export interface Account {
   user: AccountUser;
   plan: "starter" | "pro" | string;
@@ -69,6 +74,10 @@ export interface Account {
   current_period_end: string | null;
   /** A subscription that needs a payment-method fix. */
   billing_issue: "past_due" | "unpaid" | "paused" | string | null;
+  /** The active no-card Pro trial; null for paid subscriptions and Starter. */
+  trial: Trial | null;
+  /** This PC is over the free-account limit and has no paid plan. */
+  free_blocked: boolean;
   usage: Usage;
 }
 

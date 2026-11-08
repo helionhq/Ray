@@ -18,7 +18,8 @@ export async function getUser(
 ): Promise<UserRow | null> {
   return db
     .prepare(
-      `SELECT id, email, name, creem_customer_id, created_at
+      `SELECT id, email, name, creem_customer_id, created_at,
+              trial_started_at, free_blocked_at
        FROM users WHERE id = ? AND deleted_at IS NULL`,
     )
     .bind(id)
@@ -394,6 +395,8 @@ export interface CreateDeviceInput {
   userId: string;
   tokenHash: string;
   createdAt: number;
+  /** SHA-256 of the desktop's hashed device id; null when omitted. */
+  deviceHash: string | null;
 }
 
 export async function createDevice(
@@ -402,11 +405,84 @@ export async function createDevice(
 ): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO devices (id, user_id, token_hash, created_at, last_used_at, revoked_at)
-       VALUES (?, ?, ?, ?, NULL, NULL)`,
+      `INSERT INTO devices
+         (id, user_id, token_hash, created_at, last_used_at, revoked_at, device_hash)
+       VALUES (?, ?, ?, ?, NULL, NULL, ?)`,
     )
-    .bind(input.id, input.userId, input.tokenHash, input.createdAt)
+    .bind(
+      input.id,
+      input.userId,
+      input.tokenHash,
+      input.createdAt,
+      input.deviceHash,
+    )
     .run();
+}
+
+/**
+ * Distinct other accounts that have ever used this device signal. Revoked
+ * rows still count: signing out must not reset the per-PC free limit.
+ */
+export async function countOtherUsersOnDevice(
+  db: D1Database,
+  deviceHash: string,
+  userId: string,
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT user_id) AS users FROM devices
+       WHERE device_hash = ? AND user_id != ?`,
+    )
+    .bind(deviceHash, userId)
+    .first<{ users: number }>();
+  return row?.users ?? 0;
+}
+
+/** Marks an account as over the per-PC free limit (first time wins). */
+export function markFreeBlockedStatement(
+  db: D1Database,
+  userId: string,
+  now: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE users SET free_blocked_at = COALESCE(free_blocked_at, ?)
+       WHERE id = ? AND deleted_at IS NULL`,
+    )
+    .bind(now, userId);
+}
+
+/**
+ * Starts the 14-day trial exactly once. The WHERE clause enforces every
+ * server-side condition atomically: no prior trial, not free-blocked, and no
+ * subscription row has ever existed. A user who never had a desktop sign-in
+ * (site-only sign-up) never reaches this statement.
+ */
+export function startTrialStatement(
+  db: D1Database,
+  userId: string,
+  now: number,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE users SET trial_started_at = ?
+       WHERE id = ? AND deleted_at IS NULL
+         AND trial_started_at IS NULL
+         AND free_blocked_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM subscriptions WHERE user_id = users.id
+         )`,
+    )
+    .bind(now, userId);
+}
+
+export async function startTrial(
+  db: D1Database,
+  userId: string,
+  now: number,
+): Promise<boolean> {
+  const result = await startTrialStatement(db, userId, now).run();
+  return (result.meta.changes ?? 0) > 0;
 }
 
 export async function findDeviceByTokenHash(
@@ -415,7 +491,7 @@ export async function findDeviceByTokenHash(
 ): Promise<DeviceRow | null> {
   return db
     .prepare(
-      `SELECT id, user_id, last_used_at, revoked_at
+      `SELECT id, user_id, last_used_at, revoked_at, device_hash
        FROM devices WHERE token_hash = ?`,
     )
     .bind(tokenHash)

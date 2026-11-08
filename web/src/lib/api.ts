@@ -102,6 +102,13 @@ export interface MeResponse {
   current_period_end: string | null;
   /** Present on a subscription that still exists but no longer grants Pro. */
   billing_issue: "past_due" | "unpaid" | "paused" | null;
+  /**
+   * The no-card 14-day Pro trial. While non-null `plan` is "pro" but
+   * `interval` and `status` stay null because there is no subscription.
+   */
+  trial: { ends_at: string } | null;
+  /** True when this PC is over the per-PC free-account limit. */
+  free_blocked: boolean;
   usage: {
     words_used: number;
     words_limit: number | null;

@@ -75,6 +75,14 @@ function errorMessage(caught: unknown, fallback: string) {
   return caught instanceof ApiError ? caught.message : fallback;
 }
 
+/** Whole days left in the trial, never negative (0 on the last partial day). */
+function trialDaysLeft(endsAt: string | null | undefined): number {
+  if (!endsAt) return 0;
+  const ends = Date.parse(endsAt);
+  if (!Number.isFinite(ends)) return 0;
+  return Math.max(0, Math.ceil((ends - Date.now()) / 86_400_000));
+}
+
 function AccountFrame({
   children,
   loading = false,
@@ -141,6 +149,87 @@ interface AccountActions {
   onRevokeDevices: () => void;
 }
 
+/**
+ * Monthly/annual checkout buttons, shared by the Starter and trial upgrade
+ * cards so a trial keeps the upgrade CTAs visible.
+ */
+function UpgradeOptions({
+  actions,
+  busy,
+  blocked,
+}: {
+  actions: AccountActions;
+  busy: AccountBusy | null;
+  blocked: boolean;
+}) {
+  const monthly = PLANS.pro.monthly;
+  const annual = PLANS.pro.annual;
+
+  return (
+    <>
+      <div className="upgrade-options">
+        <button
+          type="button"
+          className={`upgrade-option${
+            actions.preferredInterval === "monthly" ? " is-selected" : ""
+          }`}
+          onClick={() => actions.onCheckout("monthly")}
+          disabled={busy !== null || blocked}
+          aria-busy={busy === "monthly" || undefined}
+        >
+          <span className="upgrade-head">
+            <span>Monthly</span>
+          </span>
+          <span className="upgrade-price">
+            ${monthly.price}
+            <span className="upgrade-period">/month</span>
+          </span>
+          <span className="upgrade-billing">{monthly.billing}</span>
+          <span className="upgrade-cta">
+            {busy === "monthly" ? "Opening checkout…" : "Choose monthly"}
+            <ArrowRightIcon size={13} />
+          </span>
+        </button>
+
+        <button
+          type="button"
+          className={`upgrade-option${
+            actions.preferredInterval === "annual" ? " is-selected" : ""
+          }`}
+          onClick={() => actions.onCheckout("annual")}
+          disabled={busy !== null || blocked}
+          aria-busy={busy === "annual" || undefined}
+        >
+          <span className="upgrade-head">
+            <span>Annual</span>
+            <span className="save-pill">{annual.savings}</span>
+          </span>
+          <span className="upgrade-price">
+            ${annual.price}
+            <span className="upgrade-period">/month</span>
+          </span>
+          <span className="upgrade-billing">{annual.billing}</span>
+          <span className="upgrade-cta">
+            {busy === "annual" ? "Opening checkout…" : "Choose annual"}
+            <ArrowRightIcon size={13} />
+          </span>
+        </button>
+      </div>
+
+      {actions.actionError ? (
+        <p className="form-error" role="alert">
+          {actions.actionError}
+        </p>
+      ) : null}
+
+      <p className="account-hint">
+        Cancel anytime. Payments are handled by Creem, our merchant of record.
+        Pro is unlimited for normal dictation; fair use applies.
+      </p>
+    </>
+  );
+}
+
 function AccountView({
   me,
   actions,
@@ -150,6 +239,12 @@ function AccountView({
 }) {
   const [confirmingDevices, setConfirmingDevices] = useState(false);
   const isPro = me.plan === "pro";
+  // A trial resolves as Pro but is not a paid subscription: keep the badge
+  // and copy from claiming one.
+  const trial = me.trial;
+  const isTrial = trial !== null;
+  const isPaidPro = isPro && !isTrial;
+  const trialDays = trialDaysLeft(trial?.ends_at);
   const billingIssue = me.billing_issue;
   const limit = me.usage.words_limit ?? PLANS.starter.weeklyWords;
   const used = me.usage.words_used;
@@ -166,8 +261,6 @@ function AccountView({
     : me.status === "trialing"
       ? "Trial ends"
       : "Renews";
-  const monthly = PLANS.pro.monthly;
-  const annual = PLANS.pro.annual;
   const resetsAt = formatResetAt(me.usage.resets_at);
   const { busy, actionError } = actions;
   // A checkout is in flight until the webhook flips the plan (or the poll
@@ -220,11 +313,11 @@ function AccountView({
           <p className="account-email">{me.user.email || "No email on file"}</p>
         </div>
         <span className={`plan-badge${isPro ? " is-pro" : ""}`}>
-          {isPro ? PLANS.pro.name : PLANS.starter.name}
+          {isTrial ? "Pro trial" : isPro ? PLANS.pro.name : PLANS.starter.name}
         </span>
       </section>
 
-      {isPro ? (
+      {isPaidPro ? (
         <section className="account-card" aria-labelledby="plan-heading">
           <div className="account-card-head">
             <div>
@@ -278,40 +371,80 @@ function AccountView({
         </section>
       ) : (
         <>
-          <section className="account-card" aria-labelledby="usage-heading">
-            <div className="account-card-head">
-              <div>
-                <h2 id="usage-heading">This week</h2>
-                <p className="account-muted">
-                  {formatNumber(used)} of {formatNumber(limit)} words this week
-                  · resets {resetsAt ?? RESET_LABEL}
-                </p>
+          {isTrial ? (
+            <section className="account-card" aria-labelledby="trial-heading">
+              <div className="account-card-head">
+                <div>
+                  <h2 id="trial-heading">
+                    Pro trial · {trialDays} {trialDays === 1 ? "day" : "days"}{" "}
+                    left
+                  </h2>
+                  <p className="account-muted">
+                    Everything in Pro while it lasts, with no card needed.
+                    Upgrade any time to keep Pro when the trial ends.
+                  </p>
+                </div>
+                <span className="plan-badge is-pro">Pro trial</span>
               </div>
-              <span className="account-card-note">
-                {PLANS.starter.name} plan
-              </span>
-            </div>
 
-            <div
-              className="meter"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={limit}
-              aria-valuenow={Math.min(used, limit)}
-              aria-label="Weekly word usage"
-            >
-              <span
-                className={`meter-fill${atLimit ? " is-full" : ""}`}
-                style={{ "--fill": fill.toFixed(4) } as CSSProperties}
-              />
-            </div>
+              <dl className="account-details">
+                <div>
+                  <dt>Trial ends</dt>
+                  <dd>{formatDate(trial.ends_at) ?? "—"}</dd>
+                </div>
+                <div>
+                  <dt>This week</dt>
+                  <dd>{formatNumber(used)} words · unlimited</dd>
+                </div>
+              </dl>
 
-            <p className={atLimit ? "account-alert" : "account-hint"}>
-              {atLimit
-                ? "Weekly limit reached. Upgrade to keep dictating."
-                : `Resets ${RESET_LABEL}. A dictation that crosses the limit keeps the part already transcribed (up to about two minutes) and is counted.`}
+              <p className="account-hint">
+                Pro is unlimited for normal dictation; fair use applies.
+              </p>
+            </section>
+          ) : (
+            <section className="account-card" aria-labelledby="usage-heading">
+              <div className="account-card-head">
+                <div>
+                  <h2 id="usage-heading">This week</h2>
+                  <p className="account-muted">
+                    {formatNumber(used)} of {formatNumber(limit)} words this
+                    week · resets {resetsAt ?? RESET_LABEL}
+                  </p>
+                </div>
+                <span className="account-card-note">
+                  {PLANS.starter.name} plan
+                </span>
+              </div>
+
+              <div
+                className="meter"
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={limit}
+                aria-valuenow={Math.min(used, limit)}
+                aria-label="Weekly word usage"
+              >
+                <span
+                  className={`meter-fill${atLimit ? " is-full" : ""}`}
+                  style={{ "--fill": fill.toFixed(4) } as CSSProperties}
+                />
+              </div>
+
+              <p className={atLimit ? "account-alert" : "account-hint"}>
+                {atLimit
+                  ? "Weekly limit reached. Upgrade to keep dictating."
+                  : `Resets ${RESET_LABEL}. A dictation that crosses the limit keeps the part already transcribed (up to about two minutes) and is counted.`}
+              </p>
+            </section>
+          )}
+
+          {me.free_blocked ? (
+            <p className="account-alert" role="status">
+              This PC has reached its limit of free accounts. Upgrade to Pro to
+              keep dictating.
             </p>
-          </section>
+          ) : null}
 
           {billingIssue ? (
             <section className="account-card" aria-labelledby="billing-heading">
@@ -351,7 +484,9 @@ function AccountView({
             <section className="account-card" aria-labelledby="upgrade-heading">
               <div className="account-card-head">
                 <div>
-                  <h2 id="upgrade-heading">Upgrade to Pro</h2>
+                  <h2 id="upgrade-heading">
+                    {isTrial ? "Keep Pro after your trial" : "Upgrade to Pro"}
+                  </h2>
                   <p className="account-muted">
                     Unlimited words for normal dictation. Same fast, clean
                     dictation.
@@ -359,65 +494,11 @@ function AccountView({
                 </div>
               </div>
 
-              <div className="upgrade-options">
-                <button
-                  type="button"
-                  className={`upgrade-option${
-                    actions.preferredInterval === "monthly" ? " is-selected" : ""
-                  }`}
-                  onClick={() => actions.onCheckout("monthly")}
-                  disabled={busy !== null || upgradeBlocked}
-                  aria-busy={busy === "monthly" || undefined}
-                >
-                  <span className="upgrade-head">
-                    <span>Monthly</span>
-                  </span>
-                  <span className="upgrade-price">
-                    ${monthly.price}
-                    <span className="upgrade-period">/month</span>
-                  </span>
-                  <span className="upgrade-billing">{monthly.billing}</span>
-                  <span className="upgrade-cta">
-                    {busy === "monthly" ? "Opening checkout…" : "Choose monthly"}
-                    <ArrowRightIcon size={13} />
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  className={`upgrade-option${
-                    actions.preferredInterval === "annual" ? " is-selected" : ""
-                  }`}
-                  onClick={() => actions.onCheckout("annual")}
-                  disabled={busy !== null || upgradeBlocked}
-                  aria-busy={busy === "annual" || undefined}
-                >
-                  <span className="upgrade-head">
-                    <span>Annual</span>
-                    <span className="save-pill">{annual.savings}</span>
-                  </span>
-                  <span className="upgrade-price">
-                    ${annual.price}
-                    <span className="upgrade-period">/month</span>
-                  </span>
-                  <span className="upgrade-billing">{annual.billing}</span>
-                  <span className="upgrade-cta">
-                    {busy === "annual" ? "Opening checkout…" : "Choose annual"}
-                    <ArrowRightIcon size={13} />
-                  </span>
-                </button>
-              </div>
-
-              {actionError ? (
-                <p className="form-error" role="alert">
-                  {actionError}
-                </p>
-              ) : null}
-
-              <p className="account-hint">
-                Cancel anytime. Payments are handled by Creem, our merchant of
-                record. Pro is unlimited for normal dictation; fair use applies.
-              </p>
+              <UpgradeOptions
+                actions={actions}
+                busy={busy}
+                blocked={upgradeBlocked}
+              />
             </section>
           )}
         </>
@@ -629,7 +710,9 @@ function AccountPageInner() {
     const byStorage = readBillingActivation();
     if (!byQuery && !byStorage) return;
 
-    if (me.plan === "pro") {
+    // A trial already resolves as Pro; activation is complete only when the
+    // trial has been replaced by a paid subscription.
+    if (me.plan === "pro" && !me.trial) {
       clearBillingActivation();
       setActivating(false);
       setActivationTimedOut(false);
@@ -653,7 +736,7 @@ function AccountPageInner() {
         if (cancelled) return;
         setMe(data);
         setError(null);
-        if (data.plan === "pro") {
+        if (data.plan === "pro" && !data.trial) {
           clearBillingActivation();
           setActivating(false);
           setActivationTimedOut(false);
@@ -762,9 +845,16 @@ function AccountPageInner() {
   );
 
   // The landing page's "Get Pro" link adds interval + checkout=1 for a
-  // signed-in visitor, so the selected interval goes straight to Creem.
+  // signed-in visitor, so the selected interval goes straight to Creem. A
+  // trial account is not paid yet, so it may start checkout too.
   useEffect(() => {
-    if (!isLoaded || !isSignedIn || !me || me.plan === "pro") return;
+    if (
+      !isLoaded ||
+      !isSignedIn ||
+      !me ||
+      (me.plan === "pro" && !me.trial)
+    )
+      return;
     if (me.billing_issue) return;
     // Match the disabled upgrade CTAs: another checkout while activation is
     // pending can create a second subscription and charge the account twice.

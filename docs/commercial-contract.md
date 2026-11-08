@@ -5,27 +5,44 @@ deviate, keep the deviation minimal and record it in your final report.
 
 ## Product decisions (fixed)
 
-- Plans: **Starter** (free) and **Pro** (paid). Use exactly these names.
-  - Starter: **1,000 words per week**. Week resets **every Monday 00:00 UTC**.
-  - Pro: **unlimited words**, marketed as unlimited. A hidden weekly **fair-use cap**
-    (default 100,000 words/week, env `FAIR_USE_WEEKLY_WORDS`) protects costs. Never
-    advertise the number; show a polite "fair-use limit reached, resets Monday" message only
-    when it is actually hit.
-  - Audio abuse budget: AssemblyAI bills audio time, not words, so the Worker also meters
-    the bytes streamed to it. Hidden weekly caps: Starter **60 minutes**
-    (`STARTER_WEEKLY_AUDIO_SECONDS`) and Pro **15 hours** (`FAIR_USE_WEEKLY_AUDIO_SECONDS`).
-    1,000 words is roughly 8-10 minutes of speech, so these only catch silent or
-    near-empty audio abuse. Never advertise them; over either cap STT returns the normal
-    `quota_exceeded` / `fair_use` shapes.
-  - Pro price: **$9/month billed monthly**, or **$6/month billed annually ($72/year)**.
+- Plans: **Starter** (free), **Pro** (paid), and a **14-day no-card Pro trial**.
+  Use exactly these names.
+  - Starter: **1,000 words per week** (`STARTER_WEEKLY_WORDS`). Week resets
+    **every Monday 00:00 UTC**.
+  - Pro: **unlimited words**, marketed as unlimited. There is **no weekly word
+    cap**. The only hidden Pro cap is **audio time**: `FAIR_USE_WEEKLY_AUDIO_SECONDS`
+    (default **25,200** = 7 h/week). Never advertise the number; show a polite
+    "fair-use limit reached, resets Monday" message only when it is actually hit.
+  - Trial: **14 days of Pro, no card**. It starts at the user's **first successful
+    desktop sign-in** (`POST /api/desktop/token`), only if the account has never
+    had a subscription row, `trial_started_at` is null, the account is not
+    free-blocked, and a valid `device_id` was supplied. It never starts on
+    site-only sign-up. During the trial the account resolves as **Pro (trial)**
+    with the hidden trial audio budget `TRIAL_WEEKLY_AUDIO_SECONDS` (default
+    **10,800** = 3 h/week). Afterwards it is Starter. A paid subscription takes
+    precedence over the trial at all times.
+  - Audio abuse budget: AssemblyAI bills audio time, not words, so the Worker also
+    meters the bytes streamed to it. Hidden weekly caps: Starter **60 minutes**
+    (`STARTER_WEEKLY_AUDIO_SECONDS`), trial **3 hours**, Pro **7 hours**. 1,000
+    words is roughly 8-10 minutes of speech, so these only catch silent or
+    near-empty audio abuse. Never advertise them; over a cap STT returns the
+    normal `quota_exceeded` (Starter) / `fair_use` (Pro, trial) shapes.
+  - Per-PC free limit: the desktop sends a one-way hashed device identifier. The
+    first **three distinct accounts** ever seen on a PC are unaffected; the
+    **fourth and later** are marked `free_blocked_at`. A free-blocked account can
+    sign in but gets no trial and, without a paid subscription, every STT request
+    answers `402 device_limit`. A paid Pro subscription works normally.
+  - Pro price: **$9/month billed monthly**, or **$7/month billed annually
+    ($84/year)**, badge **"Save 22%"**.
 - Auth: **Clerk**, with **email** (code or password, whichever Clerk defaults to) and **Google**.
 - Payments: **Creem** (https://docs.creem.io). Two Creem products: Pro Monthly, Pro Annual.
 - Backend: **Cloudflare Workers + D1**, deployed together with the public landing page as
   **one Worker** (Workers Static Assets for the site, `/api/*` and `/v1/*` handled in code).
 - Privacy: audio and transcripts **pass through** the Worker in memory to AssemblyAI and are
-  **never stored or logged**. D1 holds only users, device sessions, subscriptions, and
-  weekly **word counts and audio-second counters**. Do not `console.log` request or
-  response bodies anywhere.
+  **never stored or logged**. D1 holds only users, device sessions, a one-way hashed
+  device identifier (for the per-PC free limit), subscriptions, and weekly **word counts
+  and audio-second counters**. The raw hardware id is never received. Do not
+  `console.log` request or response bodies anywhere.
 - The user's own AssemblyAI key is gone. The server holds `ASSEMBLYAI_API_KEY` as a secret.
 - Desktop: no "stream while I speak" toggle (streaming is always on); no Clean mode
   (Structured is the only cleanup mode, with no selector); no API key fields; the
@@ -77,9 +94,9 @@ Worker vars (wrangler `vars`) and secrets:
 | `CREEM_PRODUCT_PRO_MONTHLY` | var | Creem product id |
 | `CREEM_PRODUCT_PRO_ANNUAL` | var | Creem product id |
 | `STARTER_WEEKLY_WORDS` | var | default `1000` |
-| `FAIR_USE_WEEKLY_WORDS` | var | default `100000` |
 | `STARTER_WEEKLY_AUDIO_SECONDS` | var | hidden Starter audio budget, default `3600` (60 min) |
-| `FAIR_USE_WEEKLY_AUDIO_SECONDS` | var | hidden Pro audio fair-use cap, default `54000` (15 h) |
+| `FAIR_USE_WEEKLY_AUDIO_SECONDS` | var | hidden Pro audio fair-use cap, default `25200` (7 h) |
+| `TRIAL_WEEKLY_AUDIO_SECONDS` | var | hidden trial audio budget, default `10800` (3 h) |
 | `CLEANUP_MODELS` | var | comma-separated allowlist, default `gemma-4-31b` |
 
 Desktop: the API origin lives in `src-tauri/config/pipeline.json` as
@@ -102,7 +119,7 @@ Google blocks OAuth inside embedded webviews, so sign-in happens in the system b
    button that re-opens the same `redirect` (browsers sometimes block the first attempt).
 4. The app receives the deep link (scheme `ray`, via `tauri-plugin-deep-link`; the
    single-instance plugin forwards argv on Windows), checks `state`, then calls
-   `POST /api/desktop/token` with `{ code, verifier }`. The Worker checks
+   `POST /api/desktop/token` with `{ code, verifier, device_id? }`. The Worker checks
    `base64url(sha256(verifier)) == challenge`, consumes the code, and returns
    `{ token, user: { id, email, name } }`. `token` is an opaque device token
    (`ray_` + 32 random bytes base64url), stored **hashed (SHA-256)** in D1 `devices`, with no
@@ -110,6 +127,23 @@ Google blocks OAuth inside embedded webviews, so sign-in happens in the system b
 5. The app stores the token in Windows Credential Manager (service `ray`, account `session`).
 6. Every desktop request sends `Authorization: Bearer <device token>`.
 7. `POST /api/desktop/signout` (device token auth) revokes it. The app deletes it locally too.
+
+### Device id and the per-PC free limit
+
+The desktop reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` with
+`KEY_READ | KEY_WOW64_64KEY` and sends
+`device_id = base64url(SHA-256("ray-device-v1:" + guid))` in the token JSON body. The
+raw GUID is never sent or logged. If it cannot be read, `device_id` is omitted: sign-in
+still works but the server grants no trial.
+
+The Worker validates `device_id` as a 43-character base64url value and stores
+`SHA-256(device_id)` in `devices.device_hash` (indexed). On token exchange it counts the
+**distinct `user_id`s that have ever had a row with that `device_hash`** (revoked rows
+included, the signing-in user excluded). When that count is already 3, the user is
+marked `free_blocked_at`; the first three accounts are never affected, and re-signing in
+as an existing account is not a new account. A free-blocked account still signs in, so it
+can reach the upgrade buttons, but free STT answers `402 device_limit` and no trial
+starts. Only a paid Pro subscription restores dictation.
 
 ## HTTP API
 
@@ -140,20 +174,27 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
 ```json
 {
   "user": { "id": "user_…", "email": "a@b.com", "name": "Arham" },
-  "plan": "starter",                 // "starter" | "pro"
-  "interval": null,                  // null | "monthly" | "annual"
+  "plan": "starter",                 // "starter" | "pro" (a trial is "pro")
+  "interval": null,                  // null | "monthly" | "annual" (null on a trial)
   "status": null,                    // null | "active" | "trialing" | "past_due" | "canceled" ...
   "cancel_at_period_end": false,
   "current_period_end": null,        // ISO string or null
   "billing_issue": null,             // null | "past_due" | "unpaid" | "paused"
+  "trial": null,                     // null | { "ends_at": "2026-11-23T12:00:00Z" }
+  "free_blocked": false,             // this PC is over the free-account limit
   "usage": {
     "words_used": 412,
-    "words_limit": 1000,             // null for Pro (do NOT expose the fair-use cap)
+    "words_limit": 1000,             // null for Pro and trial (never expose hidden caps)
     "week_start": "2026-11-02T00:00:00Z",
     "resets_at": "2026-11-09T00:00:00Z"
   }
 }
 ```
+
+While `trial` is non-null, `plan` is `"pro"` but `interval`, `status`,
+`cancel_at_period_end`, and `current_period_end` stay null because there is no
+subscription. Clients must not present a trial as a paid plan; both UIs show
+"Pro trial · N days left" (days computed from `ends_at`) with the upgrade CTAs visible.
 
 Audio seconds are metered into the same weekly usage row but are **not** part of this
 response (never expose the audio caps).
@@ -165,7 +206,9 @@ CTA, and `/api/billing/checkout` answers `409 { "error": "billing_issue" }`.
 
 A user is **Pro** when they have a subscription with status `active` or `trialing`, or one
 that is `canceled`/`scheduled_cancel` but whose `current_period_end` is still in the future.
-Otherwise they're Starter.
+A paid subscription always wins over the trial. Otherwise, a user whose account never had
+a subscription row and whose `trial_started_at` is within the last 14 days is **Pro
+(trial)**; everyone else is Starter.
 
 ### Common error codes
 
@@ -174,21 +217,27 @@ Otherwise they're Starter.
 | 400 | `invalid_request`, `invalid_messages`, `model_not_allowed`, `invalid_keyterms`, `invalid_interval`, `invalid_audio` | malformed request |
 | 401 | `unauthorized` | invalid/revoked device token or Clerk session; the desktop signs out |
 | 402 | `quota_exceeded` | Starter weekly word or audio limit (STT only) |
+| 402 | `device_limit` | this PC has used its free accounts and the user has no paid plan (STT only) |
 | 403 | `no_cleanup_grant` | no unexpired cleanup grant, or the tagged transcript exceeds the granted words + 25 |
 | 409 | `billing_issue`, `already_subscribed`, `no_billing_account`, `checkout_pending` | checkout/portal state |
 | 413 | `payload_too_large` (request/audio body) or `message_too_large` (cleanup system/user message) | input over its cap |
-| 429 | `fair_use` | Pro hidden word or audio fair-use cap (STT only); this is a quota, not a rate limit |
+| 429 | `fair_use` | Pro or trial hidden audio fair-use cap (STT only); this is a quota, not a rate limit |
 | 429 | `too_many_requests` | STT concurrency lease, weekly failure budget, or any rate-limit binding (all rate limits use this code) |
 | 500 | `config_error`, `internal_error`, `billing_not_configured` | server configuration or unexpected failure |
 | 502 | `upstream_error` | upstream 401/402/403/5xx, unreachable, or timed out |
 | 503 | `upstream_busy` | upstream 429 |
 
+`device_limit` is `402 { "error": "device_limit", "message": "This PC has reached its
+limit of free accounts. Upgrade to Pro to keep dictating." }`. The desktop classifies it
+like `quota_exceeded`: the session stops without a batch fallback, the bar shows "Free
+limit reached on this PC", and Account opens.
+
 There is no separate `rate_limited` code: every rate limit is
 `429 { "error": "too_many_requests" }`. The desktop classifies Ray errors by the JSON
 `error` code, not by status, so all `429 too_many_requests` (and `502`/`503`
 `upstream_*`) follow the normal batch-fallback path; only `unauthorized` signs out and
-only `quota_exceeded`/`fair_use` skip the fallback. The site treats any 429 as
-rate-limited and shows a friendly retry message.
+only `quota_exceeded`/`fair_use`/`device_limit` skip the fallback. The site treats any
+429 as rate-limited and shows a friendly retry message.
 
 ### STT proxy details
 
@@ -234,17 +283,19 @@ rate-limited and shows a friendly retry message.
   `usage_weeks.audio_seconds` (PCM16 mono 16 kHz = 32,000 bytes/s; the 44-byte WAV
   header is subtracted and the result is rounded up). Sync responses also report
   `audio_duration_ms`, and the larger of that duration and the byte-derived estimate is
-  charged. It is charged on every request
-  that reaches upstream, including empty transcripts and upstream failures. Quota
-  checks compare both words and audio seconds against the plan's limits and return the
-  same `402 quota_exceeded` / `429 fair_use` shapes.
+  charged. It is charged on every request that reaches upstream, including empty
+  transcripts and upstream failures. Starter compares words and audio seconds against
+  its limits; Pro and trial have no word cap and compare only audio seconds (7 h and
+  3 h respectively). They return the same `402 quota_exceeded` / `429 fair_use` shapes.
+  A free-blocked non-paying user gets `402 device_limit` before any quota check.
 - Upstream failures never look like Ray errors: upstream 401/402/403/5xx and
   unreachable/timeout become `502 { "error": "upstream_error" }`; an upstream 429 becomes
   `503 { "error": "upstream_busy" }`.
 
 Quota errors (no fallback should be attempted by the desktop for these):
 - `402 { "error": "quota_exceeded", "message": "…", "plan": "starter", "words_used", "words_limit", "resets_at" }`
-- `429 { "error": "fair_use", "message": "…", "resets_at" }` (Pro over the hidden cap)
+- `429 { "error": "fair_use", "message": "…", "resets_at" }` (Pro or trial over the hidden audio cap)
+- `402 { "error": "device_limit", "message": "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating." }`
 - `401 { "error": "unauthorized" }` → desktop treats as signed out.
 
 ### Cleanup proxy details
@@ -272,8 +323,8 @@ Cleanup words are **not** counted (STT already counted them).
 
 ## D1 schema (minimum)
 
-- `users(id TEXT PK /* clerk user id */, email TEXT, name TEXT, creem_customer_id TEXT, created_at INTEGER)`
-- `devices(id TEXT PK, user_id TEXT, token_hash TEXT UNIQUE, created_at INTEGER, last_used_at INTEGER, revoked_at INTEGER)`
+- `users(id TEXT PK /* clerk user id */, email TEXT, name TEXT, creem_customer_id TEXT, created_at INTEGER, trial_started_at INTEGER, free_blocked_at INTEGER)`
+- `devices(id TEXT PK, user_id TEXT, token_hash TEXT UNIQUE, created_at INTEGER, last_used_at INTEGER, revoked_at INTEGER, device_hash TEXT /* indexed, SHA-256 of the desktop's hashed device id */)`
 - `auth_codes(code_hash TEXT PK, user_id TEXT, challenge TEXT, state TEXT, expires_at INTEGER, used_at INTEGER)`
 - `subscriptions(id TEXT PK /* creem subscription id */, user_id TEXT, product_id TEXT, interval TEXT, status TEXT, current_period_end INTEGER, cancel_at_period_end INTEGER, updated_at INTEGER)`
 - `usage_weeks(user_id TEXT, week_start INTEGER /* unix seconds, Monday 00:00 UTC */, words INTEGER, audio_seconds INTEGER /* internal, never in /api/me */, PRIMARY KEY(user_id, week_start))`
@@ -286,16 +337,19 @@ Cleanup words are **not** counted (STT already counted them).
   with a cancel option). Pressing the dictation shortcut while signed out shows a short bar
   message ("Sign in to Ray to dictate") and opens the main window.
 - **Account** (new nav item or a top section of Settings): email, plan badge
-  (Starter/Pro), a weekly usage meter for Starter ("412 of 1,000 words this week · resets
-  Monday"), upgrade buttons ("Upgrade to Pro: $9/mo" and "$6/mo billed yearly", which open
-  checkout in the browser), "Manage billing" for Pro (portal), and "Sign out". Refresh `/api/me`
-  on window focus, after each dictation, and when a `ray://billing/success` deep link
-  arrives (Creem success_url can point to `{SITE_URL}/billing/success`, which bounces to
-  `ray://billing/success`).
+  (Starter/Pro/**Pro trial**), a weekly usage meter for Starter ("412 of 1,000 words this
+  week · resets Monday"), upgrade buttons ("Upgrade to Pro: $9/mo" and "$7/mo billed
+  yearly", which open checkout in the browser), "Manage billing" for paid Pro (portal),
+  and "Sign out". While the no-card trial is active the Account page shows "Pro trial · N
+  days left" with the upgrade buttons still visible; it must not present the trial as a
+  paid subscription. A free-blocked account shows the device-limit message with the
+  upgrade buttons. Refresh `/api/me` on window focus, after each dictation, and when a
+  `ray://billing/success` deep link arrives (Creem success_url can point to
+  `{SITE_URL}/billing/success`, which bounces to `ray://billing/success`).
 - **Limit reached:** at recording start, if the cached `/api/me` says Starter is at or
   over the limit, don't record. The bar shows "Weekly limit reached" (or similar, short) and
   the main window opens to Account. A 402/429 from the proxy also ends the session with that
-  message and **does not** fall back to batch.
+  message and **does not** fall back to batch (`device_limit` included).
 - Keep the existing monochrome Notion/Linear visual language. No new color palette.
 
 ## Site expectations
@@ -386,9 +440,20 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
     from the subscription webhook (15-minute TTL), answering `409 checkout_pending` for a second
     attempt, so a delayed webhook cannot lead to a second subscription or charge. Both clients also
     disable the upgrade CTAs while activation is pending.
-17. **Audio cost metering.** AssemblyAI bills audio time, not words, so `usage_weeks` also stores
-    `audio_seconds`, incremented from the bytes streamed upstream on every STT request (empty
-    transcripts and upstream failures included). Starter and Pro each have a hidden weekly audio
-    budget (`STARTER_WEEKLY_AUDIO_SECONDS` = 3,600; `FAIR_USE_WEEKLY_AUDIO_SECONDS` = 54,000)
-    enforced alongside the word limits, with the existing `quota_exceeded` / `fair_use` shapes.
-    Audio numbers are never exposed in `/api/me`.
+17. **Audio cost metering and time-based fair use.** AssemblyAI bills audio time, not
+    words, so `usage_weeks` also stores `audio_seconds`, incremented from the bytes streamed
+    upstream on every STT request (empty transcripts and upstream failures included).
+    Starter enforces its visible word limit plus a hidden weekly audio budget
+    (`STARTER_WEEKLY_AUDIO_SECONDS` = 3,600). Pro has **no word cap**; its only hidden cap is
+    audio time (`FAIR_USE_WEEKLY_AUDIO_SECONDS` = 25,200 = 7 h). The no-card trial uses
+    `TRIAL_WEEKLY_AUDIO_SECONDS` = 10,800 (3 h). Errors keep the existing
+    `quota_exceeded` / `fair_use` shapes. Audio numbers are never exposed in `/api/me`.
+18. **No-card 14-day trial.** `users.trial_started_at` is set once by the first successful
+    desktop token exchange, and only when the account has no subscription row, is not
+    free-blocked, and supplied a valid `device_id`. The trial resolves as Pro with
+    `trial: { ends_at }` in `/api/me`; paid subscriptions always take precedence. Checkout is
+    allowed during a trial but still refused for a paid subscription.
+19. **Per-PC free limit.** `devices.device_hash` stores `SHA-256(device_id)`; the fourth and
+    later distinct account ever seen on one device is marked `users.free_blocked_at` and
+    gets no trial. A free-blocked non-paying account gets `402 device_limit` on STT; a paid
+    subscription works normally. `/api/me` exposes `free_blocked`.

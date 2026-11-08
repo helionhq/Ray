@@ -94,10 +94,11 @@ because the Worker maps upstream failures to `502 upstream_error` /
 `503 upstream_busy` and enforces a per-user STT concurrency cap with
 `429 too_many_requests`. Only these codes change the dictation flow:
 
-- `402 quota_exceeded` (Starter weekly limit) and `429 fair_use` (Pro fair-use
-  cap) skip the batch fallback and show the limit message. Whatever was already
-  transcribed is still pasted and saved in History, including a live session
-  that hit the limit on a later rollover segment.
+- `402 quota_exceeded` (Starter weekly limit), `429 fair_use` (Pro/trial audio
+  fair-use cap), and `402 device_limit` (this PC is over its free-account
+  limit) skip the batch fallback and show the limit message. Whatever was
+  already transcribed is still pasted and saved in History, including a live
+  session that hit the limit on a later rollover segment.
 - `401 unauthorized` clears the local session and asks you to sign in.
 - `upstream_error`, `upstream_busy`, `too_many_requests`, and every other code
   follow the normal fallback path. Cleanup failures of any kind (including
@@ -214,7 +215,7 @@ still delivered.
 
 - Sync live accepts up to 120 s of audio per request; longer dictations roll over to a new live request and the segment transcripts are concatenated. If the live path fails, the batch endpoint is used.
 - A single recording stops automatically at 5 minutes, the size of the local batch-fallback buffer. The bar tells you when that happens.
-- Starter is capped at 1,000 words per week (resets Monday 00:00 UTC). Pro is unlimited under a fair-use cap; if it is hit, dictation stops with a short message until the week resets. A dictation that crosses the limit keeps the part already transcribed (up to about two minutes) and is counted.
+- Starter is capped at 1,000 words per week (resets Monday 00:00 UTC). Pro is unlimited words with a hidden time-based fair-use cap; if it is hit, dictation stops with a short message until the week resets. A dictation that crosses the limit keeps the part already transcribed (up to about two minutes) and is counted. New accounts get a 14-day Pro trial with no card, starting at their first desktop sign-in.
 - Pasting into elevated (admin) windows is blocked by Windows UIPI. Ray detects this and copies the text to the clipboard with a clear message instead of silently doing nothing.
 - With the default Right Alt shortcut on a layout where Right Alt is AltGr, typing an AltGr character starts and immediately cancels a dictation (a brief bar flicker), but the character itself is replayed correctly. Choose another shortcut in Settings if that is distracting.
 - When Win is the shortcut, Ray swallows both of its edges so a bare tap does not open Start. Windows still handles Win+L (lock) itself, so that combination may lock the PC even while Win is the dictation shortcut.

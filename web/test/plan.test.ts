@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SubscriptionRow } from "../worker/env";
 import {
+  TRIAL_SECONDS,
   entitledProductIds,
   isEntitled,
   normalizeInterval,
@@ -144,6 +145,7 @@ describe("resolvePlan", () => {
       cancel_at_period_end: false,
       current_period_end: null,
       subscription_id: null,
+      trial_ends_at: null,
     });
   });
 
@@ -302,6 +304,73 @@ describe("resolvePlan", () => {
         PRODUCTS,
       ).interval,
     ).toBeNull();
+  });
+});
+
+describe("resolvePlan — 14-day no-card trial", () => {
+  const STARTED = NOW - 3 * 86_400;
+  const TRIAL = { startedAt: STARTED, freeBlocked: false };
+
+  it("resolves as Pro with only trial_ends_at set", () => {
+    const view = resolvePlan([], NOW, PRODUCTS, TRIAL);
+    expect(view).toEqual({
+      plan: "pro",
+      interval: null,
+      status: null,
+      cancel_at_period_end: false,
+      current_period_end: null,
+      subscription_id: null,
+      trial_ends_at: STARTED + TRIAL_SECONDS,
+    });
+  });
+
+  it("ends exactly at the 14-day boundary", () => {
+    expect(resolvePlan([], STARTED + TRIAL_SECONDS - 1, PRODUCTS, TRIAL).plan).toBe(
+      "pro",
+    );
+    expect(
+      resolvePlan([], STARTED + TRIAL_SECONDS, PRODUCTS, TRIAL),
+    ).toMatchObject({ plan: "starter", trial_ends_at: null });
+  });
+
+  it("a paid subscription takes precedence over the trial", () => {
+    const view = resolvePlan([subscription()], NOW, PRODUCTS, TRIAL);
+    expect(view.plan).toBe("pro");
+    expect(view.interval).toBe("monthly");
+    expect(view.status).toBe("active");
+    expect(view.trial_ends_at).toBeNull();
+  });
+
+  it("any subscription row, even a dead one, suppresses the trial", () => {
+    const view = resolvePlan(
+      [
+        subscription({
+          status: "expired",
+          current_period_end: PAST,
+        }),
+      ],
+      NOW,
+      PRODUCTS,
+      TRIAL,
+    );
+    expect(view.plan).toBe("starter");
+    expect(view.trial_ends_at).toBeNull();
+  });
+
+  it("a free-blocked account gets no trial even inside 14 days", () => {
+    const view = resolvePlan([], NOW, PRODUCTS, {
+      startedAt: STARTED,
+      freeBlocked: true,
+    });
+    expect(view.plan).toBe("starter");
+    expect(view.trial_ends_at).toBeNull();
+  });
+
+  it("a never-started trial stays Starter", () => {
+    expect(
+      resolvePlan([], NOW, PRODUCTS, { startedAt: null, freeBlocked: false })
+        .plan,
+    ).toBe("starter");
   });
 });
 

@@ -445,7 +445,7 @@ describe("quota enforcement", () => {
     });
   });
 
-  it("hides the fair-use cap in /api/me but returns 429 at it", async () => {
+  it("hides the Pro audio fair-use cap in /api/me but returns 429 at it", async () => {
     await seedUser("user_fair");
     const token = await seedDevice("user_fair");
     const now = nowSeconds();
@@ -464,7 +464,13 @@ describe("quota enforcement", () => {
         now,
       )
       .run();
-    await addUsage(env.DB, "user_fair", weekBounds(now).weekStart, 100_000);
+    await addUsage(
+      env.DB,
+      "user_fair",
+      weekBounds(now).weekStart,
+      500_000,
+      25_200,
+    );
 
     const me = await SELF.fetch("https://ray.test/api/me", {
       headers: { authorization: `Bearer ${token}` },
@@ -473,6 +479,9 @@ describe("quota enforcement", () => {
     const meBody = await jsonOf(me);
     expect(meBody["plan"]).toBe("pro");
     expect(meBody["usage"]).toMatchObject({ words_limit: null });
+    expect(
+      (meBody["usage"] as Record<string, unknown>)["audio_seconds"],
+    ).toBeUndefined();
 
     const response = await SELF.fetch("https://ray.test/v1/stt/sync", {
       method: "POST",
@@ -541,7 +550,7 @@ describe("quota enforcement", () => {
       "user_audio_fair",
       weekBounds(now).weekStart,
       0,
-      54_000,
+      25_200,
     );
 
     const response = await SELF.fetch("https://ray.test/v1/stt/sync", {

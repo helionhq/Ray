@@ -12,6 +12,10 @@ export type PlanName = "starter" | "pro";
 export type PlanInterval = "monthly" | "annual";
 export type BillingIssue = "past_due" | "unpaid" | "paused";
 
+/** The no-card Pro trial runs for 14 days from the first desktop sign-in. */
+export const TRIAL_DAYS = 14;
+export const TRIAL_SECONDS = TRIAL_DAYS * 86_400;
+
 export interface PlanView {
   plan: PlanName;
   interval: PlanInterval | null;
@@ -20,7 +24,22 @@ export interface PlanView {
   /** Unix seconds. */
   current_period_end: number | null;
   subscription_id: string | null;
+  /**
+   * Unix seconds when the active no-card Pro trial ends. Null for paid
+   * subscriptions and Starter: while non-null the account resolves as Pro
+   * but `interval`/`status` stay null because there is no subscription.
+   */
+  trial_ends_at: number | null;
 }
+
+export interface TrialState {
+  /** Unix seconds; null when the trial never started. */
+  startedAt: number | null;
+  /** Free-blocked accounts can never be on a trial. */
+  freeBlocked: boolean;
+}
+
+const NO_TRIAL: TrialState = { startedAt: null, freeBlocked: false };
 
 /**
  * The only product ids allowed to grant Pro. Placeholder/empty values are
@@ -145,6 +164,7 @@ function toView(subscription: SubscriptionRow, plan: PlanName): PlanView {
     cancel_at_period_end: subscription.cancel_at_period_end !== 0,
     current_period_end: subscription.current_period_end,
     subscription_id: subscription.id,
+    trial_ends_at: null,
   };
 }
 
@@ -155,20 +175,48 @@ const STARTER: PlanView = {
   cancel_at_period_end: false,
   current_period_end: null,
   subscription_id: null,
+  trial_ends_at: null,
 };
+
+/** When the trial ends, or null when it never started / is suppressed. */
+export function trialEndsAt(trial: TrialState): number | null {
+  if (trial.startedAt === null || trial.freeBlocked) return null;
+  return trial.startedAt + TRIAL_SECONDS;
+}
+
+function trialView(trial: TrialState, nowSeconds: number): PlanView | null {
+  const endsAt = trialEndsAt(trial);
+  if (endsAt === null || nowSeconds >= endsAt) return null;
+  return {
+    plan: "pro",
+    interval: null,
+    status: null,
+    cancel_at_period_end: false,
+    current_period_end: null,
+    subscription_id: null,
+    trial_ends_at: endsAt,
+  };
+}
 
 /**
  * Chooses the subscription that best describes the user's current state.
  * Entitled subscriptions win (active before trialing before a scheduled
  * cancellation), otherwise the most recently updated row is shown so the
  * account page can still display "canceled"/"expired"/"revoked".
+ *
+ * A paid subscription always takes precedence over the trial. Once any
+ * subscription row exists the trial is never used again, matching the rule
+ * that only accounts that never subscribed can start one.
  */
 export function resolvePlan(
   subscriptions: readonly SubscriptionRow[],
   nowSeconds: number,
   entitledProducts: readonly string[],
+  trial: TrialState = NO_TRIAL,
 ): PlanView {
-  if (subscriptions.length === 0) return STARTER;
+  if (subscriptions.length === 0) {
+    return trialView(trial, nowSeconds) ?? STARTER;
+  }
 
   const entitled = subscriptions.filter((subscription) =>
     isEntitled(subscription, nowSeconds, entitledProducts),

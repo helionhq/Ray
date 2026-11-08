@@ -5,18 +5,20 @@
 //! `error` code, never by status alone: upstream 401/402/403/429 responses are
 //! mapped by the Worker to `502 upstream_error` / `503 upstream_busy`, so a
 //! status can never be trusted to describe the account state. Only
-//! `unauthorized` signs out; only `quota_exceeded` / `fair_use` skip the batch
-//! fallback.
+//! `unauthorized` signs out; only `quota_exceeded` / `fair_use` / `device_limit`
+//! skip the batch fallback.
 
 use serde_json::Value;
 
-/// Why a Ray API request failed. Only the first three variants are fatal to a
+/// Why a Ray API request failed. Only the first four variants are fatal to a
 /// dictation session; `Other` keeps the existing retry/fallback behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApiErrorKind {
     Unauthorized,
     QuotaExceeded,
     FairUse,
+    /// This PC has used up its free accounts; only a paid plan can dictate.
+    DeviceLimit,
     Other,
 }
 
@@ -68,6 +70,7 @@ impl ApiError {
             "unauthorized" => ApiErrorKind::Unauthorized,
             "quota_exceeded" => ApiErrorKind::QuotaExceeded,
             "fair_use" => ApiErrorKind::FairUse,
+            "device_limit" => ApiErrorKind::DeviceLimit,
             _ => return None,
         };
         let value = serde_json::from_str::<Value>(body).ok();
@@ -82,6 +85,7 @@ impl ApiError {
             ApiErrorKind::Unauthorized => "Your session expired. Sign in to Ray again.".into(),
             ApiErrorKind::QuotaExceeded => "Weekly limit reached".into(),
             ApiErrorKind::FairUse => "Fair-use limit reached, resets Monday".into(),
+            ApiErrorKind::DeviceLimit => "Free limit reached on this PC".into(),
             ApiErrorKind::Other => String::new(),
         });
         Some(Self {
@@ -212,6 +216,27 @@ mod tests {
         assert_eq!(fair_use.kind, ApiErrorKind::FairUse);
         assert_eq!(fair_use.resets_at.as_deref(), Some("2026-11-09T00:00:00Z"));
         assert!(fair_use.is_fatal());
+
+        let device_limit = ApiError::from_response(
+            402,
+            r#"{"error":"device_limit","message":"This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating."}"#,
+        )
+        .expect("402 with device_limit is typed");
+        assert_eq!(device_limit.kind, ApiErrorKind::DeviceLimit);
+        assert_eq!(
+            device_limit.message.as_deref(),
+            Some(
+                "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating."
+            )
+        );
+        assert!(device_limit.is_fatal());
+
+        let device_limit_default = ApiError::from_response(402, r#"{"error":"device_limit"}"#)
+            .expect("a bare device_limit is typed");
+        assert_eq!(
+            device_limit_default.to_string(),
+            "Free limit reached on this PC"
+        );
 
         let unauthorized =
             ApiError::from_response(401, r#"{"error":"unauthorized"}"#).expect("401 is typed");

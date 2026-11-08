@@ -4,6 +4,7 @@ mod auth;
 mod cleanup;
 mod commands;
 mod config;
+mod device;
 mod hotkey;
 mod paste;
 mod pipeline;

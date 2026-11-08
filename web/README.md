@@ -90,11 +90,11 @@ placeholder before deploying.
 | `CLERK_WEBHOOK_SECRET` | secret (required) | Svix signing secret for Clerk webhooks. Required for account deletion: when unset, `POST /api/webhooks/clerk` answers 503 and deleted accounts keep their PII, device access and Creem subscription. |
 | `CREEM_API_BASE` | var | `https://test-api.creem.io` or `https://api.creem.io` |
 | `CREEM_PRODUCT_PRO_MONTHLY` | var | Creem product id for Pro Monthly ($9/mo) |
-| `CREEM_PRODUCT_PRO_ANNUAL` | var | Creem product id for Pro Annual ($72/yr) |
+| `CREEM_PRODUCT_PRO_ANNUAL` | var | Creem product id for Pro Annual ($84/yr) |
 | `STARTER_WEEKLY_WORDS` | var | Starter weekly allowance, default `1000` |
-| `FAIR_USE_WEEKLY_WORDS` | var | Hidden Pro fair-use cap, default `100000` |
 | `STARTER_WEEKLY_AUDIO_SECONDS` | var | Hidden Starter weekly audio budget, default `3600` (60 minutes). Audio seconds are metered from bytes streamed to AssemblyAI. |
-| `FAIR_USE_WEEKLY_AUDIO_SECONDS` | var | Hidden Pro weekly audio fair-use cap, default `54000` (15 hours) |
+| `FAIR_USE_WEEKLY_AUDIO_SECONDS` | var | Hidden Pro weekly audio fair-use cap, default `25200` (7 hours) |
+| `TRIAL_WEEKLY_AUDIO_SECONDS` | var | Hidden 14-day-trial weekly audio budget, default `10800` (3 hours) |
 | `CLEANUP_MODELS` | var | Comma-separated model allowlist, default `gemma-4-31b` |
 
 Set the five required secrets in production:
@@ -163,7 +163,7 @@ acknowledged and ignored.
 
 1. Create two recurring products in the Creem dashboard:
    - **Pro Monthly** — $9/month
-   - **Pro Annual** — $72/year ($6/month billed annually)
+   - **Pro Annual** — $84/year ($7/month billed annually)
 2. Copy both product ids into `CREEM_PRODUCT_PRO_MONTHLY` and
    `CREEM_PRODUCT_PRO_ANNUAL`.
 3. Set `CREEM_API_BASE` to `https://test-api.creem.io` for test mode or
@@ -341,9 +341,11 @@ sign-in (the browser hand-off checks `SITE_URL`).
 | POST | `/v1/stt/batch` | device | v2 upload/create/poll fallback (12 MB cap) |
 | POST | `/v1/cleanup/chat/completions` | device | AssemblyAI LLM gateway proxy (grant-gated) |
 
-Plans: **Starter** (1,000 words/week, resets Monday 00:00 UTC) and **Pro**
-(unlimited, with a hidden weekly fair-use cap). Quota failures are
-`402 quota_exceeded` for Starter and `429 fair_use` for Pro.
+Plans: **Starter** (1,000 words/week, resets Monday 00:00 UTC), **Pro**
+(unlimited, with a hidden weekly audio fair-use cap), and a **14-day no-card Pro
+trial** that starts on the first desktop sign-in. Quota failures are
+`402 quota_exceeded` for Starter, `429 fair_use` for Pro/trial audio, and
+`402 device_limit` for a free account over the per-PC limit.
 
 ### API fields and error codes other clients rely on
 
@@ -351,9 +353,16 @@ Plans: **Starter** (1,000 words/week, resets Monday 00:00 UTC) and **Pro**
   and `billing_issue: null | "past_due" | "unpaid" | "paused"`. When it is
   non-null, show "Payment issue: update your card" and the portal instead of
   upgrade buttons.
+- `GET /api/me` also returns `trial: null | { ends_at }` and
+  `free_blocked: boolean`. While `trial` is non-null the plan is `"pro"` but
+  `interval`/`status` stay null (there is no subscription); show "Pro trial ·
+  N days left". `free_blocked` means the PC is over the free-account limit.
 - `POST /api/billing/checkout` returns `409 { error: "billing_issue" }` while
   a payment issue is outstanding, and `409 { error: "already_subscribed" }`
-  for an entitled Pro account.
+  only for a paid Pro account (checkout is allowed during the trial).
+- `402 { error: "device_limit" }` is returned on STT for a free-blocked
+  account that has no paid subscription. It must stop dictation without a
+  batch fallback, exactly like `quota_exceeded`.
 - `POST /api/devices/revoke-all` returns `{ ok: true, revoked: <count> }`.
 - `POST /api/webhooks/clerk` returns `503 { error: "not_configured" }` when
   `CLERK_WEBHOOK_SECRET` is unset.
@@ -398,6 +407,24 @@ Plans: **Starter** (1,000 words/week, resets Monday 00:00 UTC) and **Pro**
   `/v1/stt/sync` and `/v1/stt/batch` — rejects a declared `Content-Length`
   over 12 MB and enforces the same cap chunk by chunk while streaming the
   audio to AssemblyAI. Nothing calls `arrayBuffer()` on an unbounded body.
+- **Time-based fair use.** Pro has no weekly word cap. Its only hidden cap is
+  audio time (`FAIR_USE_WEEKLY_AUDIO_SECONDS` = 7 h/week); the 14-day trial
+  uses `TRIAL_WEEKLY_AUDIO_SECONDS` = 3 h/week. Starter keeps its visible
+  1,000-word limit plus the hidden 60-minute audio budget. Over an audio cap
+  the STT proxy answers `429 fair_use` (Pro/trial) or `402 quota_exceeded`
+  (Starter). None of the hidden numbers appear in `/api/me` or the site.
+- **No-card trial.** `users.trial_started_at` is set once by the first
+  successful `POST /api/desktop/token`, and only when the account has no
+  subscription row, is not free-blocked, and sent a valid `device_id`. It
+  never starts on site-only sign-up. During the trial the account resolves as
+  Pro with `trial: { ends_at }`; a paid subscription wins.
+- **Per-PC free limit.** The desktop sends `device_id =
+  base64url(SHA-256("ray-device-v1:" + MachineGuid))`; the raw GUID never
+  leaves the PC. The Worker stores `SHA-256(device_id)` in
+  `devices.device_hash` and counts distinct users that ever used that hash
+  (revoked rows included). A fourth or later distinct account is marked
+  `users.free_blocked_at`: sign-in still succeeds, but it gets no trial and,
+  without a paid plan, every STT request answers `402 device_limit`.
 - **Rate limiting (M6).** The Worker uses Workers Rate Limiting bindings
   (`ratelimits` in `wrangler.jsonc`): per user for
   `/api/desktop/authorize`, `/api/billing/*`, `/api/devices/revoke-all` and
@@ -414,9 +441,12 @@ billing meter.
 
 Audio and transcripts pass through the Worker in memory to AssemblyAI. They
 are never written to D1, logs, or analytics. D1 stores only users, devices,
-one-time auth codes, subscriptions, webhook ids, weekly word counts, cleanup
-grant counters, STT leases and weekly failure counts. Do not add logging of
-request/response bodies, audio or transcripts anywhere in `worker/`.
+one-time auth codes, subscriptions, webhook ids, weekly word counts and
+audio-second counters, cleanup grant counters, STT leases, weekly failure
+counts, and — for the per-PC free limit — a one-way hashed device identifier
+(`SHA-256` of the already-hashed id the desktop sends). The raw hardware id is
+never received. Do not add logging of request/response bodies, audio or
+transcripts anywhere in `worker/`.
 
 ## Tests
 

@@ -23,9 +23,29 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
     subscriptions,
     now,
     entitledProductIds(c.env),
+    {
+      startedAt: user.trial_started_at,
+      freeBlocked: user.free_blocked_at !== null,
+    },
   );
+
+  // Trial-farming protection: a free-blocked account cannot dictate without a
+  // paid subscription. Sign-in still works so the upgrade buttons remain
+  // reachable. This runs before the quota check: it applies even when the
+  // weekly usage is still low.
+  if (user.free_blocked_at !== null && plan.plan !== "pro") {
+    return c.json(
+      {
+        error: "device_limit",
+        message:
+          "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating.",
+      },
+      402,
+    );
+  }
+
   const decision = decideQuota(
-    plan.plan,
+    plan.trial_ends_at !== null ? "trial" : plan.plan,
     usage.words,
     usage.audioSeconds,
     quotaLimits(c.env),

@@ -56,8 +56,14 @@ export function registerBillingRoutes(app: Hono<AppContext>): void {
         await listSubscriptions(c.env.DB, user.id),
         nowSeconds(),
         entitledProductIds(c.env),
+        {
+          startedAt: user.trial_started_at,
+          freeBlocked: user.free_blocked_at !== null,
+        },
       );
-      if (plan.plan === "pro") {
+      // A trial resolves as Pro, but the user has no subscription yet and
+      // must be able to upgrade. Only a paid subscription blocks checkout.
+      if (plan.plan === "pro" && plan.trial_ends_at === null) {
         return c.json(
           {
             error: "already_subscribed",

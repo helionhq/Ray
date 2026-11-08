@@ -19,9 +19,9 @@ export interface Env {
   CREEM_PRODUCT_PRO_MONTHLY: string;
   CREEM_PRODUCT_PRO_ANNUAL: string;
   STARTER_WEEKLY_WORDS: string;
-  FAIR_USE_WEEKLY_WORDS: string;
   STARTER_WEEKLY_AUDIO_SECONDS: string;
   FAIR_USE_WEEKLY_AUDIO_SECONDS: string;
+  TRIAL_WEEKLY_AUDIO_SECONDS: string;
   CLEANUP_MODELS: string;
 
   // Secrets (wrangler secret put / .dev.vars).
@@ -55,6 +55,10 @@ export interface UserRow {
   name: string | null;
   creem_customer_id: string | null;
   created_at: number;
+  /** Unix seconds; set on the first successful desktop sign-in. */
+  trial_started_at: number | null;
+  /** Unix seconds; set when this account is over the per-PC free limit. */
+  free_blocked_at: number | null;
 }
 
 export interface SubscriptionRow {
@@ -74,6 +78,8 @@ export interface DeviceRow {
   user_id: string;
   last_used_at: number | null;
   revoked_at: number | null;
+  /** SHA-256 of the desktop's hashed device id; null when it was omitted. */
+  device_hash: string | null;
 }
 
 export interface AuthCodeRow {

@@ -49,6 +49,13 @@ export function PrivacyPage() {
         can stay signed in. Signing out of the desktop app revokes that token.
         Your device token itself lives in Windows Credential Manager on your PC.
       </p>
+      <p>
+        The Windows app also sends a one-way hashed device identifier derived
+        from your PC&rsquo;s Windows device ID. It is hashed on your PC before
+        it is sent, hashed again on our server, and used only to limit free
+        trials and free accounts per PC. We never receive or store the raw
+        hardware ID.
+      </p>
 
       <h2>Plan, payment, and usage</h2>
       <p>
@@ -59,9 +66,9 @@ export function PrivacyPage() {
       </p>
       <p>
         We store weekly usage counts — words and audio minutes, a number per
-        account, not the text — to enforce the Starter limit and a fair-use
-        limit that protects service costs. The count resets every Monday at
-        00:00 UTC.
+        account, not the text or the audio — to enforce the Starter limit and a
+        fair-use limit that protects service costs. The count resets every
+        Monday at 00:00 UTC.
       </p>
 
       <h2>What stays on your PC</h2>

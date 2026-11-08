@@ -6,6 +6,10 @@
 
 export type BillingInterval = "monthly" | "annual";
 
+/** The no-card Pro trial on the landing page, FAQ, and account page. */
+export const TRIAL_DAYS = 14;
+export const TRIAL_LINE = `Try Pro free for ${TRIAL_DAYS} days, no card needed.`;
+
 export const PLANS = {
   starter: {
     name: "Starter",
@@ -27,11 +31,11 @@ export const PLANS = {
     },
     annual: {
       interval: "annual" as const,
-      price: 6,
+      price: 7,
       period: "/month",
-      billing: "Billed $72 yearly",
-      total: 72,
-      savings: "Save 33%",
+      billing: "Billed $84 yearly",
+      total: 84,
+      savings: "Save 22%",
     },
   },
 } as const;

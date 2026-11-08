@@ -5,6 +5,7 @@ import {
   PLANS,
   PRIVACY_LINE,
   RESET_LABEL,
+  TRIAL_LINE,
   proPrice,
   type BillingInterval,
 } from "../content";
@@ -74,6 +75,10 @@ const faqs: { question: string; answer: ReactNode }[] = [
     } at ${
       PLANS.starter.resetTime
     }. When you hit the limit, Ray stops recording and asks you to upgrade. A dictation that crosses the line keeps the part already transcribed (up to about two minutes) and is counted.`,
+  },
+  {
+    question: "Can I try Pro before paying?",
+    answer: `${TRIAL_LINE} Pro starts on your first desktop sign-in and runs for 14 days; when it ends you can keep dictating on the free Starter plan.`,
   },
   {
     question: "Can I cancel Pro anytime?",
@@ -312,6 +317,7 @@ function Pricing() {
           </article>
         </div>
 
+        <p className="pricing-note">{TRIAL_LINE}</p>
         <p className="pricing-note">
           Prices in USD. Pro renews monthly or yearly until you cancel. Creem
           is our merchant of record.

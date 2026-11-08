@@ -12,13 +12,16 @@ import type { AppContext } from "../env";
 import { requireClerk, requireDevice } from "../auth";
 import {
   consumeAuthCode,
+  countOtherUsersOnDevice,
   createAuthCode,
   createDevice,
   deleteExpiredAuthCodes,
   findAuthCode,
   getUser,
+  markFreeBlockedStatement,
   revokeAllDevices,
   revokeDevice,
+  startTrialStatement,
 } from "../db";
 import {
   pkceChallenge,
@@ -32,6 +35,12 @@ import { isBase64Url32 } from "../lib/validation";
 import { parseJsonObject, readBodyLimited } from "../http";
 
 const AUTH_CODE_TTL_SECONDS = 300;
+/**
+ * At most this many distinct Ray accounts may ever use one PC. The fourth and
+ * later accounts are free-blocked (they can sign in but cannot dictate
+ * without a paid subscription).
+ */
+export const DEVICE_ACCOUNT_LIMIT = 3;
 
 export function registerDesktopRoutes(app: Hono<AppContext>): void {
   app.post(
@@ -125,6 +134,22 @@ export function registerDesktopRoutes(app: Hono<AppContext>): void {
           400,
         );
       }
+      // Optional: old clients omit it and simply get no trial. A malformed
+      // value is a client bug and is rejected rather than silently ignored.
+      const rawDeviceId = json["device_id"];
+      const deviceId =
+        rawDeviceId === undefined || rawDeviceId === null
+          ? null
+          : rawDeviceId;
+      if (deviceId !== null && !isBase64Url32(deviceId)) {
+        return c.json(
+          {
+            error: "invalid_request",
+            message: "device_id must be a 32-byte base64url value.",
+          },
+          400,
+        );
+      }
 
       const now = nowSeconds();
       const codeHash = await sha256Hex(code);
@@ -179,12 +204,42 @@ export function registerDesktopRoutes(app: Hono<AppContext>): void {
 
       const token = `ray_${randomToken(32)}`;
       const tokenHash = await sha256Hex(token);
+      // The desktop sends base64url(SHA-256("ray-device-v1:" + MachineGuid));
+      // the Worker stores SHA-256 of that value. Neither side can recover the
+      // raw hardware id, and the second hash is only used to count accounts.
+      const deviceHash = deviceId === null ? null : await sha256Hex(deviceId);
+      if (deviceHash !== null) {
+        const otherAccounts = await countOtherUsersOnDevice(
+          c.env.DB,
+          deviceHash,
+          authCode.user_id,
+        );
+        if (otherAccounts >= DEVICE_ACCOUNT_LIMIT) {
+          // Fourth or later distinct account on this PC: keep sign-in working
+          // (so the upgrade buttons are reachable) but grant no free use.
+          await markFreeBlockedStatement(
+            c.env.DB,
+            authCode.user_id,
+            now,
+          ).run();
+        }
+      }
       await createDevice(c.env.DB, {
         id: `dev_${crypto.randomUUID()}`,
         userId: authCode.user_id,
         tokenHash,
         createdAt: now,
+        deviceHash,
       });
+
+      // The no-card 14-day trial starts on the first successful desktop
+      // sign-in only: never on site-only sign-up, never without a device id,
+      // never when a subscription has ever existed, and never once another
+      // PC-level free block or trial is already in place. The WHERE clause
+      // enforces this atomically.
+      if (deviceHash !== null) {
+        await startTrialStatement(c.env.DB, authCode.user_id, now).run();
+      }
 
       return c.json({
         token,

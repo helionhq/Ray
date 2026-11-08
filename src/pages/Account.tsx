@@ -42,8 +42,20 @@ function dateLabel(iso: string | null): string | null {
   return Number.isNaN(date.getTime()) ? null : dateFormat.format(date);
 }
 
-function planLabel(account: Account): "Starter" | "Pro" {
+function planLabel(account: Account): "Starter" | "Pro" | "Pro trial" {
+  // A trial resolves as Pro but is not a paid subscription; never label it
+  // as one.
+  if (account.trial !== null) return "Pro trial";
   return account.plan === "pro" ? "Pro" : "Starter";
+}
+
+/** Whole days left in the trial, never negative. */
+function trialDaysLeft(account: Account): number {
+  const endsAt = account.trial?.ends_at;
+  if (!endsAt) return 0;
+  const ends = new Date(endsAt).getTime();
+  if (Number.isNaN(ends)) return 0;
+  return Math.max(0, Math.ceil((ends - Date.now()) / 86_400_000));
 }
 
 function proNote(account: Account): string {
@@ -175,7 +187,10 @@ export function AccountPage({
   }
 
   const plan = planLabel(account);
+  const isTrial = account.trial !== null;
+  const trialDays = trialDaysLeft(account);
   const starter = plan === "Starter";
+  const showUpgrade = starter || isTrial;
   const limit = account.usage.words_limit;
   const used = account.usage.words_used;
   const percent =
@@ -260,30 +275,56 @@ export function AccountPage({
               {busy === "portal" ? "Opening…" : "Manage billing"}
             </button>
           </div>
-        ) : starter ? (
+        ) : showUpgrade ? (
           <>
-            <div className="row account-usage">
-              <div className="row-copy">
-                <div className="label">Weekly usage</div>
-                <div className="help">
-                  {numberFormat.format(used)} of{" "}
-                  {limit ? numberFormat.format(limit) : "—"} words this week ·{" "}
-                  {resetLabel(account)}
-                </div>
-                <div
-                  className="meter"
-                  role="progressbar"
-                  aria-label="Weekly words used"
-                  aria-valuemin={0}
-                  aria-valuemax={limit ?? 0}
-                  // aria-valuenow must never exceed its max, even when the
-                  // server reports usage above the limit.
-                  aria-valuenow={Math.min(used, limit ?? used)}
-                >
-                  <span style={{ width: `${percent}%` }} />
+            {isTrial ? (
+              <div className="row">
+                <div className="row-copy">
+                  <div className="label">
+                    Pro trial · {trialDays}{" "}
+                    {trialDays === 1 ? "day" : "days"} left
+                  </div>
+                  <div className="help">
+                    Everything in Pro while it lasts, no card needed. Upgrade
+                    any time to keep Pro when the trial ends.
+                  </div>
                 </div>
               </div>
-            </div>
+            ) : (
+              <div className="row account-usage">
+                <div className="row-copy">
+                  <div className="label">Weekly usage</div>
+                  <div className="help">
+                    {numberFormat.format(used)} of{" "}
+                    {limit ? numberFormat.format(limit) : "—"} words this week ·{" "}
+                    {resetLabel(account)}
+                  </div>
+                  <div
+                    className="meter"
+                    role="progressbar"
+                    aria-label="Weekly words used"
+                    aria-valuemin={0}
+                    aria-valuemax={limit ?? 0}
+                    // aria-valuenow must never exceed its max, even when the
+                    // server reports usage above the limit.
+                    aria-valuenow={Math.min(used, limit ?? used)}
+                  >
+                    <span style={{ width: `${percent}%` }} />
+                  </div>
+                </div>
+              </div>
+            )}
+            {account.free_blocked && (
+              <div className="row">
+                <div className="row-copy">
+                  <div className="label">Free limit reached on this PC</div>
+                  <div className="help">
+                    This PC has reached its limit of free accounts. Upgrade to
+                    Pro to keep dictating.
+                  </div>
+                </div>
+              </div>
+            )}
             <div className="row account-upgrade">
               <div className="row-copy">
                 <div className="label">Upgrade to Pro</div>
@@ -306,7 +347,7 @@ export function AccountPage({
                   disabled={busy !== null || activatingPro}
                   onClick={() => void upgrade("annual")}
                 >
-                  {busy === "annual" ? "Opening…" : "$6/mo billed yearly"}
+                  {busy === "annual" ? "Opening…" : "$7/mo billed yearly"}
                 </button>
               </div>
             </div>
