@@ -71,9 +71,10 @@ pub fn run() {
                 handle_deep_links(app.handle(), urls);
             }
 
-            // The global Right Alt hook.
+            // The global dictation-shortcut hook, using the saved shortcut.
+            let hotkey = app.state::<Arc<store::Store>>().settings().hotkey;
             let (hotkey_tx, mut hotkey_rx) = tokio::sync::mpsc::unbounded_channel();
-            if let Err(error) = hotkey::install(hotkey_tx) {
+            if let Err(error) = hotkey::install(hotkey_tx, hotkey, app.handle().clone()) {
                 eprintln!("[ray] {error}");
             }
             tauri::async_runtime::spawn(async move {
@@ -147,6 +148,11 @@ pub fn run() {
             commands::open_main,
             commands::reload_config,
             commands::retry_hotkey,
+            commands::get_hotkey,
+            commands::start_hotkey_capture,
+            commands::cancel_hotkey_capture,
+            commands::set_hotkey,
+            commands::reset_hotkey,
             commands::quit,
             auth::auth_state,
             auth::sign_in,
@@ -179,8 +185,9 @@ fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit Ray", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &dictate, &quit])?;
 
+    let shortcut = app.state::<Arc<store::Store>>().settings().hotkey.label();
     let mut builder = TrayIconBuilder::with_id("ray-tray")
-        .tooltip("Ray · Right Alt to dictate")
+        .tooltip(format!("Ray · {shortcut} to dictate"))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

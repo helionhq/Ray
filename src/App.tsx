@@ -206,7 +206,7 @@ export default function App() {
           <div className="banner" role="status">
             <AlertIcon size={14} className="banner-icon" />
             <span className="banner-text">
-              The Right Alt shortcut is unavailable.
+              Your dictation shortcut is unavailable.
             </span>
             <button
               type="button"

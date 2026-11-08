@@ -1,12 +1,12 @@
 # Ray
 
-Fast, clean dictation for Windows 10/11. Press **Right Alt**, speak, press it again. Ray transcribes while you speak, cleans up the text, and pastes it into whatever you were typing in.
+Fast, clean dictation for Windows 10/11. Press your dictation shortcut (**Right Alt** by default), speak, press it again. Ray transcribes while you speak, cleans up the text, and pastes it into whatever you were typing in.
 
 Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar is a web port of the Dot scope HUD from [Hex](https://github.com/anomalyco/hex).
 
 ## What it does
 
-- **Right Alt toggles recording.** A low-level keyboard hook swallows both edges of the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held cancels the recording and replays the chord with Right Alt down, so AltGr characters (`@`, `€`) and Alt+Tab still work. **Esc** cancels.
+- **The dictation shortcut toggles recording.** It is configurable in Settings and defaults to Right Alt. Supported forms are a single modifier (either side of Alt, Ctrl, Shift, or Win), a single safe key (F1–F24, Pause, Scroll Lock, Insert, the navigation keys, and media keys), or one or more modifiers plus a key (for example Ctrl + Shift + Space or Alt + D; Esc is reserved for cancelling and letters or digits need a modifier). A low-level keyboard hook swallows the shortcut's edges so the target app never sees them: a modifier shortcut swallows both edges of the modifier (so no menu bar or Start menu), and a combo swallows only its trigger key. Pressing another key while a modifier shortcut is held cancels the recording and replays the chord with the modifier down, so AltGr characters (`@`, `€`) and Alt+Tab still work. A bare Win tap is suppressed so it does not open Start. **Esc** cancels.
 - **Streaming is always on.** Ray sends 16 kHz mono PCM to Ray's API while you talk (`/v1/stt/sync-live`, proxied to AssemblyAI Sync live), so stopping only waits for the tail and final decode (~0.5 s typical). If the live request fails, Ray falls back to Sync batch, then a server-side v2 batch proxy, using the locally buffered WAV.
 - **Cleanup** sends the transcript through Ray's OpenAI-compatible cleanup proxy (`/v1/cleanup/chat/completions`). Structured is the only mode: it rewrites for flow and can add paragraphs and lists. If cleanup fails, the raw transcript is pasted rather than lost.
 - **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard. Restore timing is adaptive (longer for Electron, Office, and browsers) and is skipped if anything else changed the clipboard meanwhile, so slow targets never paste the old contents. Transient dictation text is excluded from Win+V clipboard history and cloud clipboard. If the focused window is elevated, Ray says so instead of silently failing.
@@ -162,7 +162,7 @@ In debug builds, `RAY_TEST_PCM=/path/to/raw-16k-mono.pcm` replaces the microphon
 
 ```
 src-tauri/src/
-  hotkey.rs      WH_KEYBOARD_LL thread: Right Alt toggle, Esc cancel, AltGr chord recovery
+  hotkey.rs      WH_KEYBOARD_LL thread: configurable shortcut toggle + capture, Esc cancel, chord recovery
   audio.rs       cpal capture, mono downmix, low-pass + resample to 16 kHz PCM16, level meter
   auth.rs        browser sign-in, PKCE state/challenge, deep links, device token, /api/me cache
   api.rs         API origin/URL helpers and typed quota/auth errors
@@ -194,5 +194,6 @@ still delivered.
 - A single recording stops automatically at 5 minutes, the size of the local batch-fallback buffer. The bar tells you when that happens.
 - Starter is capped at 1,000 words per week (resets Monday 00:00 UTC). Pro is unlimited under a fair-use cap; if it is hit, dictation stops with a short message until the week resets. A dictation that crosses the limit is allowed to finish and is counted.
 - Pasting into elevated (admin) windows is blocked by Windows UIPI. Ray detects this and copies the text to the clipboard with a clear message instead of silently doing nothing.
-- On layouts where Right Alt is AltGr, typing an AltGr character starts and immediately cancels a dictation (a brief bar flicker), but the character itself is replayed correctly. A bare Right Alt is still the dictation toggle.
+- With the default Right Alt shortcut on a layout where Right Alt is AltGr, typing an AltGr character starts and immediately cancels a dictation (a brief bar flicker), but the character itself is replayed correctly. Choose another shortcut in Settings if that is distracting.
+- When Win is the shortcut, Ray swallows both of its edges so a bare tap does not open Start. Windows still handles Win+L (lock) itself, so that combination may lock the PC even while Win is the dictation shortcut.
 - Multi-monitor placement is implemented but only verified on a single monitor.

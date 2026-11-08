@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::hotkey::Hotkey;
+
 const FILE_NAME: &str = "ray.json";
 const MAX_HISTORY: usize = 1_000;
 const MAX_DICTIONARY: usize = 200;
@@ -28,6 +30,10 @@ pub struct Settings {
     /// "system", "light", or "dark". Old documents without this field load
     /// with the default because the struct is `#[serde(default)]`.
     pub theme: String,
+    /// The dictation shortcut. Old documents without this field load as
+    /// Right Alt (the historical hard-wired shortcut).
+    #[serde(default)]
+    pub hotkey: Hotkey,
 }
 
 impl Default for Settings {
@@ -38,6 +44,7 @@ impl Default for Settings {
             cleanup_enabled: true,
             keep_raw: true,
             theme: "system".into(),
+            hotkey: Hotkey::default(),
         }
     }
 }
@@ -177,6 +184,7 @@ impl Store {
         });
         data.dictionary.truncate(MAX_DICTIONARY);
         data.settings.theme = normalize_theme(&data.settings.theme);
+        data.settings.hotkey = data.settings.hotkey.normalized();
     }
 
     fn persist(&self, data: &StoreData) -> Result<(), String> {
@@ -232,10 +240,20 @@ impl Store {
             cleanup_enabled: settings.cleanup_enabled,
             keep_raw: settings.keep_raw,
             theme: normalize_theme(&settings.theme),
+            hotkey: settings.hotkey.normalized(),
         };
         self.persist(&candidate)?;
         *data = candidate;
         Ok(data.settings.clone())
+    }
+
+    /// Change only the dictation shortcut, leaving every other setting as it
+    /// is on disk. Used by the Shortcut settings section so a stale copy of
+    /// the rest of Settings can never clobber it.
+    pub fn update_hotkey(&self, hotkey: Hotkey) -> Result<Settings, String> {
+        let mut settings = self.settings();
+        settings.hotkey = hotkey;
+        self.update_settings(settings)
     }
 
     pub fn add_history(&self, entry: HistoryEntry) -> Result<(), String> {
@@ -454,6 +472,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!(saved.theme, "system");
+    }
+
+    #[test]
+    fn old_settings_documents_default_the_hotkey_to_right_alt() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"keep_raw":false,"streaming_enabled":false}"#).unwrap();
+        assert_eq!(settings.hotkey, Hotkey::default());
+    }
+
+    #[test]
+    fn hotkey_updates_survive_a_reload() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::load(&dir);
+        store
+            .update_hotkey(Hotkey::parse("ctrl+shift+space").unwrap())
+            .unwrap();
+
+        let reloaded = Store::load(&dir);
+        assert_eq!(
+            reloaded.settings().hotkey,
+            Hotkey::parse("ctrl+shift+space").unwrap()
+        );
+        // The targeted update must not disturb other settings.
+        assert!(reloaded.settings().keep_raw);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_hand_edited_unknown_hotkey_loads_as_right_alt() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), r#"{"settings":{"hotkey":"banana"}}"#).unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.settings().hotkey, Hotkey::default());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
