@@ -19,9 +19,11 @@
 //!
 //! A bare Win tap would normally open Start; because the hook swallows both
 //! edges of a bare-Win shortcut, Start never sees the tap, so Win is supported
-//! as a modifier-only shortcut. Windows still handles Win+L (lock) itself,
-//! which no low-level hook can reliably suppress; that is documented in the
-//! README.
+//! as a modifier-only shortcut. Combinations Windows handles before any
+//! low-level hook (Win+L to lock, Ctrl+Alt+Del, Win+G for the Game Bar, and
+//! Ctrl+Shift+Esc for Task Manager, which is already blocked because Esc is
+//! reserved) are rejected by `Hotkey::validate` with a capture error instead
+//! of being saved as a shortcut that could never fire.
 //!
 //! While recording, a shortcut press only *defers* the stop until the key is
 //! released without a chord. The receiver handles events one at a time and a
@@ -112,6 +114,8 @@ const VK_DELETE: u32 = 0x2E;
 const VK_0: u32 = 0x30;
 const VK_9: u32 = 0x39;
 const VK_A: u32 = 0x41;
+const VK_G: u32 = 0x47;
+const VK_L: u32 = 0x4C;
 const VK_Z: u32 = 0x5A;
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
@@ -372,6 +376,9 @@ impl Hotkey {
                 if modifiers.is_empty() {
                     return Err("A shortcut needs at least one modifier.".into());
                 }
+                if let Some(message) = reserved_combo_error(modifiers, u32::from(*key)) {
+                    return Err(message.into());
+                }
                 if u32::from(*key) == VK_ESCAPE {
                     return Err("Esc is reserved for cancel.".into());
                 }
@@ -441,9 +448,13 @@ impl Serialize for Hotkey {
 impl<'de> Deserialize<'de> for Hotkey {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Old and hand-edited settings must never make the whole store
-        // unreadable; an unusable value loads as Right Alt.
-        let text = String::deserialize(deserializer)?;
-        Ok(Hotkey::parse(&text).unwrap_or_default())
+        // unreadable; an unusable value (including a non-string from a hand
+        // edit) loads as Right Alt instead of failing the whole document.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value {
+            serde_json::Value::String(text) => Hotkey::parse(&text).unwrap_or_default(),
+            _ => Hotkey::default(),
+        })
     }
 }
 
@@ -725,6 +736,36 @@ fn is_letter_or_digit(vk: u32) -> bool {
         || (VK_NUMPAD0..=VK_NUMPAD9).contains(&vk)
 }
 
+/// Combinations Windows handles itself before a low-level hook ever sees
+/// them, so a shortcut using one would lock the screen, open the Game Bar, or
+/// reach the secure attention sequence instead of dictating. Ctrl+Shift+Esc
+/// (Task Manager) is already rejected because Escape is reserved for
+/// cancelling. A bare Win modifier shortcut is still allowed: the hook
+/// swallows its tap, but Win+L/Ctrl+Alt+Del cannot be suppressed.
+fn reserved_combo_error(modifiers: &[ChordModifier], key: u32) -> Option<&'static str> {
+    let only = |modifier: ChordModifier| modifiers.len() == 1 && modifiers[0] == modifier;
+    let has_both =
+        modifiers.contains(&ChordModifier::Ctrl) && modifiers.contains(&ChordModifier::Alt);
+    if only(ChordModifier::Win) && key == VK_L {
+        Some(
+            "Windows reserves Win + L for locking the screen and does not let Ray \
+             intercept it. Pick another combination.",
+        )
+    } else if only(ChordModifier::Win) && key == VK_G {
+        Some(
+            "Windows reserves Win + G for the Game Bar and does not let Ray intercept \
+             it. Pick another combination.",
+        )
+    } else if has_both && key == VK_DELETE {
+        Some(
+            "Windows reserves Ctrl + Alt + Del and does not let Ray intercept it. Pick \
+             another combination.",
+        )
+    } else {
+        None
+    }
+}
+
 /// A combo trigger can be any physical, non-modifier key except Escape.
 fn is_valid_combo_key(vk: u32) -> bool {
     (0x08..=0xFE).contains(&vk) && vk != VK_ESCAPE && vk != VK_PACKET && !is_modifier_vk(vk)
@@ -742,6 +783,35 @@ fn logical_modifier(vk: u32) -> Option<ChordModifier> {
 
 fn is_modifier_vk(vk: u32) -> bool {
     logical_modifier(vk).is_some()
+}
+
+/// The virtual key a physical key should match against, independent of
+/// NumLock. The numpad digits and decimal key report Insert/End/Down/... when
+/// NumLock is off, while the navigation keys on the same scan codes are
+/// marked extended. Mapping the non-extended numpad scan codes to their
+/// numpad virtual keys makes a captured "Ctrl + Numpad 1" keep working when
+/// NumLock toggles, without confusing it with the arrow/navigation cluster.
+fn effective_vk(vk: u32, scan: u32, extended: bool) -> u32 {
+    if extended {
+        return vk;
+    }
+    match scan {
+        0x47 => VK_NUMPAD0 + 7,
+        0x48 => VK_NUMPAD0 + 8,
+        0x49 => VK_NUMPAD0 + 9,
+        0x4B => VK_NUMPAD0 + 4,
+        0x4C => VK_NUMPAD0 + 5,
+        0x4D => VK_NUMPAD0 + 6,
+        0x4F => VK_NUMPAD0 + 1,
+        0x50 => VK_NUMPAD0 + 2,
+        0x51 => VK_NUMPAD0 + 3,
+        0x52 => VK_NUMPAD0,
+        0x53 => VK_DECIMAL,
+        0x4A => VK_SUBTRACT,
+        0x4E => VK_ADD,
+        0x37 => VK_MULTIPLY,
+        _ => vk,
+    }
 }
 
 fn single_modifier_from_vk(vk: u32) -> Option<SingleModifier> {
@@ -828,10 +898,18 @@ struct DownModifier {
 struct Capture {
     id: u64,
     deadline: Instant,
-    /// Physical modifier keys currently down (capture swallows their edges).
+    /// Physical modifiers already down when capture began. Their presses
+    /// reached the focused app, so their releases pass through, and they
+    /// still count toward the captured combination (Ctrl held + Space).
+    preheld_modifiers: Vec<DownModifier>,
+    /// Physical modifier keys pressed during capture (capture swallows their
+    /// edges).
     modifiers_down: Vec<DownModifier>,
     /// Distinct modifiers pressed during this capture, in press order.
     modifiers_seen: Vec<SingleModifier>,
+    /// Every key whose down this capture swallowed. Only those releases are
+    /// swallowed; a key already down at capture start keeps its release.
+    swallowed_downs: HashSet<u32>,
 }
 
 /// The entire hook decision logic. Pure except for the clock: unit tests feed
@@ -843,6 +921,10 @@ struct HookState {
     prime: Option<KeyRef>,
     // Another key joined the held modifier shortcut; the chord is replayed.
     prime_chord: bool,
+    // The swallowed shortcut modifier has been injected for this chord. An
+    // Escape-cancel starts a chord replay without injecting it yet, so the
+    // first replayed key must emit ChordDown first.
+    prime_chord_started: bool,
     // The shortcut press happened while recording, so the stop waits for the
     // release (a chord key cancels instead).
     pending_stop: bool,
@@ -874,6 +956,7 @@ impl HookState {
             recording: false,
             prime: None,
             prime_chord: false,
+            prime_chord_started: false,
             pending_stop: false,
             single_down: false,
             modifiers_down: Vec::new(),
@@ -886,39 +969,61 @@ impl HookState {
         }
     }
 
-    /// Apply a new shortcut without restarting the hook. A modifier that is
-    /// held right now had its press swallowed; its release is swallowed too so
-    /// the focused app never sees a lone key-up.
-    fn apply_hotkey(&mut self, hotkey: Hotkey) {
-        if let Some(prime) = self.prime.take() {
+    /// Remember keys whose press the hook swallowed (so their release would
+    /// reach the app as a lone key-up) before the held state is reset.
+    fn remember_held_keys(&mut self) {
+        if let Some(prime) = self.prime {
             self.swallow_releases.insert(prime.vk);
         }
+        if self.trigger_down {
+            if let HotkeyMode::Combo(_, trigger) = self.hotkey.mode() {
+                self.swallow_releases.insert(u32::from(trigger));
+            }
+        }
+        if self.single_down {
+            if let HotkeyMode::Key(trigger) = self.hotkey.mode() {
+                self.swallow_releases.insert(u32::from(trigger));
+            }
+        }
+    }
+
+    /// Apply a new shortcut without restarting the hook. A key that is held
+    /// right now had its press swallowed; its release is swallowed too so the
+    /// focused app never sees a lone key-up. A chord that is already being
+    /// replayed has its injected modifier released here rather than at the
+    /// replay worker's 1.5 s timeout.
+    fn apply_hotkey(&mut self, hotkey: Hotkey) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if self.prime_chord {
+            actions.push(Action::Replay(Replay::ChordUp));
+        }
+        self.remember_held_keys();
+        self.prime = None;
         self.prime_chord = false;
+        self.prime_chord_started = false;
         self.pending_stop = false;
         self.single_down = false;
         self.trigger_down = false;
         self.deferred_ups.clear();
         self.finish_capture(&[]);
         self.hotkey = hotkey.normalized();
+        actions
     }
 
     /// Called after the hook is (re)installed: any in-flight chord state is
     /// lost, so drop it rather than let a stale release toggle a recording.
     fn reset_transient(&mut self) {
-        if let Some(prime) = self.prime.take() {
-            self.swallow_releases.insert(prime.vk);
-        }
+        self.remember_held_keys();
+        self.prime = None;
         self.prime_chord = false;
+        self.prime_chord_started = false;
         self.pending_stop = false;
         self.single_down = false;
         self.trigger_down = false;
         self.deferred_ups.clear();
         if let Some(capture) = self.capture.as_mut() {
-            let held: Vec<u32> = capture
-                .modifiers_down
-                .iter()
-                .map(|entry| entry.key.vk)
-                .collect();
+            let held: Vec<u32> = capture.swallowed_downs.drain().collect();
+            capture.preheld_modifiers.clear();
             capture.modifiers_down.clear();
             capture.modifiers_seen.clear();
             for vk in held {
@@ -927,31 +1032,58 @@ impl HookState {
         }
     }
 
-    fn begin_capture(&mut self) -> (u64, Instant) {
-        if let Some(prime) = self.prime.take() {
-            self.swallow_releases.insert(prime.vk);
+    /// Start watching for a shortcut. Returns the timeout identity, its
+    /// deadline, and any replay needed to undo a chord that was in flight.
+    fn begin_capture(&mut self) -> (u64, Instant, Vec<Action>) {
+        let mut actions = Vec::new();
+        if self.prime_chord {
+            // The injected chord modifier is still down from a replayed
+            // chord; release it now instead of leaving it down for the
+            // replay worker's idle timeout.
+            actions.push(Action::Replay(Replay::ChordUp));
         }
+        self.remember_held_keys();
+        let prime_vk = self.prime.take().map(|prime| prime.vk);
         self.prime_chord = false;
+        self.prime_chord_started = false;
         self.pending_stop = false;
         self.single_down = false;
         self.trigger_down = false;
         self.deferred_ups.clear();
         self.capture_counter += 1;
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        let mut swallowed_downs = HashSet::new();
+        if let Some(vk) = prime_vk {
+            // The modifier was held when capture began and its press was
+            // swallowed, so capture must swallow its release too.
+            swallowed_downs.insert(vk);
+        }
         self.capture = Some(Capture {
             id: self.capture_counter,
             deadline,
+            preheld_modifiers: self.modifiers_down.clone(),
             modifiers_down: Vec::new(),
             modifiers_seen: Vec::new(),
+            swallowed_downs,
         });
-        (self.capture_counter, deadline)
+        (self.capture_counter, deadline, actions)
+    }
+
+    /// Undo a capture that could not be armed (its timeout thread failed to
+    /// start), so the hook stops swallowing every key edge.
+    fn abort_capture(&mut self, id: u64) {
+        if matches!(&self.capture, Some(capture) if capture.id == id) {
+            self.finish_capture(&[]);
+        }
     }
 
     /// End capture and swallow the releases of every key capture took over.
+    /// Keys that were already down when capture began keep their release:
+    /// their press reached the app.
     fn finish_capture(&mut self, extra_vks: &[u32]) {
         if let Some(capture) = self.capture.take() {
-            for entry in capture.modifiers_down {
-                self.swallow_releases.insert(entry.key.vk);
+            for vk in capture.swallowed_downs {
+                self.swallow_releases.insert(vk);
             }
         }
         for vk in extra_vks {
@@ -990,6 +1122,22 @@ impl HookState {
     fn track_modifier(&mut self, key: &KeyInput) -> Option<Action> {
         let logical = logical_modifier(key.vk)?;
         if key.down {
+            // AltGr arrives as Right Alt plus a synthetic Left Ctrl. Ignoring
+            // that Ctrl keeps AltGr characters from completing a Ctrl+Alt
+            // shortcut; the key edge still falls through to the app, which is
+            // what makes the character.
+            if key.vk == VK_LCONTROL
+                && self
+                    .modifiers_down
+                    .iter()
+                    .any(|entry| entry.key.vk == VK_RMENU)
+                && !self
+                    .modifiers_down
+                    .iter()
+                    .any(|entry| entry.key.vk == VK_LCONTROL)
+            {
+                return None;
+            }
             if !self
                 .modifiers_down
                 .iter()
@@ -1061,6 +1209,7 @@ impl HookState {
                 // First key of a chord: replay the swallowed modifier and the
                 // key, then cancel. AltGr characters and Alt+Tab keep working.
                 self.prime_chord = true;
+                self.prime_chord_started = true;
                 self.pending_stop = false;
                 return vec![
                     Action::Replay(Replay::ChordDown(prime)),
@@ -1070,12 +1219,22 @@ impl HookState {
                 ];
             }
             if self.prime_chord {
-                let replay = if key.down {
+                let mut actions = Vec::new();
+                if key.down && !self.prime_chord_started {
+                    // Escape started a chord replay without injecting the
+                    // modifier (its own edge was swallowed). Inject it now,
+                    // before the first replayed key, or the app sees a bare
+                    // key instead of AltGr/Alt+key.
+                    actions.push(Action::Replay(Replay::ChordDown(prime)));
+                    self.prime_chord_started = true;
+                }
+                actions.push(Action::Replay(if key.down {
                     Replay::KeyDown(key.key_ref())
                 } else {
                     Replay::KeyUp(key.key_ref())
-                };
-                return vec![Action::Replay(replay), Action::Swallow];
+                }));
+                actions.push(Action::Swallow);
+                return actions;
             }
             return vec![Action::Pass];
         }
@@ -1086,6 +1245,7 @@ impl HookState {
             }
             self.prime = Some(key.key_ref());
             self.prime_chord = false;
+            self.prime_chord_started = false;
             self.swallow_releases.remove(&key.vk);
             if self.recording {
                 // Wait for the release: a chord key that follows cancels the
@@ -1104,7 +1264,8 @@ impl HookState {
         } else {
             let chord = std::mem::take(&mut self.prime_chord);
             let pending = std::mem::take(&mut self.pending_stop);
-            self.prime = None;
+            let pressed = self.prime.take().is_some();
+            self.prime_chord_started = false;
             if chord {
                 vec![Action::Replay(Replay::ChordUp), Action::Swallow]
             } else if pending && self.recording {
@@ -1113,14 +1274,19 @@ impl HookState {
                 // the release falls inside the processing window and the
                 // toggle is dropped as stale.
                 vec![Action::Toggle, Action::Swallow]
-            } else {
+            } else if pressed {
                 vec![Action::Swallow]
+            } else {
+                // The press was not ours (the shortcut changed or the hook
+                // started while the key was held), so the app saw it and
+                // must see the release too.
+                vec![Action::Pass]
             }
         }
     }
 
     fn on_single_key(&mut self, key: KeyInput, trigger: u16) -> Vec<Action> {
-        if key.vk != u32::from(trigger) {
+        if effective_vk(key.vk, key.scan, key.extended) != u32::from(trigger) {
             return vec![Action::Pass];
         }
         if key.down {
@@ -1129,9 +1295,13 @@ impl HookState {
             }
             self.single_down = true;
             vec![Action::Toggle, Action::Swallow]
-        } else {
+        } else if self.single_down {
             self.single_down = false;
             vec![Action::Swallow]
+        } else {
+            // The press was not swallowed (the shortcut changed or the hook
+            // started while the key was held); pass the release through.
+            vec![Action::Pass]
         }
     }
 
@@ -1141,7 +1311,7 @@ impl HookState {
         modifiers: &[ChordModifier],
         trigger: u16,
     ) -> Vec<Action> {
-        if key.vk != u32::from(trigger) {
+        if effective_vk(key.vk, key.scan, key.extended) != u32::from(trigger) {
             return vec![Action::Pass];
         }
         if !key.down {
@@ -1188,90 +1358,162 @@ impl HookState {
     }
 
     fn on_capture_key(&mut self, key: KeyInput) -> Vec<Action> {
-        // A key that was already held when capture began has its release
-        // consumed here; drop the stale "swallow this release later" marker so
-        // the next real press behaves normally.
-        if !key.down {
-            self.swallow_releases.remove(&key.vk);
-            self.forget_key(key.vk);
-        }
         if key.vk == VK_ESCAPE {
             if key.down {
                 self.finish_capture(&[key.vk]);
                 return vec![Action::CaptureError("Esc is reserved for cancel.".into())];
             }
-            return vec![Action::Swallow];
-        }
-
-        if let Some(modifier) = single_modifier_from_vk(key.vk) {
-            let Some(capture) = self.capture.as_mut() else {
-                return vec![Action::Swallow];
-            };
-            if key.down {
-                if !capture
-                    .modifiers_down
-                    .iter()
-                    .any(|entry| entry.key.vk == key.vk)
-                {
-                    capture.modifiers_down.push(DownModifier {
-                        logical: modifier.chord(),
-                        key: key.key_ref(),
-                    });
-                    if !capture.modifiers_seen.contains(&modifier) {
-                        capture.modifiers_seen.push(modifier);
-                    }
-                }
-                return vec![Action::Swallow];
-            }
-            capture
-                .modifiers_down
-                .retain(|entry| entry.key.vk != key.vk);
-            let tap_finished =
-                capture.modifiers_down.is_empty() && !capture.modifiers_seen.is_empty();
-            if !tap_finished {
-                return vec![Action::Swallow];
-            }
-            let seen = capture.modifiers_seen.clone();
-            self.finish_capture(&[]);
-            if seen.len() == 1 {
-                let hotkey = Hotkey::Modifier(seen[0]);
-                let label = hotkey.label();
-                return vec![Action::Captured { hotkey, label }];
-            }
-            return vec![Action::CaptureError(
-                "Add a key to the shortcut, like Ctrl + Shift + Space.".into(),
-            )];
-        }
-
-        if is_modifier_vk(key.vk) {
-            // A generic modifier code (no side); it cannot be captured alone.
+            // Capture consumes the matching release; clear any stale Escape
+            // state so the next Escape press is treated as a fresh edge.
+            self.esc_down = false;
             return vec![Action::Swallow];
         }
 
         if !key.down {
+            return self.on_capture_release(key);
+        }
+
+        // Right Alt is AltGr on many layouts, and Windows fakes a Left Ctrl
+        // press alongside it. Ignore that fake Ctrl so it never joins the
+        // captured modifier set.
+        let (altgr, ctrl_already_down) = match self.capture.as_ref() {
+            Some(capture) => (
+                capture
+                    .preheld_modifiers
+                    .iter()
+                    .chain(capture.modifiers_down.iter())
+                    .any(|entry| entry.key.vk == VK_RMENU),
+                capture
+                    .preheld_modifiers
+                    .iter()
+                    .chain(capture.modifiers_down.iter())
+                    .any(|entry| matches!(entry.key.vk, VK_LCONTROL | VK_CONTROL)),
+            ),
+            None => (false, false),
+        };
+        if altgr && key.vk == VK_LCONTROL && !ctrl_already_down {
+            if let Some(capture) = self.capture.as_mut() {
+                capture.swallowed_downs.insert(key.vk);
+            }
             return vec![Action::Swallow];
         }
 
-        let modifiers: Vec<ChordModifier> = {
-            let capture = self.capture.as_ref().expect("capture checked above");
-            let mut modifiers = Vec::new();
-            for entry in &capture.modifiers_down {
+        let Some(modifier) = single_modifier_from_vk(key.vk) else {
+            if is_modifier_vk(key.vk) {
+                // A generic modifier code (no side); it cannot be captured
+                // alone, but its release is still ours to swallow.
+                if let Some(capture) = self.capture.as_mut() {
+                    capture.swallowed_downs.insert(key.vk);
+                }
+                return vec![Action::Swallow];
+            }
+            return self.on_capture_trigger(key);
+        };
+
+        if let Some(capture) = self.capture.as_mut() {
+            capture.swallowed_downs.insert(key.vk);
+            if !capture
+                .modifiers_down
+                .iter()
+                .any(|entry| entry.key.vk == key.vk)
+            {
+                capture.modifiers_down.push(DownModifier {
+                    logical: modifier.chord(),
+                    key: key.key_ref(),
+                });
+                if !capture.modifiers_seen.contains(&modifier) {
+                    capture.modifiers_seen.push(modifier);
+                }
+            }
+        }
+        vec![Action::Swallow]
+    }
+
+    /// A release while capture is armed. Only keys whose press capture
+    /// swallowed are swallowed again: a key that was already down when
+    /// capture began keeps its release, since the app saw the press.
+    fn on_capture_release(&mut self, key: KeyInput) -> Vec<Action> {
+        let mut captured_down = false;
+        let mut tap_seen: Option<Vec<SingleModifier>> = None;
+        if let Some(capture) = self.capture.as_mut() {
+            captured_down = capture.swallowed_downs.remove(&key.vk);
+            capture
+                .preheld_modifiers
+                .retain(|entry| entry.key.vk != key.vk);
+            if captured_down {
+                capture
+                    .modifiers_down
+                    .retain(|entry| entry.key.vk != key.vk);
+                if single_modifier_from_vk(key.vk).is_some()
+                    && capture.modifiers_down.is_empty()
+                    && !capture.modifiers_seen.is_empty()
+                {
+                    tap_seen = Some(capture.modifiers_seen.clone());
+                }
+            }
+        }
+        let swallowed_marker = self.swallow_releases.remove(&key.vk);
+        self.forget_key(key.vk);
+        if let Some(seen) = tap_seen {
+            self.finish_capture(&[]);
+            return if seen.len() == 1 {
+                let hotkey = Hotkey::Modifier(seen[0]);
+                let label = hotkey.label();
+                vec![Action::Captured { hotkey, label }]
+            } else {
+                vec![Action::CaptureError(
+                    "Add a key to the shortcut, like Ctrl + Shift + Space.".into(),
+                )]
+            };
+        }
+        if captured_down || swallowed_marker {
+            vec![Action::Swallow]
+        } else {
+            vec![Action::Pass]
+        }
+    }
+
+    /// A non-modifier press while capture is armed: it completes the captured
+    /// shortcut with every modifier currently held, including ones that were
+    /// already down before capture began.
+    fn on_capture_trigger(&mut self, key: KeyInput) -> Vec<Action> {
+        let vk = effective_vk(key.vk, key.scan, key.extended);
+        let mut modifiers: Vec<ChordModifier> = Vec::new();
+        let mut right_alt = false;
+        if let Some(capture) = self.capture.as_mut() {
+            capture.swallowed_downs.insert(key.vk);
+            for entry in capture
+                .preheld_modifiers
+                .iter()
+                .chain(capture.modifiers_down.iter())
+            {
+                right_alt |= entry.key.vk == VK_RMENU;
                 if !modifiers.contains(&entry.logical) {
                     modifiers.push(entry.logical);
                 }
             }
-            modifiers
-        };
+        }
+
+        if right_alt && !modifiers.is_empty() {
+            // Right Alt is AltGr: capturing e.g. Right Alt + Q would shadow
+            // typing "@" or "€" on many layouts.
+            self.finish_capture(&[]);
+            return vec![Action::CaptureError(
+                "Right Alt + key is used for typing characters on many keyboards; \
+                 pick another combination"
+                    .into(),
+            )];
+        }
 
         if modifiers.is_empty() {
-            if is_allowed_single_key(key.vk) {
-                let hotkey = Hotkey::Key(key.vk as u16);
-                self.finish_capture(&[key.vk]);
+            if is_allowed_single_key(vk) {
+                let hotkey = Hotkey::Key(vk as u16);
+                self.finish_capture(&[]);
                 let label = hotkey.label();
                 return vec![Action::Captured { hotkey, label }];
             }
-            self.finish_capture(&[key.vk]);
-            let message = if is_letter_or_digit(key.vk) {
+            self.finish_capture(&[]);
+            let message = if is_letter_or_digit(vk) {
                 "Letters and numbers need a modifier. Try Ctrl + D, or a function key like F9."
             } else {
                 "That key can't be used on its own. Try a function key like F9, or add a modifier."
@@ -1281,21 +1523,30 @@ impl HookState {
 
         let hotkey = Hotkey::Combo {
             modifiers,
-            key: key.vk as u16,
+            key: vk as u16,
         };
         if let Err(message) = hotkey.validate() {
-            self.finish_capture(&[key.vk]);
+            self.finish_capture(&[]);
             return vec![Action::CaptureError(message)];
         }
         let hotkey = hotkey.normalized();
-        self.finish_capture(&[key.vk]);
+        self.finish_capture(&[]);
         let label = hotkey.label();
         vec![Action::Captured { hotkey, label }]
     }
 }
 
+/// A capture result forwarded from the hook thread. Webview emission can be
+/// slow enough to make Windows drop a low-level hook, so the hook only sends
+/// one of these to a dedicated thread that does the actual `emit_to`.
+enum CaptureEvent {
+    Captured(HotkeyView),
+    Error(String),
+}
+
 static SENDER: OnceLock<UnboundedSender<HotkeyEvent>> = OnceLock::new();
 static REPLAY: OnceLock<mpsc::Sender<Replay>> = OnceLock::new();
+static CAPTURE_EVENTS: OnceLock<mpsc::Sender<CaptureEvent>> = OnceLock::new();
 static APP: OnceLock<AppHandle> = OnceLock::new();
 static STATE: OnceLock<Mutex<HookState>> = OnceLock::new();
 static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
@@ -1328,7 +1579,10 @@ pub fn install(
 ) -> Result<(), String> {
     SENDER.set(sender).ok();
     let _ = APP.set(app);
-    with_state(|state| state.apply_hotkey(hotkey));
+    let _ = capture_events();
+    // Any in-flight chord belongs to the previous hook instance; start_thread
+    // releases the injected modifier.
+    let _ = with_state(|state| state.apply_hotkey(hotkey));
     start_thread()
 }
 
@@ -1343,7 +1597,8 @@ pub fn reinstall() -> Result<(), String> {
 
 /// Apply a shortcut change without reinstalling or restarting the hook.
 pub fn set_hotkey(hotkey: Hotkey) {
-    with_state(|state| state.apply_hotkey(hotkey));
+    let actions = with_state(|state| state.apply_hotkey(hotkey));
+    dispatch(actions);
 }
 
 /// Start watching for the next shortcut. Every key edge is swallowed until a
@@ -1352,7 +1607,8 @@ pub fn start_capture() -> Result<(), String> {
     if SENDER.get().is_none() || HOOK_THREAD.load(Ordering::SeqCst) == 0 {
         return Err("The keyboard hook is not running.".into());
     }
-    let (id, deadline) = with_state(HookState::begin_capture);
+    let (id, deadline, actions) = with_state(HookState::begin_capture);
+    dispatch(actions);
     thread::Builder::new()
         .name("ray-capture".into())
         .spawn(move || {
@@ -1365,7 +1621,12 @@ pub fn start_capture() -> Result<(), String> {
                 dispatch(actions);
             }
         })
-        .map_err(|error| format!("Could not start the shortcut capture: {error}"))?;
+        .map_err(|error| {
+            // The capture was armed but nothing will ever end it; disarm it
+            // so the hook does not keep swallowing every key edge.
+            with_state(|state| state.abort_capture(id));
+            format!("Could not start the shortcut capture: {error}")
+        })?;
     Ok(())
 }
 
@@ -1461,6 +1722,40 @@ fn emit_event<T: Serialize + Clone>(event: &str, payload: &T) {
     }
 }
 
+fn emit_capture_event(event: CaptureEvent) {
+    match event {
+        CaptureEvent::Captured(view) => emit_event("hotkey-captured", &view),
+        CaptureEvent::Error(message) => emit_event(
+            "hotkey-capture-error",
+            &serde_json::json!({ "message": message }),
+        ),
+    }
+}
+
+/// Move capture results off the hook thread. `sink` is where the worker
+/// delivers them (a webview emit in production, a test channel in tests).
+fn forward_capture_events(
+    sink: impl Fn(CaptureEvent) + Send + 'static,
+) -> mpsc::Sender<CaptureEvent> {
+    let (tx, rx) = mpsc::channel();
+    let _ = thread::Builder::new()
+        .name("ray-capture-events".into())
+        .spawn(move || {
+            for event in rx {
+                sink(event);
+            }
+        });
+    tx
+}
+
+fn capture_events() -> &'static mpsc::Sender<CaptureEvent> {
+    CAPTURE_EVENTS.get_or_init(|| forward_capture_events(emit_capture_event))
+}
+
+fn send_capture_event(event: CaptureEvent) {
+    let _ = capture_events().send(event);
+}
+
 fn dispatch(actions: Vec<Action>) -> bool {
     let mut swallow = false;
     for action in actions {
@@ -1480,14 +1775,11 @@ fn dispatch(actions: Vec<Action>) -> bool {
                 swallow = true;
             }
             Action::Captured { hotkey, label } => {
-                emit_event("hotkey-captured", &HotkeyView { hotkey, label });
+                send_capture_event(CaptureEvent::Captured(HotkeyView { hotkey, label }));
                 swallow = true;
             }
             Action::CaptureError(message) => {
-                emit_event(
-                    "hotkey-capture-error",
-                    &serde_json::json!({ "message": message }),
-                );
+                send_capture_event(CaptureEvent::Error(message));
                 swallow = true;
             }
         }
@@ -2004,11 +2296,13 @@ mod tests {
     }
 
     #[test]
-    fn capture_forgets_a_modifier_that_was_already_held() {
+    fn capture_passes_through_a_modifier_that_was_already_held() {
         let mut state = HookState::new(Hotkey::parse("ctrl+space").unwrap());
         state.on_key(press(VK_LCONTROL));
         state.begin_capture();
-        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Swallow]);
+        // The app saw the Ctrl press before capture began, so it must see the
+        // release too instead of a lone key-up.
+        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Pass]);
         state.finish_capture(&[]);
         state.on_key(press(VK_LCONTROL));
         assert_eq!(state.on_key(press(VK_SPACE)), toggle());
@@ -2106,7 +2400,7 @@ mod tests {
     #[test]
     fn capture_times_out_and_stale_timers_do_nothing() {
         let mut state = HookState::default();
-        let (id, deadline) = state.begin_capture();
+        let (id, deadline, _actions) = state.begin_capture();
         assert!(state.timeout_capture(id + 1, deadline).is_empty());
         let timed_out = state.timeout_capture(id, deadline);
         assert!(matches!(&timed_out[0], Action::CaptureError(_)));
@@ -2124,5 +2418,337 @@ mod tests {
         let captured = state.on_key(release(VK_RMENU));
         assert!(matches!(captured[0], Action::Captured { .. }));
         assert!(!captured.contains(&Action::Toggle));
+    }
+
+    const VK_Q: u32 = 0x51;
+
+    fn key_at(vk: u32, down: bool, scan: u32, extended: bool) -> KeyInput {
+        KeyInput {
+            vk,
+            down,
+            scan,
+            extended,
+            ray_injected: false,
+        }
+    }
+
+    fn capture_error(actions: &[Action]) -> &str {
+        match &actions[0] {
+            Action::CaptureError(message) => message,
+            other => panic!("expected a capture error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_cancel_then_chord_replays_the_modifier_first() {
+        let mut state = HookState {
+            recording: true,
+            ..HookState::default()
+        };
+        let prime = KeyRef {
+            vk: VK_RMENU,
+            scan: 0,
+            extended: false,
+        };
+        assert_eq!(state.on_key(press(VK_RMENU)), vec![Action::Swallow]);
+        assert!(state.on_key(press(VK_ESCAPE)).contains(&Action::Cancel));
+        assert_eq!(state.on_key(release(VK_ESCAPE)), vec![Action::Swallow]);
+
+        // Escape started the chord replay but never injected the modifier.
+        // The first replayed key must bring it down, or the app sees a bare Q.
+        let q = KeyRef {
+            vk: VK_Q,
+            scan: 0,
+            extended: false,
+        };
+        assert_eq!(
+            state.on_key(press(VK_Q)),
+            vec![
+                Action::Replay(Replay::ChordDown(prime)),
+                Action::Replay(Replay::KeyDown(q)),
+                Action::Swallow,
+            ]
+        );
+        // Only the first key injects the modifier.
+        assert_eq!(
+            state.on_key(press(VK_C)),
+            vec![
+                Action::Replay(Replay::KeyDown(KeyRef {
+                    vk: VK_C,
+                    scan: 0,
+                    extended: false,
+                })),
+                Action::Swallow,
+            ]
+        );
+        assert_eq!(
+            state.on_key(release(VK_Q)),
+            vec![Action::Replay(Replay::KeyUp(q)), Action::Swallow,]
+        );
+        assert_eq!(
+            state.on_key(release(VK_RMENU)),
+            vec![Action::Replay(Replay::ChordUp), Action::Swallow]
+        );
+    }
+
+    #[test]
+    fn windows_reserved_combinations_are_rejected() {
+        for (text, needle) in [
+            ("win+l", "Win + L"),
+            ("win+g", "Game Bar"),
+            ("ctrl+alt+del", "Ctrl + Alt + Del"),
+            ("alt+ctrl+delete", "Ctrl + Alt + Del"),
+        ] {
+            let error = Hotkey::parse(text).unwrap_err();
+            assert!(error.contains(needle), "{text}: {error}");
+        }
+        // Task Manager is already blocked because Esc is reserved.
+        assert!(Hotkey::parse("ctrl+shift+esc").is_err());
+        // Nearby combinations Windows does let a hook handle still work.
+        assert!(Hotkey::parse("win+shift+s").is_ok());
+        assert!(Hotkey::parse("ctrl+alt+r").is_ok());
+    }
+
+    #[test]
+    fn capture_rejects_a_windows_reserved_combination() {
+        let mut state = HookState::default();
+        state.begin_capture();
+        assert_eq!(state.on_key(press(VK_LWIN)), vec![Action::Swallow]);
+        let rejected = state.on_key(press(VK_L));
+        assert!(capture_error(&rejected).contains("Win + L"));
+        assert!(state.capture.is_none());
+    }
+
+    #[test]
+    fn changing_the_shortcut_mid_hold_swallows_only_swallowed_presses() {
+        // A combo trigger's press was swallowed; its release must stay
+        // swallowed even though the shortcut changed under it.
+        let mut state = HookState::new(Hotkey::parse("ctrl+space").unwrap());
+        assert_eq!(state.on_key(press(VK_LCONTROL)), vec![Action::Pass]);
+        assert!(state.on_key(press(VK_SPACE)).contains(&Action::Toggle));
+        state.apply_hotkey(Hotkey::parse("f9").unwrap());
+        assert_eq!(state.on_key(release(VK_SPACE)), vec![Action::Swallow]);
+        // Ctrl's press reached the app, so its release must too.
+        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Pass]);
+
+        // The same holds for a held single-key shortcut.
+        let mut state = HookState::new(Hotkey::parse("f9").unwrap());
+        let f9 = VK_F1 + 8;
+        assert!(state.on_key(press(f9)).contains(&Action::Toggle));
+        state.apply_hotkey(Hotkey::parse("ctrl+space").unwrap());
+        assert_eq!(state.on_key(release(f9)), vec![Action::Swallow]);
+    }
+
+    #[test]
+    fn a_modifier_release_is_passed_when_its_press_reached_the_app() {
+        // Changing to Left Ctrl while Ctrl is already held: the app saw the
+        // press, so it must see the release instead of a lone key-up.
+        let mut state = HookState::new(Hotkey::parse("ctrl+space").unwrap());
+        assert_eq!(state.on_key(press(VK_LCONTROL)), vec![Action::Pass]);
+        state.apply_hotkey(Hotkey::parse("left_ctrl").unwrap());
+        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Pass]);
+    }
+
+    #[test]
+    fn a_single_key_release_is_passed_when_its_press_reached_the_app() {
+        let f9 = VK_F1 + 8;
+        let mut state = HookState::new(Hotkey::parse("ctrl+space").unwrap());
+        assert_eq!(state.on_key(press(f9)), vec![Action::Pass]);
+        state.apply_hotkey(Hotkey::parse("f9").unwrap());
+        assert_eq!(state.on_key(release(f9)), vec![Action::Pass]);
+    }
+
+    #[test]
+    fn changing_the_shortcut_mid_chord_releases_the_injected_modifier() {
+        let mut state = HookState {
+            recording: true,
+            ..HookState::default()
+        };
+        state.on_key(press(VK_RMENU));
+        state.on_key(press(VK_C));
+        let actions = state.apply_hotkey(Hotkey::parse("f9").unwrap());
+        assert_eq!(actions, vec![Action::Replay(Replay::ChordUp)]);
+        // C's down was replayed to the app, so its physical release passes
+        // through and matches it; the swallowed modifier release stays ours.
+        assert_eq!(state.on_key(release(VK_C)), vec![Action::Pass]);
+        assert_eq!(state.on_key(release(VK_RMENU)), vec![Action::Swallow]);
+    }
+
+    #[test]
+    fn starting_capture_mid_chord_releases_the_injected_modifier() {
+        let mut state = HookState {
+            recording: true,
+            ..HookState::default()
+        };
+        state.on_key(press(VK_RMENU));
+        state.on_key(press(VK_C));
+        let (_id, _deadline, actions) = state.begin_capture();
+        assert_eq!(actions, vec![Action::Replay(Replay::ChordUp)]);
+    }
+
+    #[test]
+    fn capture_counts_modifiers_held_before_it_started() {
+        let mut state = HookState::default();
+        assert_eq!(state.on_key(press(VK_LCONTROL)), vec![Action::Pass]);
+        state.begin_capture();
+        assert_eq!(
+            state.on_key(press(VK_SPACE)),
+            vec![Action::Captured {
+                hotkey: Hotkey::parse("ctrl+space").unwrap(),
+                label: "Ctrl + Space".into(),
+            }]
+        );
+        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Pass]);
+    }
+
+    #[test]
+    fn capture_passes_the_release_of_a_key_already_down_at_start() {
+        let mut state = HookState::default();
+        assert_eq!(state.on_key(press(VK_A)), vec![Action::Pass]);
+        state.begin_capture();
+        // The app saw the press, so it must see the release.
+        assert_eq!(state.on_key(release(VK_A)), vec![Action::Pass]);
+
+        let f9 = VK_F1 + 8;
+        assert!(matches!(
+            state.on_key(press(f9))[0],
+            Action::Captured { .. }
+        ));
+        assert_eq!(state.on_key(release(f9)), vec![Action::Swallow]);
+    }
+
+    #[test]
+    fn capture_consuming_escape_clears_esc_state() {
+        let mut state = HookState {
+            esc_down: true,
+            ..HookState::default()
+        };
+        state.begin_capture();
+        assert_eq!(state.on_key(release(VK_ESCAPE)), vec![Action::Swallow]);
+        assert!(!state.esc_down);
+    }
+
+    #[test]
+    fn capture_rejects_right_alt_combinations_without_the_fake_ctrl() {
+        let mut state = HookState::default();
+        state.begin_capture();
+        assert_eq!(state.on_key(press(VK_RMENU)), vec![Action::Swallow]);
+        // Windows sends a fake Left Ctrl with AltGr; it must not join combos.
+        assert_eq!(state.on_key(press(VK_LCONTROL)), vec![Action::Swallow]);
+        let capture = state.capture.as_ref().unwrap();
+        assert!(capture
+            .modifiers_down
+            .iter()
+            .all(|entry| entry.key.vk != VK_LCONTROL));
+        let rejected = state.on_key(press(VK_Q));
+        assert!(
+            capture_error(&rejected).contains("Right Alt + key"),
+            "{rejected:?}"
+        );
+        assert!(state.capture.is_none());
+        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Swallow]);
+    }
+
+    #[test]
+    fn a_capture_that_could_not_arm_is_undone() {
+        let mut state = HookState::default();
+        let (id, _deadline, _actions) = state.begin_capture();
+        state.on_key(press(VK_LCONTROL));
+        // A stale timer identity must not end a newer capture.
+        state.abort_capture(id + 1);
+        assert!(state.capture.is_some());
+        state.abort_capture(id);
+        assert!(state.capture.is_none());
+        // The held modifier's press was swallowed, so its release is too.
+        assert_eq!(state.on_key(release(VK_LCONTROL)), vec![Action::Swallow]);
+        assert_eq!(state.on_key(press(VK_A)), vec![Action::Pass]);
+    }
+
+    #[test]
+    fn numpad_combos_match_by_scan_code_when_numlock_toggles() {
+        let mut state = HookState::new(Hotkey::parse("ctrl+numpad1").unwrap());
+        assert_eq!(state.on_key(press(VK_LCONTROL)), vec![Action::Pass]);
+        // NumLock off: the same physical key reports End, non-extended.
+        assert_eq!(state.on_key(key_at(VK_END, true, 0x4F, false)), toggle());
+        assert_eq!(
+            state.on_key(key_at(VK_END, false, 0x4F, false)),
+            vec![Action::Swallow]
+        );
+    }
+
+    #[test]
+    fn numpad_matching_does_not_confuse_the_navigation_cluster() {
+        // Ctrl + Numpad 1 must not fire for the real End key (extended).
+        let mut state = HookState::new(Hotkey::parse("ctrl+numpad1").unwrap());
+        state.on_key(press(VK_LCONTROL));
+        assert_eq!(
+            state.on_key(key_at(VK_END, true, 0x4F, true)),
+            vec![Action::Pass]
+        );
+
+        // An End shortcut must not fire for the numpad key with NumLock off.
+        let mut state = HookState::new(Hotkey::parse("end").unwrap());
+        assert_eq!(
+            state.on_key(key_at(VK_END, true, 0x4F, false)),
+            vec![Action::Pass]
+        );
+        assert_eq!(state.on_key(key_at(VK_END, true, 0x4F, true)), toggle());
+    }
+
+    #[test]
+    fn altgr_fake_ctrl_does_not_complete_a_combo() {
+        // Typing an AltGr character (Right Alt + fake Left Ctrl + key) must
+        // not fire a Ctrl + Alt + Space shortcut.
+        let mut state = HookState::new(Hotkey::parse("ctrl+alt+space").unwrap());
+        assert_eq!(state.on_key(press(VK_RMENU)), vec![Action::Pass]);
+        assert_eq!(state.on_key(press(VK_LCONTROL)), vec![Action::Pass]);
+        assert_eq!(state.on_key(press(VK_SPACE)), vec![Action::Pass]);
+
+        // A genuine Ctrl + Alt + Space still fires.
+        let mut state = HookState::new(Hotkey::parse("ctrl+alt+space").unwrap());
+        state.on_key(press(VK_LCONTROL));
+        state.on_key(press(VK_LMENU));
+        assert!(state.on_key(press(VK_SPACE)).contains(&Action::Toggle));
+    }
+
+    #[test]
+    fn capture_stores_numpad_keys_independently_of_numlock() {
+        let mut state = HookState::default();
+        state.begin_capture();
+        state.on_key(press(VK_LCONTROL));
+        let captured = state.on_key(key_at(VK_END, true, 0x4F, false));
+        assert_eq!(
+            captured,
+            vec![Action::Captured {
+                hotkey: Hotkey::parse("ctrl+numpad1").unwrap(),
+                label: "Ctrl + Numpad 1".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_events_are_forwarded_through_a_channel() {
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let sender = forward_capture_events(move |event| {
+            let message = match event {
+                CaptureEvent::Captured(view) => view.label,
+                CaptureEvent::Error(message) => message,
+            };
+            seen_tx.send(message).unwrap();
+        });
+        sender
+            .send(CaptureEvent::Captured(HotkeyView::new(Hotkey::default())))
+            .unwrap();
+        sender
+            .send(CaptureEvent::Error("no shortcut".into()))
+            .unwrap();
+        assert_eq!(
+            seen_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "Right Alt"
+        );
+        assert_eq!(
+            seen_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "no shortcut"
+        );
     }
 }

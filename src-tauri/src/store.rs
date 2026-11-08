@@ -251,9 +251,18 @@ impl Store {
     /// is on disk. Used by the Shortcut settings section so a stale copy of
     /// the rest of Settings can never clobber it.
     pub fn update_hotkey(&self, hotkey: Hotkey) -> Result<Settings, String> {
-        let mut settings = self.settings();
-        settings.hotkey = hotkey;
-        self.update_settings(settings)
+        // Read, mutate, and write under one lock so a concurrent settings
+        // change can never be clobbered by a stale copy of the rest of
+        // Settings. Only `hotkey` is touched.
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        candidate.settings.hotkey = hotkey.normalized();
+        self.persist(&candidate)?;
+        *data = candidate;
+        Ok(data.settings.clone())
     }
 
     pub fn add_history(&self, entry: HistoryEntry) -> Result<(), String> {
@@ -508,6 +517,58 @@ mod tests {
         let store = Store::load(&dir);
         assert_eq!(store.settings().hotkey, Hotkey::default());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_string_hotkey_values_load_as_right_alt_without_losing_state() {
+        for value in ["null", "5"] {
+            let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(FILE_NAME),
+                format!(
+                    r#"{{"history":[{{"id":"a","created_at":1,"text":"hi","raw":null,
+                        "app":null,"duration_ms":10}}],
+                        "dictionary":["Helion"],
+                        "settings":{{"hotkey":{value}}}}}"#
+                ),
+            )
+            .unwrap();
+            let store = Store::load(&dir);
+            assert!(
+                store.load_error().is_none(),
+                "{value}: {:?}",
+                store.load_error()
+            );
+            assert!(
+                store.load_warning().is_none(),
+                "{value}: {:?}",
+                store.load_warning()
+            );
+            assert_eq!(store.settings().hotkey, Hotkey::default());
+            // A single bad field must not cost the user their state.
+            assert_eq!(store.snapshot().history.len(), 1);
+            assert_eq!(store.dictionary(), vec!["Helion".to_string()]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn update_hotkey_only_touches_the_hotkey() {
+        let store = temp_store();
+        // Stand in for another writer that changed settings in memory. The
+        // old split read-modify-write funnelled this through update_settings,
+        // which rewrote (and normalized) every field from a stale snapshot.
+        store.data.lock().unwrap().settings.input_device = Some("  mic  ".into());
+        store.update_hotkey(Hotkey::parse("f9").unwrap()).unwrap();
+
+        assert_eq!(store.settings().hotkey, Hotkey::parse("f9").unwrap());
+        assert_eq!(store.settings().input_device.as_deref(), Some("  mic  "));
+
+        let saved: StoreData =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved.settings.input_device.as_deref(), Some("  mic  "));
+        std::fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 
     #[test]
