@@ -18,18 +18,21 @@ function SignUpInner() {
     "redirect_url",
   );
 
+  // The desktop hand-off puts state/challenge directly on this URL as well,
+  // so an email-verification link opened in a new tab keeps them.
+  const desktopRedirect = desktopRedirectFromSearch(location.search);
+
   useEffect(() => {
-    rememberRedirect(queryRedirect);
-  }, [queryRedirect]);
+    // Remember the direct desktop params too, in case Clerk's flow drops the
+    // query while it moves the hash around.
+    rememberRedirect(queryRedirect ?? desktopRedirect);
+  }, [queryRedirect, desktopRedirect]);
 
   const exactPath =
     location.pathname !== "/" && location.pathname.endsWith("/")
       ? location.pathname.slice(0, -1)
       : location.pathname;
   const inFlow = Boolean(location.hash) || exactPath !== "/sign-up";
-  // The desktop hand-off puts state/challenge directly on this URL as well,
-  // so an email-verification link opened in a new tab keeps them.
-  const desktopRedirect = desktopRedirectFromSearch(location.search);
   const redirectUrl =
     safeRedirect(queryRedirect) ??
     desktopRedirect ??

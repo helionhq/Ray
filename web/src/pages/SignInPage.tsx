@@ -18,9 +18,15 @@ function SignInInner() {
     "redirect_url",
   );
 
+  // state/challenge may be on this URL when a Clerk email link opened in a
+  // new tab, where sessionStorage from the original tab isn't available.
+  const desktopRedirect = desktopRedirectFromSearch(location.search);
+
   useEffect(() => {
-    rememberRedirect(queryRedirect);
-  }, [queryRedirect]);
+    // Remember the direct desktop params too, in case Clerk's flow drops the
+    // query while it moves the hash around.
+    rememberRedirect(queryRedirect ?? desktopRedirect);
+  }, [queryRedirect, desktopRedirect]);
 
   // Only fall back to the remembered destination once Clerk has started its
   // own flow; a fresh visit shouldn't inherit an old tab's redirect.
@@ -29,9 +35,6 @@ function SignInInner() {
       ? location.pathname.slice(0, -1)
       : location.pathname;
   const inFlow = Boolean(location.hash) || exactPath !== "/sign-in";
-  // state/challenge may be on this URL when a Clerk email link opened in a
-  // new tab, where sessionStorage from the original tab isn't available.
-  const desktopRedirect = desktopRedirectFromSearch(location.search);
   const redirectUrl =
     safeRedirect(queryRedirect) ??
     desktopRedirect ??
