@@ -25,5 +25,10 @@ export default defineConfig({
   build: {
     target: "es2022",
     outDir: "dist",
+    // Keep `/*! @license */` blocks (the Hex MIT notice in
+    // src/components/dotScope.ts) in the shipped bundle, as MIT requires.
+    rollupOptions: {
+      output: { comments: { legal: true, annotation: false, jsdoc: false } },
+    },
   },
 });
