@@ -81,6 +81,11 @@ const faqs: { question: string; answer: ReactNode }[] = [
     answer: `${TRIAL_LINE} Pro starts on your first desktop sign-in and runs for 14 days; when it ends you can keep dictating on the free Starter plan.`,
   },
   {
+    question: "Can I use Ray on a shared PC?",
+    answer:
+      "Free plans are limited to three accounts per PC. Additional accounts can sign in but need Pro to dictate.",
+  },
+  {
     question: "Can I cancel Pro anytime?",
     answer:
       "Yes. Pro is billed through Creem, our merchant of record. Cancel from Account → Manage billing and you keep Pro until the end of the period you paid for.",

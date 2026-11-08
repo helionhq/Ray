@@ -1,11 +1,12 @@
 import type { Hono } from "hono";
 import type { AppContext } from "../env";
-import { getUsageWords, listSubscriptions } from "../db";
+import { getUsage, listSubscriptions, usageForPlan } from "../db";
 import { requireEither } from "../auth";
 import {
   entitledProductIds,
   resolveBillingIssue,
   resolvePlan,
+  trialEndedThisWeek,
 } from "../lib/plan";
 import { quotaLimits } from "../lib/quota";
 import { isoFromUnixSeconds, nowSeconds, weekBounds } from "../lib/weeks";
@@ -15,18 +16,26 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
     const user = c.get("user");
     const now = nowSeconds();
     const week = weekBounds(now);
-    const [subscriptions, wordsUsed] = await Promise.all([
+    const trial = {
+      startedAt: user.trial_started_at,
+      freeBlocked: user.free_blocked_at !== null,
+    };
+    const [subscriptions, rawUsage] = await Promise.all([
       listSubscriptions(c.env.DB, user.id),
-      getUsageWords(c.env.DB, user.id, week.weekStart),
+      getUsage(c.env.DB, user.id, week.weekStart),
     ]);
     const plan = resolvePlan(
       subscriptions,
       now,
       entitledProductIds(c.env),
-      {
-        startedAt: user.trial_started_at,
-        freeBlocked: user.free_blocked_at !== null,
-      },
+      trial,
+    );
+    const usage = await usageForPlan(
+      c.env.DB,
+      user,
+      week.weekStart,
+      rawUsage,
+      trialEndedThisWeek(plan, subscriptions, trial, now, week.weekStart),
     );
     const limits = quotaLimits(c.env);
 
@@ -55,7 +64,7 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
       // Set when this account is over the per-PC free-account limit.
       free_blocked: user.free_blocked_at !== null,
       usage: {
-        words_used: wordsUsed,
+        words_used: usage.words,
         // The Pro fair-use and trial audio caps are deliberately hidden from
         // clients; only Starter has a visible word limit.
         words_limit:

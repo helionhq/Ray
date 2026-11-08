@@ -45,6 +45,7 @@ export interface Env {
   RATE_LIMIT_BILLING?: RateLimitBinding;
   RATE_LIMIT_REVOKE_ALL?: RateLimitBinding;
   RATE_LIMIT_DESKTOP_TOKEN?: RateLimitBinding;
+  RATE_LIMIT_TRIAL?: RateLimitBinding;
   RATE_LIMIT_WEBHOOKS?: RateLimitBinding;
   RATE_LIMIT_STT?: RateLimitBinding;
 }
@@ -59,6 +60,14 @@ export interface UserRow {
   trial_started_at: number | null;
   /** Unix seconds; set when this account is over the per-PC free limit. */
   free_blocked_at: number | null;
+  /**
+   * The week (`week_start`) whose pre-Starter totals are snapshotted. Set when
+   * a no-card trial ends mid-week; later weeks keep the old value and need no
+   * adjustment.
+   */
+  starter_baseline_week: number | null;
+  starter_baseline_words: number;
+  starter_baseline_audio_seconds: number;
 }
 
 export interface SubscriptionRow {

@@ -34,6 +34,11 @@
       "simple": { "limit": 30, "period": 60 }
     },
     {
+      "name": "RATE_LIMIT_TRIAL",
+      "namespace_id": "4207",
+      "simple": { "limit": 3, "period": 60 }
+    },
+    {
       "name": "RATE_LIMIT_WEBHOOKS",
       "namespace_id": "4205",
       "simple": { "limit": 120, "period": 60 }

@@ -184,6 +184,26 @@ export function trialEndsAt(trial: TrialState): number | null {
   return trial.startedAt + TRIAL_SECONDS;
 }
 
+/**
+ * True when a no-card trial ended during the current week and the account is
+ * now on Starter. Trial usage still sits in this week's `usage_weeks` row, so
+ * it must not count against the Starter allowance: only usage recorded after
+ * the trial ended does.
+ */
+export function trialEndedThisWeek(
+  plan: PlanView,
+  subscriptions: readonly SubscriptionRow[],
+  trial: TrialState,
+  nowSeconds: number,
+  weekStart: number,
+): boolean {
+  if (plan.plan !== "starter" || subscriptions.length > 0) return false;
+  const endsAt = trialEndsAt(trial);
+  return (
+    endsAt !== null && endsAt <= nowSeconds && endsAt >= weekStart
+  );
+}
+
 function trialView(trial: TrialState, nowSeconds: number): PlanView | null {
   const endsAt = trialEndsAt(trial);
   if (endsAt === null || nowSeconds >= endsAt) return null;

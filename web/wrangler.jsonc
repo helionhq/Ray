@@ -42,6 +42,15 @@
       "simple": { "limit": 30, "period": 60 }
     },
     {
+      // Trial-farming brake keyed by IP, applied only when a trial would
+      // start. The binding's window is 10 or 60 seconds, so this caps fresh
+      // trial grants at three per minute per Cloudflare location. Over the
+      // limit, sign-in still succeeds but no trial is granted.
+      "name": "RATE_LIMIT_TRIAL",
+      "namespace_id": "4107",
+      "simple": { "limit": 3, "period": 60 }
+    },
+    {
       "name": "RATE_LIMIT_WEBHOOKS",
       "namespace_id": "4105",
       "simple": { "limit": 120, "period": 60 }

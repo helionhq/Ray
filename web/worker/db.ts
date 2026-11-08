@@ -19,7 +19,9 @@ export async function getUser(
   return db
     .prepare(
       `SELECT id, email, name, creem_customer_id, created_at,
-              trial_started_at, free_blocked_at
+              trial_started_at, free_blocked_at,
+              starter_baseline_week, starter_baseline_words,
+              starter_baseline_audio_seconds
        FROM users WHERE id = ? AND deleted_at IS NULL`,
     )
     .bind(id)
@@ -177,6 +179,65 @@ export async function getUsageWords(
   weekStart: number,
 ): Promise<number> {
   return (await getUsage(db, userId, weekStart)).words;
+}
+
+/**
+ * Usage that counts against the current plan.
+ *
+ * A trial that ends mid-week leaves its words and audio in the same
+ * `usage_weeks` row as the post-trial Starter usage. When the trial ended in
+ * the current week, the first post-trial call snapshots that week's totals and
+ * later calls subtract them, so only usage recorded after `trial_ends_at`
+ * counts against Starter. The snapshot is idempotent (`starter_baseline_week`
+ * names the week it belongs to), and later weeks need no adjustment.
+ */
+export async function usageForPlan(
+  db: D1Database,
+  user: UserRow,
+  weekStart: number,
+  usage: WeeklyUsage,
+  trialEndedThisWeek: boolean,
+): Promise<WeeklyUsage> {
+  if (!trialEndedThisWeek) return usage;
+
+  let baselineWeek = user.starter_baseline_week;
+  let baselineWords = user.starter_baseline_words;
+  let baselineAudio = user.starter_baseline_audio_seconds;
+  if (baselineWeek !== weekStart) {
+    await db
+      .prepare(
+        `UPDATE users
+         SET starter_baseline_week = ?,
+             starter_baseline_words = ?,
+             starter_baseline_audio_seconds = ?
+         WHERE id = ? AND deleted_at IS NULL
+           AND (starter_baseline_week IS NULL OR starter_baseline_week != ?)`,
+      )
+      .bind(weekStart, usage.words, usage.audioSeconds, user.id, weekStart)
+      .run();
+    const row = await db
+      .prepare(
+        `SELECT starter_baseline_week, starter_baseline_words,
+                starter_baseline_audio_seconds
+         FROM users WHERE id = ? AND deleted_at IS NULL`,
+      )
+      .bind(user.id)
+      .first<{
+        starter_baseline_week: number | null;
+        starter_baseline_words: number;
+        starter_baseline_audio_seconds: number;
+      }>();
+    if (row) {
+      baselineWeek = row.starter_baseline_week;
+      baselineWords = row.starter_baseline_words;
+      baselineAudio = row.starter_baseline_audio_seconds;
+    }
+  }
+  if (baselineWeek !== weekStart) return usage;
+  return {
+    words: Math.max(0, usage.words - baselineWords),
+    audioSeconds: Math.max(0, usage.audioSeconds - baselineAudio),
+  };
 }
 
 /**
@@ -420,36 +481,69 @@ export async function createDevice(
 }
 
 /**
- * Distinct other accounts that have ever used this device signal. Revoked
- * rows still count: signing out must not reset the per-PC free limit.
+ * At most this many distinct Ray accounts may ever use one PC. The fourth and
+ * later accounts are free-blocked (they can sign in but cannot dictate
+ * without a paid subscription).
  */
-export async function countOtherUsersOnDevice(
-  db: D1Database,
-  deviceHash: string,
-  userId: string,
-): Promise<number> {
-  const row = await db
-    .prepare(
-      `SELECT COUNT(DISTINCT user_id) AS users FROM devices
-       WHERE device_hash = ? AND user_id != ?`,
-    )
-    .bind(deviceHash, userId)
-    .first<{ users: number }>();
-  return row?.users ?? 0;
-}
+export const DEVICE_ACCOUNT_LIMIT = 3;
 
-/** Marks an account as over the per-PC free limit (first time wins). */
-export function markFreeBlockedStatement(
+/**
+ * Marks the account as over the per-PC free limit. Call after inserting the
+ * new device row, and only that row's id is passed: the condition compares
+ * rows by `created_at` then `rowid`, so concurrent sign-ins serialize to
+ * exactly three free accounts, and a re-sign-in by an account that already
+ * has an earlier row for this device is never blocked. Revoked rows still
+ * count: signing out must not reset the limit.
+ */
+export function markFreeBlockedIfOverDeviceLimitStatement(
   db: D1Database,
-  userId: string,
-  now: number,
+  input: {
+    userId: string;
+    deviceRowId: string;
+    now: number;
+  },
 ): D1PreparedStatement {
   return db
     .prepare(
-      `UPDATE users SET free_blocked_at = COALESCE(free_blocked_at, ?)
-       WHERE id = ? AND deleted_at IS NULL`,
+      `UPDATE users SET free_blocked_at = ?
+       WHERE id = ? AND deleted_at IS NULL AND free_blocked_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1
+           FROM devices AS d_self
+           JOIN devices AS d_earlier
+             ON d_earlier.device_hash = d_self.device_hash
+            AND d_earlier.user_id = d_self.user_id
+            AND (
+              d_earlier.created_at < d_self.created_at
+              OR (
+                d_earlier.created_at = d_self.created_at
+                AND d_earlier.rowid < d_self.rowid
+              )
+            )
+           WHERE d_self.id = ?
+         )
+         AND (
+           SELECT COUNT(DISTINCT d_earlier.user_id)
+           FROM devices AS d_self
+           JOIN devices AS d_earlier
+             ON d_earlier.device_hash = d_self.device_hash
+            AND (
+              d_earlier.created_at < d_self.created_at
+              OR (
+                d_earlier.created_at = d_self.created_at
+                AND d_earlier.rowid < d_self.rowid
+              )
+            )
+           WHERE d_self.id = ?
+         ) >= ?`,
     )
-    .bind(now, userId);
+    .bind(
+      input.now,
+      input.userId,
+      input.deviceRowId,
+      input.deviceRowId,
+      DEVICE_ACCOUNT_LIMIT,
+    );
 }
 
 /**

@@ -16,11 +16,18 @@ deviate, keep the deviation minimal and record it in your final report.
   - Trial: **14 days of Pro, no card**. It starts at the user's **first successful
     desktop sign-in** (`POST /api/desktop/token`), only if the account has never
     had a subscription row, `trial_started_at` is null, the account is not
-    free-blocked, and a valid `device_id` was supplied. It never starts on
-    site-only sign-up. During the trial the account resolves as **Pro (trial)**
-    with the hidden trial audio budget `TRIAL_WEEKLY_AUDIO_SECONDS` (default
-    **10,800** = 3 h/week). Afterwards it is Starter. A paid subscription takes
-    precedence over the trial at all times.
+    free-blocked, and the request includes a valid `device_id` (required). It
+    never starts on site-only sign-up. During the trial the account resolves as
+    **Pro (trial)** with the hidden trial audio budget
+    `TRIAL_WEEKLY_AUDIO_SECONDS` (default **10,800** = 3 h/week). Afterwards it
+    is Starter, and the Starter allowance starts at `trial_ends_at`: usage from
+    earlier in that week does not count. A paid subscription takes precedence
+    over the trial at all times.
+  - Trial-farming brake: trial grants are additionally rate limited per IP
+    (Workers Rate Limiting, 3 starts/minute per Cloudflare location by default).
+    Over the limit, sign-in still succeeds but no trial is granted. This is an
+    abuse brake, not an enforcement boundary; device ids are client-supplied.
+
   - Audio abuse budget: AssemblyAI bills audio time, not words, so the Worker also
     meters the bytes streamed to it. Hidden weekly caps: Starter **60 minutes**
     (`STARTER_WEEKLY_AUDIO_SECONDS`), trial **3 hours**, Pro **7 hours**. 1,000
@@ -31,7 +38,9 @@ deviate, keep the deviation minimal and record it in your final report.
     first **three distinct accounts** ever seen on a PC are unaffected; the
     **fourth and later** are marked `free_blocked_at`. A free-blocked account can
     sign in but gets no trial and, without a paid subscription, every STT request
-    answers `402 device_limit`. A paid Pro subscription works normally.
+    answers `402 device_limit`. Re-signing in as an account that already used the
+    PC is never treated as a new account. A paid Pro subscription works normally.
+    This limit is disclosed in the landing FAQ and the Terms.
   - Pro price: **$9/month billed monthly**, or **$7/month billed annually
     ($84/year)**, badge **"Save 22%"**.
 - Auth: **Clerk**, with **email** (code or password, whichever Clerk defaults to) and **Google**.
@@ -119,7 +128,7 @@ Google blocks OAuth inside embedded webviews, so sign-in happens in the system b
    button that re-opens the same `redirect` (browsers sometimes block the first attempt).
 4. The app receives the deep link (scheme `ray`, via `tauri-plugin-deep-link`; the
    single-instance plugin forwards argv on Windows), checks `state`, then calls
-   `POST /api/desktop/token` with `{ code, verifier, device_id? }`. The Worker checks
+   `POST /api/desktop/token` with `{ code, verifier, device_id }`. The Worker checks
    `base64url(sha256(verifier)) == challenge`, consumes the code, and returns
    `{ token, user: { id, email, name } }`. `token` is an opaque device token
    (`ray_` + 32 random bytes base64url), stored **hashed (SHA-256)** in D1 `devices`, with no
@@ -133,17 +142,30 @@ Google blocks OAuth inside embedded webviews, so sign-in happens in the system b
 The desktop reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` with
 `KEY_READ | KEY_WOW64_64KEY` and sends
 `device_id = base64url(SHA-256("ray-device-v1:" + guid))` in the token JSON body. The
-raw GUID is never sent or logged. If it cannot be read, `device_id` is omitted: sign-in
-still works but the server grants no trial.
+raw GUID is never sent or logged. `device_id` is **required**: token exchange rejects a
+missing or malformed value with `400 invalid_request`.
 
 The Worker validates `device_id` as a 43-character base64url value and stores
-`SHA-256(device_id)` in `devices.device_hash` (indexed). On token exchange it counts the
-**distinct `user_id`s that have ever had a row with that `device_hash`** (revoked rows
-included, the signing-in user excluded). When that count is already 3, the user is
-marked `free_blocked_at`; the first three accounts are never affected, and re-signing in
-as an existing account is not a new account. A free-blocked account still signs in, so it
+`SHA-256(device_id)` in `devices.device_hash` (indexed). On token exchange it inserts the
+new device row first, then runs one conditional `UPDATE users SET free_blocked_at = …`
+that applies only when:
+
+- the account has **no earlier row** for that `device_hash` (so a re-sign-in is never
+  blocked), and
+- at least three **distinct other accounts** have an earlier row for the same hash,
+  ordered by `created_at` then `rowid` (revoked rows included).
+
+The earlier-row ordering makes the decision atomic: concurrent sign-ins serialize to
+exactly three free accounts, and a re-sign-in by one of the first three is always
+allowed, even after a fourth account exists. A free-blocked account still signs in, so it
 can reach the upgrade buttons, but free STT answers `402 device_limit` and no trial
 starts. Only a paid Pro subscription restores dictation.
+
+`device_id` is client-supplied, and a modified client can send a fresh random value per
+account. The per-PC rule is a deterrent, not an attestation boundary. The additional
+per-IP trial-grant limiter (`RATE_LIMIT_TRIAL`, 3 grants/minute per Cloudflare location,
+eventually consistent) throttles a scripted loop of fresh accounts; it does not stop an
+attacker who spreads requests across IPs. See `web/README.md` for the residual risk.
 
 ## HTTP API
 
@@ -448,12 +470,21 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
     audio time (`FAIR_USE_WEEKLY_AUDIO_SECONDS` = 25,200 = 7 h). The no-card trial uses
     `TRIAL_WEEKLY_AUDIO_SECONDS` = 10,800 (3 h). Errors keep the existing
     `quota_exceeded` / `fair_use` shapes. Audio numbers are never exposed in `/api/me`.
+    When the trial ends during the current week, `users.starter_baseline_week` /
+    `starter_baseline_words` / `starter_baseline_audio_seconds` snapshot that week's
+    totals at the first post-trial request; Starter counts only usage above the
+    baseline, so trial usage does not consume the new Starter allowance.
 18. **No-card 14-day trial.** `users.trial_started_at` is set once by the first successful
     desktop token exchange, and only when the account has no subscription row, is not
-    free-blocked, and supplied a valid `device_id`. The trial resolves as Pro with
-    `trial: { ends_at }` in `/api/me`; paid subscriptions always take precedence. Checkout is
-    allowed during a trial but still refused for a paid subscription.
-19. **Per-PC free limit.** `devices.device_hash` stores `SHA-256(device_id)`; the fourth and
-    later distinct account ever seen on one device is marked `users.free_blocked_at` and
-    gets no trial. A free-blocked non-paying account gets `402 device_limit` on STT; a paid
-    subscription works normally. `/api/me` exposes `free_blocked`.
+    free-blocked, is under the per-IP trial-grant rate limit, and the request included a
+    valid `device_id` (required by the API). The trial resolves as Pro with
+    `trial: { ends_at }` in `/api/me`; paid subscriptions always take precedence. Checkout
+    is allowed during a trial but still refused for a paid subscription. If the trial
+    rate limiter denies, sign-in still succeeds and the account stays Starter.
+19. **Per-PC free limit.** `devices.device_hash` stores `SHA-256(device_id)`. After
+    inserting the new device row, one conditional `UPDATE` marks the account
+    `free_blocked_at` only when it has no earlier row for that hash and at least three
+    distinct accounts have earlier rows. The fourth and later distinct accounts get no
+    trial; a free-blocked non-paying account gets `402 device_limit` on STT. A
+    re-sign-in by an earlier account is never blocked. A paid subscription works
+    normally. `/api/me` exposes `free_blocked`.

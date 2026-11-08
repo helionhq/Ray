@@ -6,8 +6,12 @@
 
 import type { MiddlewareHandler } from "hono";
 import type { AppContext } from "./env";
-import { getUsage, listSubscriptions } from "./db";
-import { entitledProductIds, resolvePlan } from "./lib/plan";
+import { getUsage, listSubscriptions, usageForPlan } from "./db";
+import {
+  entitledProductIds,
+  resolvePlan,
+  trialEndedThisWeek,
+} from "./lib/plan";
 import { decideQuota, quotaLimits } from "./lib/quota";
 import { isoFromUnixSeconds, nowSeconds, weekBounds } from "./lib/weeks";
 
@@ -15,7 +19,11 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
   const user = c.get("user");
   const now = nowSeconds();
   const week = weekBounds(now);
-  const [subscriptions, usage] = await Promise.all([
+  const trial = {
+    startedAt: user.trial_started_at,
+    freeBlocked: user.free_blocked_at !== null,
+  };
+  const [subscriptions, rawUsage] = await Promise.all([
     listSubscriptions(c.env.DB, user.id),
     getUsage(c.env.DB, user.id, week.weekStart),
   ]);
@@ -23,10 +31,7 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
     subscriptions,
     now,
     entitledProductIds(c.env),
-    {
-      startedAt: user.trial_started_at,
-      freeBlocked: user.free_blocked_at !== null,
-    },
+    trial,
   );
 
   // Trial-farming protection: a free-blocked account cannot dictate without a
@@ -43,6 +48,14 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
       402,
     );
   }
+
+  const usage = await usageForPlan(
+    c.env.DB,
+    user,
+    week.weekStart,
+    rawUsage,
+    trialEndedThisWeek(plan, subscriptions, trial, now, week.weekStart),
+  );
 
   const decision = decideQuota(
     plan.trial_ends_at !== null ? "trial" : plan.plan,

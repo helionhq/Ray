@@ -56,6 +56,7 @@ export function TermsPage() {
         dictation that crosses the limit keeps the part already transcribed (up
         to about two minutes) and is counted.
       </p>
+      <p>Free plans are limited to three accounts per PC.</p>
       <p>
         <strong>{PLANS.pro.name}</strong> is billed at ${PLANS.pro.monthly.price}
         /month on the monthly plan, or ${PLANS.pro.annual.price}/month billed

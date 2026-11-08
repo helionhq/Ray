@@ -129,12 +129,12 @@ async function exchange(
 }
 
 /** Completes a desktop sign-in and returns the device token. */
-async function signIn(userId: string, deviceId?: string): Promise<string> {
+async function signIn(userId: string, deviceId: string): Promise<string> {
   const { code, verifier } = await seedAuthCode(userId);
   const response = await exchange({
     code,
     verifier,
-    ...(deviceId === undefined ? {} : { device_id: deviceId }),
+    device_id: deviceId,
   });
   expect(response.status).toBe(200);
   const token = (await jsonOf(response))["token"];
@@ -233,17 +233,53 @@ describe("14-day no-card trial", () => {
     );
   });
 
-  it("does not start on a site-only sign-up (no desktop device id)", async () => {
+  it("requires a device id at token exchange", async () => {
     const userId = "user_trial_no_device";
     await seedUser(userId);
+    const { code, verifier } = await seedAuthCode(userId);
 
-    const token = await signIn(userId);
+    const response = await exchange({ code, verifier });
 
+    expect(response.status).toBe(400);
+    expect(await jsonOf(response)).toMatchObject({ error: "invalid_request" });
     expect(await trialStartedAt(userId)).toBeNull();
-    const me = await fetchMe(token);
+  });
+
+  it("signs in but grants no trial when the per-IP trial brake denies", async () => {
+    const userId = "user_trial_rate_limited";
+    await seedUser(userId);
+    const { code, verifier } = await seedAuthCode(userId);
+    let keySeen = "";
+
+    const response = await app.request(
+      new Request("https://ray.test/api/desktop/token", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "cf-connecting-ip": "198.51.100.23",
+        },
+        body: JSON.stringify({
+          code,
+          verifier,
+          device_id: randomToken(),
+        }),
+      }),
+      undefined,
+      workerEnv({
+        RATE_LIMIT_TRIAL: {
+          limit: async ({ key }) => {
+            keySeen = key;
+            return { success: false };
+          },
+        },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(keySeen).toBe("ip:198.51.100.23");
+    expect(await trialStartedAt(userId)).toBeNull();
+    const me = await fetchMe(String((await jsonOf(response))["token"]));
     expect(me["plan"]).toBe("starter");
-    expect(me["trial"]).toBeNull();
-    expect(me["free_blocked"]).toBe(false);
   });
 
   it("does not start when the user has ever had a subscription row", async () => {
@@ -312,6 +348,43 @@ describe("14-day no-card trial", () => {
     expect(me["usage"]).toMatchObject({ words_limit: 1_000 });
   });
 
+  it("does not charge pre-trial usage against Starter in the trial's last week", async () => {
+    const userId = "user_trial_midweek";
+    await seedUser(userId);
+    const now = nowSeconds();
+    const weekStart = weekBounds(now).weekStart;
+    // A trial that ended earlier this week, including when the test runs in
+    // the first minute after the Monday boundary.
+    const trialEnd = Math.max(weekStart, now - 60);
+    await env.DB.prepare(
+      "UPDATE users SET trial_started_at = ? WHERE id = ?",
+    )
+      .bind(trialEnd - TRIAL_SECONDS, userId)
+      .run();
+    await addUsage(env.DB, userId, weekStart, 6_000);
+
+    const token = await seedDevice(userId);
+    const me = await fetchMe(token);
+    expect(me["plan"]).toBe("starter");
+    expect(me["usage"]).toMatchObject({
+      words_used: 0,
+      words_limit: 1_000,
+    });
+
+    // The Starter allowance starts at the trial's end, so dictation works
+    // immediately; only the words it produces count.
+    stubSyncSuccess();
+    const response = await app.request(
+      sttRequest(token),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(200);
+
+    const after = await fetchMe(token);
+    expect(after["usage"]).toMatchObject({ words_used: 1 });
+  });
+
   it("still resolves as Pro on the last second of the trial", async () => {
     const userId = "user_trial_last_second";
     await seedUser(userId);
@@ -362,19 +435,48 @@ describe("per-PC free-account limit", () => {
     expect(me["trial"]).toBeNull();
   });
 
-  it("does not count the same user signing in again as a new account", async () => {
+  it("never blocks an earlier account that re-signs in after the fourth account", async () => {
     const deviceId = randomToken();
     for (const userId of ["user_pc_r_a", "user_pc_r_b", "user_pc_r_c"]) {
       await seedUser(userId);
       await signIn(userId, deviceId);
     }
+    // D is the fourth distinct account and is blocked as expected.
+    await seedUser("user_pc_r_d");
+    await signIn("user_pc_r_d", deviceId);
+    expect(await freeBlockedAt("user_pc_r_d")).not.toBeNull();
 
+    // A already had a row on this PC, so re-signing in is not a new account
+    // and must not suppress its active trial or free access.
     const token = await signIn("user_pc_r_a", deviceId);
 
     expect(await freeBlockedAt("user_pc_r_a")).toBeNull();
     const me = await fetchMe(token);
     expect(me["free_blocked"]).toBe(false);
     expect(me["plan"]).toBe("pro");
+  });
+
+  it("serializes concurrent sign-ins to exactly three free accounts", async () => {
+    const deviceId = randomToken();
+    for (const userId of ["user_pc_cc_a", "user_pc_cc_b"]) {
+      await seedUser(userId);
+      await signIn(userId, deviceId);
+    }
+    for (const userId of ["user_pc_cc_c", "user_pc_cc_d"]) {
+      await seedUser(userId);
+    }
+
+    await Promise.all([
+      signIn("user_pc_cc_c", deviceId),
+      signIn("user_pc_cc_d", deviceId),
+    ]);
+
+    const states = await Promise.all(
+      ["user_pc_cc_a", "user_pc_cc_b", "user_pc_cc_c", "user_pc_cc_d"].map(
+        (userId) => freeBlockedAt(userId),
+      ),
+    );
+    expect(states.filter((value) => value === null)).toHaveLength(3);
   });
 
   it("revoked device rows still count toward the PC limit", async () => {

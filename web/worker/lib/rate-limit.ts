@@ -14,6 +14,7 @@ export type RateLimitBindingName =
   | "RATE_LIMIT_BILLING"
   | "RATE_LIMIT_REVOKE_ALL"
   | "RATE_LIMIT_DESKTOP_TOKEN"
+  | "RATE_LIMIT_TRIAL"
   | "RATE_LIMIT_WEBHOOKS"
   | "RATE_LIMIT_STT";
 

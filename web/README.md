@@ -329,7 +329,7 @@ sign-in (the browser hand-off checks `SITE_URL`).
 | GET | `/v1/ping` | none | 204 pre-warm |
 | GET | `/api/me` | either | user, plan, usage, `billing_issue` |
 | POST | `/api/desktop/authorize` | Clerk JWT | issue one-time desktop code |
-| POST | `/api/desktop/token` | code + verifier | issue device token |
+| POST | `/api/desktop/token` | code + verifier + required `device_id` | issue device token |
 | POST | `/api/desktop/signout` | device | revoke this device |
 | POST | `/api/devices/revoke-all` | Clerk JWT | revoke every device for the user |
 | POST | `/api/billing/checkout` | either | Creem checkout URL |
@@ -415,23 +415,38 @@ trial** that starts on the first desktop sign-in. Quota failures are
   (Starter). None of the hidden numbers appear in `/api/me` or the site.
 - **No-card trial.** `users.trial_started_at` is set once by the first
   successful `POST /api/desktop/token`, and only when the account has no
-  subscription row, is not free-blocked, and sent a valid `device_id`. It
-  never starts on site-only sign-up. During the trial the account resolves as
-  Pro with `trial: { ends_at }`; a paid subscription wins.
+  subscription row, is not free-blocked, and sent a valid `device_id` (the
+  field is required). It never starts on site-only sign-up. During the trial
+  the account resolves as Pro with `trial: { ends_at }`; a paid subscription
+  wins. Trial grants are also throttled by the per-IP `RATE_LIMIT_TRIAL`
+  binding (3/minute per Cloudflare location): over the limit, sign-in succeeds
+  but no trial is granted. When the trial ends mid-week, the first post-trial
+  request snapshots the week's usage and Starter counts only what comes after,
+  so trial words/audio do not consume the new Starter allowance.
 - **Per-PC free limit.** The desktop sends `device_id =
   base64url(SHA-256("ray-device-v1:" + MachineGuid))`; the raw GUID never
   leaves the PC. The Worker stores `SHA-256(device_id)` in
-  `devices.device_hash` and counts distinct users that ever used that hash
-  (revoked rows included). A fourth or later distinct account is marked
-  `users.free_blocked_at`: sign-in still succeeds, but it gets no trial and,
-  without a paid plan, every STT request answers `402 device_limit`.
+  `devices.device_hash` and, after inserting each sign-in row, runs one
+  conditional `UPDATE` that compares rows by `created_at`/`rowid`. A fourth or
+  later distinct account is marked `users.free_blocked_at`: sign-in still
+  succeeds, but it gets no trial and, without a paid plan, every STT request
+  answers `402 device_limit`. An account that already has an earlier row for
+  the hash is never blocked, including when it re-signs in after a fourth
+  account exists. The limit is disclosed in the landing FAQ and Terms.
+- **Residual abuse risk.** `device_id` is client-supplied; a modified client
+  can omit nothing (the API rejects that) but can send a fresh random value per
+  account, which defeats the per-PC rule and gives each account a trial. The
+  per-IP trial limiter brakes a scripted loop but is per Cloudflare location,
+  eventually consistent, and defeated by spreading requests across IPs. Treat
+  these as deterrents, not an attestation or billing boundary; stronger
+  enforcement would need device attestation or a payment-method signal.
 - **Rate limiting (M6).** The Worker uses Workers Rate Limiting bindings
   (`ratelimits` in `wrangler.jsonc`): per user for
   `/api/desktop/authorize`, `/api/billing/*`, `/api/devices/revoke-all` and
-  every `/v1/stt/*` route, per IP for `/api/desktop/token` and both webhook
-  endpoints. Counts are per Cloudflare location and eventually consistent. If
-  a binding is absent at runtime (for example an older local runtime), the
-  Worker logs one warning and continues without rate limiting.
+  every `/v1/stt/*` route, per IP for `/api/desktop/token`, trial grants and
+  both webhook endpoints. Counts are per Cloudflare location and eventually
+  consistent. If a binding is absent at runtime (for example an older local
+  runtime), the Worker logs one warning and continues without rate limiting.
 
 Live rollover: overlapping segments from two simultaneous dictations may be
 counted twice. This is accepted; the quota is a cost guard, not an exact

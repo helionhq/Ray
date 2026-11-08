@@ -638,9 +638,10 @@ pub async fn exchange_code(
     verifier: &str,
 ) -> Result<String, ApiError> {
     let mut payload = json!({ "code": code, "verifier": verifier });
-    // Omitted when the registry value cannot be read: sign-in still succeeds,
-    // the Worker simply grants no trial without a device id. The raw GUID is
-    // never sent or logged.
+    // Required by the server: the device id drives the per-PC free limit and
+    // the trial. If the registry value cannot be read the field is omitted and
+    // the exchange is rejected rather than signing in without one. The raw
+    // GUID is never sent or logged.
     if let Some(device_id) = crate::device::device_id() {
         payload["device_id"] = Value::String(device_id);
     }

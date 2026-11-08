@@ -2,8 +2,9 @@
 //!
 //! The raw Windows `MachineGuid` never leaves this module: the app sends only
 //! `base64url(SHA-256("ray-device-v1:" + guid))`, and the Worker stores a
-//! second SHA-256 of that value. If the GUID cannot be read, the app omits
-//! the id and the server grants no trial rather than failing sign-in.
+//! second SHA-256 of that value. The server requires the id, so if the GUID
+//! cannot be read the sign-in exchange fails rather than proceeding without
+//! one.
 
 use base64::Engine;
 use sha2::Digest;
@@ -24,7 +25,8 @@ pub fn device_id_from_guid(guid: &str) -> String {
 /// Reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` through the
 /// 64-bit registry view (`KEY_WOW64_64KEY`) so a 32-bit process sees the same
 /// value as a 64-bit one. Returns `None` when the value is missing or empty;
-/// the app then signs in normally and simply gets no trial.
+/// the server requires the field, so the sign-in exchange then fails rather
+/// than skipping the trial and the per-PC limit.
 pub fn device_id() -> Option<String> {
     let guid = read_machine_guid()?;
     let guid = guid.trim();

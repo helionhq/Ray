@@ -71,8 +71,16 @@ describe("basic API surface", () => {
 describe("desktop hand-off", () => {
   it("exchanges a one-time code for a device token exactly once", async () => {
     await seedUser("user_handoff");
+    // An old trial keeps this test on Starter; the trial flow has its own
+    // suite.
+    await env.DB.prepare(
+      "UPDATE users SET trial_started_at = ? WHERE id = ?",
+    )
+      .bind(nowSeconds() - 30 * 86_400, "user_handoff")
+      .run();
     const verifier = randomToken();
     const code = randomToken();
+    const deviceId = randomToken();
     const challenge = await pkceChallenge(verifier);
     await env.DB.prepare(
       `INSERT INTO auth_codes (code_hash, user_id, challenge, state, expires_at, used_at)
@@ -91,7 +99,7 @@ describe("desktop hand-off", () => {
       SELF.fetch("https://ray.test/api/desktop/token", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code, verifier }),
+        body: JSON.stringify({ code, verifier, device_id: deviceId }),
       });
 
     const first = await request();
@@ -146,7 +154,11 @@ describe("desktop hand-off", () => {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code, verifier: randomToken() }),
+        body: JSON.stringify({
+          code,
+          verifier: randomToken(),
+          device_id: randomToken(),
+        }),
       },
     );
     expect(response.status).toBe(400);
@@ -177,7 +189,11 @@ describe("desktop hand-off", () => {
       SELF.fetch("https://ray.test/api/desktop/token", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code, verifier }),
+        body: JSON.stringify({
+          code,
+          verifier,
+          device_id: randomToken(),
+        }),
       });
 
     const responses = await Promise.all([
