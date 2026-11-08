@@ -58,9 +58,10 @@ export function PrivacyPage() {
         interval, status, and renewal date so we can apply your plan.
       </p>
       <p>
-        We store weekly word counts — a number per account, not the text — to
-        enforce the Starter limit and a fair-use limit that protects service
-        costs. The count resets every Monday at 00:00 UTC.
+        We store weekly usage counts — words and audio minutes, a number per
+        account, not the text — to enforce the Starter limit and a fair-use
+        limit that protects service costs. The count resets every Monday at
+        00:00 UTC.
       </p>
 
       <h2>What stays on your PC</h2>

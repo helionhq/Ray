@@ -203,9 +203,12 @@ rate-limited and shows a friendly retry message.
   request at 118 s, and the segment transcripts are joined.
 - `/v1/stt/sync`: same, for `https://sync.assemblyai.com/v1/transcribe` (non-streamed body),
   also under the 12 MB cap.
-- `/v1/stt/batch`: request body is `audio/wav` (maximum **12 MB**, enforced on
-  `Content-Length` and chunk by chunk while streaming; over the cap is
-  `413 payload_too_large`, an empty body is `400 invalid_audio`), optional header
+- `/v1/stt/batch`: request body must be the desktop's canonical WAV (RIFF/WAVE,
+  PCM format 1, mono, 16 kHz, 16 bit; the declared data length must be ≤ 5 min plus a small
+  margin), maximum **12 MB**, enforced on `Content-Length` and chunk by chunk while
+  streaming. A non-WAV or over-long body is `400 invalid_audio` before any upstream call;
+  over the byte cap is `413 payload_too_large`; an empty body is `400 invalid_audio`.
+  Optional header
   `X-Ray-Keyterms` with a JSON array of strings (base64url-encoded JSON, since headers
   can't hold arbitrary Unicode), plus optional `X-Ray-Speech-Models` (comma-separated).
   The Worker does upload → create transcript → poll (700 ms) up to 45 s, counts words, and
@@ -215,7 +218,8 @@ rate-limited and shows a friendly retry message.
   whitespace-separated tokens, with each CJK/Hiragana/Katakana/Hangul character counted
   as one word.
 - Quota is checked **before** the upstream call. Going over mid-dictation is allowed (the
-  dictation that crosses the line completes and is counted).
+  segment that crosses the line is admitted and counted; later live segments are refused
+  and the partial text is kept and pasted).
 - Concurrency: at most **2 in-flight STT requests per user** (D1 `stt_leases`, 6-minute
   expiry, released in `finally` even when a client stream ends or the handler fails).
   Over the cap: `429 { "error": "too_many_requests" }`. Live rollover segments are
@@ -228,7 +232,9 @@ rate-limited and shows a friendly retry message.
   it costs an upstream transcription but consumes no word quota.
 - Audio metering: every STT request adds the bytes streamed to AssemblyAI to
   `usage_weeks.audio_seconds` (PCM16 mono 16 kHz = 32,000 bytes/s; the 44-byte WAV
-  header is subtracted and the result is rounded up). It is charged on every request
+  header is subtracted and the result is rounded up). Sync responses also report
+  `audio_duration_ms`, and the larger of that duration and the byte-derived estimate is
+  charged. It is charged on every request
   that reaches upstream, including empty transcripts and upstream failures. Quota
   checks compare both words and audio seconds against the plan's limits and return the
   same `402 quota_exceeded` / `429 fair_use` shapes.
@@ -319,7 +325,7 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
    expires_at > now`, and reject if the `<transcript>…</transcript>` content in the last user message
    has more than `grant.words + 25` words. On failure, return `403 { error: "no_cleanup_grant" }`. The
    desktop treats that like any other cleanup failure (paste the raw transcript). This means the
-   dictation that crosses the limit always completes and gets cleaned up, and cleanup can't be
+   segment that crosses the limit is transcribed and gets cleaned up, and cleanup can't be
    used as a general LLM.
 2. **Cleanup body whitelist.** Forward only `model`, `messages`, `temperature`, `max_tokens`
    (clamped ≤ 4000), and `stream: false`. Drop everything else (`n`, `max_completion_tokens`, tools…).
@@ -340,6 +346,8 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
    message.
 6. **STT input cap:** 12 MB on every STT route (`sync-live`, `sync`, `batch`), Content-Length
    check plus a streamed cap, streamed upload to AssemblyAI, no `arrayBuffer()` of unbounded input.
+   `/v1/stt/batch` validates the canonical 16 kHz mono PCM16 WAV header (≤ 5 min of declared
+   data) before any upstream call.
 7. **Word counting:** prefer the length of AssemblyAI's `words` array when present; otherwise count
    whitespace tokens, with each CJK/Hiragana/Katakana/Hangul character counted as one word.
 8. **Billing integrity:** only `CREEM_PRODUCT_PRO_MONTHLY` / `CREEM_PRODUCT_PRO_ANNUAL` grant Pro;

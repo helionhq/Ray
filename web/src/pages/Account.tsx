@@ -309,7 +309,7 @@ function AccountView({
             <p className={atLimit ? "account-alert" : "account-hint"}>
               {atLimit
                 ? "Weekly limit reached. Upgrade to keep dictating."
-                : `Resets ${RESET_LABEL}. A dictation that crosses the limit still finishes and is counted.`}
+                : `Resets ${RESET_LABEL}. A dictation that crosses the limit keeps the part already transcribed (up to about two minutes) and is counted.`}
             </p>
           </section>
 

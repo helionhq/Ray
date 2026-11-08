@@ -54,8 +54,8 @@ const faqs: { question: string; answer: ReactNode }[] = [
         Audio and transcripts are sent over a Cloudflare Worker to AssemblyAI
         to be transcribed and cleaned up, then discarded from our servers.{" "}
         {PRIVACY_LINE} We keep only your account details, your subscription,
-        your weekly word count, and device sign-ins. Your local History stays
-        on your PC.{" "}
+        weekly usage counts (words and audio minutes), and device sign-ins. Your
+        local History stays on your PC.{" "}
         <Link to="/privacy">Read the privacy policy</Link>.
       </>
     ),
@@ -73,7 +73,7 @@ const faqs: { question: string; answer: ReactNode }[] = [
       PLANS.starter.resetDay
     } at ${
       PLANS.starter.resetTime
-    }. When you hit the limit, Ray stops recording and asks you to upgrade. A dictation that crosses the line still finishes and is counted.`,
+    }. When you hit the limit, Ray stops recording and asks you to upgrade. A dictation that crosses the line keeps the part already transcribed (up to about two minutes) and is counted.`,
   },
   {
     question: "Can I cancel Pro anytime?",
@@ -481,9 +481,9 @@ export function LandingPage() {
                 </div>
                 <p className="privacy-note">
                   <LockIcon size={14} />
-                  Only your account, subscription, weekly word counts, and
-                  device sign-ins are stored on our servers. History stays on
-                  your PC.
+                  Only your account, subscription, weekly usage counts (words
+                  and audio minutes), and device sign-ins are stored on our
+                  servers. History stays on your PC.
                 </p>
               </article>
             </div>

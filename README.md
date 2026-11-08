@@ -214,7 +214,7 @@ still delivered.
 
 - Sync live accepts up to 120 s of audio per request; longer dictations roll over to a new live request and the segment transcripts are concatenated. If the live path fails, the batch endpoint is used.
 - A single recording stops automatically at 5 minutes, the size of the local batch-fallback buffer. The bar tells you when that happens.
-- Starter is capped at 1,000 words per week (resets Monday 00:00 UTC). Pro is unlimited under a fair-use cap; if it is hit, dictation stops with a short message until the week resets. A dictation that crosses the limit is allowed to finish and is counted.
+- Starter is capped at 1,000 words per week (resets Monday 00:00 UTC). Pro is unlimited under a fair-use cap; if it is hit, dictation stops with a short message until the week resets. A dictation that crosses the limit keeps the part already transcribed (up to about two minutes) and is counted.
 - Pasting into elevated (admin) windows is blocked by Windows UIPI. Ray detects this and copies the text to the clipboard with a clear message instead of silently doing nothing.
 - With the default Right Alt shortcut on a layout where Right Alt is AltGr, typing an AltGr character starts and immediately cancels a dictation (a brief bar flicker), but the character itself is replayed correctly. Choose another shortcut in Settings if that is distracting.
 - When Win is the shortcut, Ray swallows both of its edges so a bare tap does not open Start. Windows still handles Win+L (lock) itself, so that combination may lock the PC even while Win is the dictation shortcut.

@@ -119,6 +119,31 @@ function syncRequest(token: string, body: BodyInit = "audio"): Request {
   });
 }
 
+/** The canonical desktop WAV: PCM16 mono at `sampleRate`, zero-filled data. */
+function wavBytes(dataBytes: number, sampleRate = 16_000): Uint8Array {
+  const wav = new Uint8Array(44 + dataBytes);
+  const view = new DataView(wav.buffer);
+  const tag = (offset: number, text: string) => {
+    for (let index = 0; index < text.length; index += 1) {
+      wav[offset + index] = text.charCodeAt(index);
+    }
+  };
+  tag(0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  tag(8, "WAVE");
+  tag(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  tag(36, "data");
+  view.setUint32(40, dataBytes, true);
+  return wav;
+}
+
 describe("upstream error mapping (decision 4)", () => {
   it("maps an upstream 401 to 502 upstream_error, not Ray unauthorized", async () => {
     await seedUser("user_upstream_401");
@@ -223,7 +248,7 @@ describe("upstream error mapping (decision 4)", () => {
           authorization: `Bearer ${token}`,
           "content-type": "audio/wav",
         },
-        body: "audio",
+        body: wavBytes(32_000),
       }),
       undefined,
       workerEnv(),
@@ -357,7 +382,7 @@ describe("word counting and cleanup grants on STT responses", () => {
           authorization: `Bearer ${token}`,
           "content-type": "audio/wav",
         },
-        body: "audio-bytes",
+        body: wavBytes(32_000),
       }),
       undefined,
       workerEnv(),
@@ -398,6 +423,36 @@ describe("audio metering (AssemblyAI bills audio time)", () => {
     expect(await getUsage(env.DB, "user_audio_meter", weekStart)).toEqual({
       words: 1,
       audioSeconds: 2,
+    });
+  });
+
+  it("meters the duration AssemblyAI reports when it exceeds the byte estimate", async () => {
+    await seedUser("user_audio_reported");
+    const token = await seedDevice("user_audio_reported");
+    stubFetch(async (_url, init) => {
+      await drainBody(init);
+      return new Response(
+        JSON.stringify({
+          text: "word",
+          words: [{}],
+          audio_duration_ms: 120_000,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+
+    // One second of bytes, but the upstream decoded two minutes.
+    const response = await app.request(
+      syncRequest(token, new Uint8Array(32_044)),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(200);
+
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    expect(await getUsage(env.DB, "user_audio_reported", weekStart)).toEqual({
+      words: 1,
+      audioSeconds: 120,
     });
   });
 
@@ -479,7 +534,7 @@ describe("audio metering (AssemblyAI bills audio time)", () => {
           authorization: `Bearer ${token}`,
           "content-type": "audio/wav",
         },
-        body: new Uint8Array(96_044),
+        body: wavBytes(96_000),
       }),
       undefined,
       workerEnv(),
@@ -522,6 +577,33 @@ describe("batch streamed input cap (decision 6)", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("rejects a non-WAV or non-16 kHz PCM16 body without calling upstream", async () => {
+    await seedUser("user_batch_format");
+    const token = await seedDevice("user_batch_format");
+    const calls = stubFetch(() => new Response("{}", { status: 200 }));
+
+    for (const body of [
+      new Uint8Array(1_024), // could be compressed audio to the v2 API
+      wavBytes(32_000, 8_000), // decodes to twice the metered duration
+    ]) {
+      const response = await app.request(
+        new Request("https://ray.test/v1/stt/batch", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "audio/wav",
+          },
+          body,
+        }),
+        undefined,
+        workerEnv(),
+      );
+      expect(response.status).toBe(400);
+      expect(await jsonOf(response)).toMatchObject({ error: "invalid_audio" });
+    }
+    expect(calls).toHaveLength(0);
+  });
+
   it("returns 413 when the streamed body overflows 12 MB", async () => {
     await seedUser("user_batch_stream");
     const token = await seedDevice("user_batch_stream");
@@ -543,10 +625,16 @@ describe("batch streamed input cap (decision 6)", () => {
       },
     );
 
+    const header = wavBytes(32_000);
     const chunk = new Uint8Array(64 * 1024);
     let sent = 0;
     const body = new ReadableStream<Uint8Array>({
       pull(controller) {
+        if (sent === 0) {
+          sent += header.byteLength;
+          controller.enqueue(header);
+          return;
+        }
         if (sent > 13 * 1024 * 1024) {
           controller.close();
           return;

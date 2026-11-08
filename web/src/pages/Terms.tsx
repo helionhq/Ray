@@ -53,7 +53,8 @@ export function TermsPage() {
         <strong>{PLANS.starter.name}</strong> is free and includes{" "}
         {formatNumber(PLANS.starter.weeklyWords)} words per week, resetting
         every {PLANS.starter.resetDay} at {PLANS.starter.resetTime}. A
-        dictation that crosses the limit is allowed to finish and is counted.
+        dictation that crosses the limit keeps the part already transcribed (up
+        to about two minutes) and is counted.
       </p>
       <p>
         <strong>{PLANS.pro.name}</strong> is billed at ${PLANS.pro.monthly.price}

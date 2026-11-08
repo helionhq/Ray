@@ -2,8 +2,9 @@
  * Speech-to-text proxies.
  *
  * Audio and transcripts pass through memory only. Nothing in this file logs a
- * request or response body, and only word counts and streamed audio seconds
- * (metered from bytes, never the audio itself) are written to D1.
+ * request or response body, and only word counts and audio seconds (metered
+ * from bytes and, for sync, the duration AssemblyAI reports) are written to
+ * D1.
  *
  * `/v1/stt/sync-live` forwards the original streamed multipart body without
  * buffering it. `/v1/stt/batch` implements the v2 upload/create/poll fallback
@@ -56,6 +57,8 @@ const DEFAULT_SPEECH_MODELS = ["universal-3-5-pro", "universal-2"];
 const AUDIO_BYTES_PER_SECOND = 32_000;
 /** WAV files carry a 44-byte header before the PCM samples. */
 const WAV_HEADER_BYTES = 44;
+/** The desktop stops recording at 5 minutes; allow a small margin. */
+const WAV_MAX_DATA_BYTES = 32_000 * (5 * 60 + 5);
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -65,6 +68,61 @@ function audioSecondsFromBytes(bytes: number): number {
   return Math.ceil(
     Math.max(0, bytes - WAV_HEADER_BYTES) / AUDIO_BYTES_PER_SECOND,
   );
+}
+
+/**
+ * Validates the canonical WAV the desktop sends (`wav_from_pcm16`): RIFF/WAVE,
+ * PCM format 1, mono, 16 kHz, 16 bit, and at most the desktop's 5-minute
+ * recording. Returns the declared data length in bytes, or null. This keeps
+ * the byte-derived meter exact: AssemblyAI bills decoded audio time, so a
+ * compressed or lower-rate file could otherwise cost far more than it meters.
+ */
+function parsePcmWav(bytes: Uint8Array): number | null {
+  if (bytes.byteLength < WAV_HEADER_BYTES) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const byteAt = (offset: number) => bytes[offset] ?? 0;
+  const tag = (offset: number) =>
+    String.fromCharCode(
+      byteAt(offset),
+      byteAt(offset + 1),
+      byteAt(offset + 2),
+      byteAt(offset + 3),
+    );
+  if (
+    tag(0) !== "RIFF" ||
+    tag(8) !== "WAVE" ||
+    tag(12) !== "fmt " ||
+    tag(36) !== "data"
+  ) {
+    return null;
+  }
+  const dataBytes = view.getUint32(40, true);
+  if (
+    view.getUint32(16, true) !== 16 || // fmt chunk size
+    view.getUint16(20, true) !== 1 || // PCM
+    view.getUint16(22, true) !== 1 || // mono
+    view.getUint32(24, true) !== 16_000 ||
+    view.getUint32(28, true) !== AUDIO_BYTES_PER_SECOND || // byte rate
+    view.getUint16(32, true) !== 2 || // block align
+    view.getUint16(34, true) !== 16 || // bits per sample
+    dataBytes === 0 ||
+    dataBytes % 2 !== 0 ||
+    dataBytes > WAV_MAX_DATA_BYTES
+  ) {
+    return null;
+  }
+  return dataBytes;
+}
+
+/** AssemblyAI's sync responses report the decoded duration in milliseconds. */
+function reportedAudioSeconds(
+  payload: Record<string, unknown> | null,
+): number {
+  const milliseconds = payload?.["audio_duration_ms"];
+  if (typeof milliseconds !== "number" || !Number.isFinite(milliseconds)) {
+    return 0;
+  }
+  return Math.ceil(Math.max(0, milliseconds) / 1000);
 }
 
 /**
@@ -107,15 +165,18 @@ async function recordWords(
 /**
  * Meters the audio that actually reached upstream, in seconds. AssemblyAI
  * bills audio time, so this is charged for every request, including ones that
- * return an empty transcript or fail upstream. Best effort: metering must
- * never mask the response.
+ * return an empty transcript or fail upstream. For sync responses the
+ * upstream-reported duration is authoritative when it is longer than the
+ * byte-derived estimate (compressed or lower-rate input). Best effort:
+ * metering must never mask the response.
  */
 async function recordAudioUsage(
   c: Context<AppContext>,
   weekStart: number,
   bytes: number,
+  reportedSeconds = 0,
 ): Promise<void> {
-  const seconds = audioSecondsFromBytes(bytes);
+  const seconds = Math.max(audioSecondsFromBytes(bytes), reportedSeconds);
   if (seconds <= 0) return;
   try {
     await addUsage(c.env.DB, c.get("user").id, weekStart, 0, seconds);
@@ -145,6 +206,7 @@ async function proxySync(
   // The same streamed cap as /v1/stt/batch: a lying or missing Content-Length
   // cannot push an unbounded body (and an unbounded upstream bill) through.
   const limited = createLimitedBody(body, BATCH_MAX_BYTES);
+  let reportedSeconds = 0;
 
   try {
     const headers = new Headers();
@@ -176,11 +238,9 @@ async function proxySync(
 
     const text = await upstream.text();
     if (upstream.ok) {
-      await recordWords(
-        c,
-        weekStart,
-        countTranscriptWords(parseJsonObject(text)),
-      );
+      const payload = parseJsonObject(text);
+      reportedSeconds = reportedAudioSeconds(payload);
+      await recordWords(c, weekStart, countTranscriptWords(payload));
     }
 
     // Decision 4: upstream auth/rate-limit/5xx never look like Ray errors.
@@ -199,7 +259,7 @@ async function proxySync(
   } finally {
     // Charge the audio that reached upstream even when the transcript was
     // empty or the request failed.
-    await recordAudioUsage(c, weekStart, limited.bytesRead());
+    await recordAudioUsage(c, weekStart, limited.bytesRead(), reportedSeconds);
   }
 }
 
@@ -267,25 +327,31 @@ function declaredLengthTooLarge(
 
 function invalidAudio(c: Context<AppContext>): Response {
   return c.json(
-    { error: "invalid_audio", message: "The audio body is empty." },
+    {
+      error: "invalid_audio",
+      message:
+        "The audio body must be a 16 kHz mono PCM16 WAV of at most about 5 minutes.",
+    },
     400,
   );
 }
 
 /**
- * Re-attaches a peeked first chunk to the rest of a reader so the batch route
- * can reject truly empty bodies before calling upstream while still streaming
- * everything else under the cap.
+ * Re-attaches the chunks already read for header validation to the rest of a
+ * reader so the batch route can validate the WAV before calling upstream while
+ * still streaming everything else under the cap.
  */
-function prependChunk(
-  first: Uint8Array,
+function prependChunks(
+  chunks: Uint8Array[],
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(first);
-    },
     async pull(controller) {
+      const first = chunks.shift();
+      if (first !== undefined) {
+        controller.enqueue(first);
+        return;
+      }
       try {
         const { done, value } = await reader.read();
         if (done) {
@@ -598,20 +664,37 @@ export function registerSttRoutes(app: Hono<AppContext>): void {
       const body = c.req.raw.body;
       if (!body) return invalidAudio(c);
 
-      // Peek one chunk so a truly empty body is rejected before any upstream
-      // work; the rest is still streamed under the cap.
+      // Peek the WAV header so non-PCM/compressed or over-long audio is
+      // rejected before any upstream work; the rest is still streamed under
+      // the cap.
       const reader = body.getReader();
-      let first = await reader.read();
-      while (!first.done && first.value.byteLength === 0) {
-        first = await reader.read();
+      const head: Uint8Array[] = [];
+      let headBytes = 0;
+      while (headBytes < WAV_HEADER_BYTES) {
+        const next = await reader.read();
+        if (next.done) break;
+        if (next.value.byteLength === 0) continue;
+        head.push(next.value);
+        headBytes += next.value.byteLength;
       }
-      if (first.done) {
+      const header = new Uint8Array(headBytes);
+      let offset = 0;
+      for (const chunk of head) {
+        header.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      if (parsePcmWav(header) === null) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The body is already gone; nothing else to clean up.
+        }
         reader.releaseLock();
         return invalidAudio(c);
       }
 
       const limited = createLimitedBody(
-        prependChunk(first.value, reader),
+        prependChunks(head, reader),
         BATCH_MAX_BYTES,
       );
       const weekStart = weekBounds(nowSeconds()).weekStart;
