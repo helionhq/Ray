@@ -60,7 +60,7 @@
     "publisher": "Helion",
     "copyright": "Copyright © 2026 Helion",
     "shortDescription": "Fast, clean dictation",
-    "longDescription": "Press Right Alt, speak, press it again. Ray transcribes and cleans your speech, then pastes it wherever you are typing.",
+    "longDescription": "Press your dictation shortcut (Right Alt by default), speak, press it again. Ray transcribes and cleans your speech, then pastes it wherever you are typing.",
     "windows": {
       "nsis": {
         "installMode": "currentUser"

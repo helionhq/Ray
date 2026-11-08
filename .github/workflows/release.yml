@@ -289,7 +289,7 @@ jobs:
           INSTALLER="${installers[0]}"
           NOTES="Ray ${VERSION} for Windows.
 
-          Press Right Alt, speak, press it again. Ray updates itself; run the setup file below for a fresh install."
+          Press your dictation shortcut (Right Alt by default), speak, press it again. Ray updates itself; run the setup file below for a fresh install."
           # The push step ran first, so COMMIT_SHA is on main. Attach assets
           # only to a tag that names that same commit: the installer, the
           # version commit, the tag, and the release must agree.
