@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ray-web-test",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-15",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ray-test",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Test-only dummy values. Never use real keys here.
+  "vars": {
+    "SITE_URL": "https://ray.test",
+    "CLERK_PUBLISHABLE_KEY": "pk_test_placeholder",
+    "CLERK_SECRET_KEY": "sk_test_placeholder",
+    "ASSEMBLYAI_API_KEY": "test_assemblyai_key",
+    "CREEM_API_KEY": "creem_test_placeholder",
+    "CREEM_WEBHOOK_SECRET": "whsec_test_placeholder",
+    "CREEM_API_BASE": "https://test-api.creem.io",
+    "CREEM_PRODUCT_PRO_MONTHLY": "prod_test_monthly",
+    "CREEM_PRODUCT_PRO_ANNUAL": "prod_test_annual",
+    "STARTER_WEEKLY_WORDS": "1000",
+    "FAIR_USE_WEEKLY_WORDS": "100000",
+    "CLEANUP_MODELS": "gemma-4-31b"
+  }
+}

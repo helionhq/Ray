@@ -1,0 +1,18 @@
+# Copy this file to .dev.vars and fill in test credentials.
+# .dev.vars is gitignored. Never commit real keys.
+#
+# The Vite dev server origin. This also drives Clerk's authorized parties and
+# the Creem success URL. localhost:5173 and localhost:8787 are both accepted
+# while SITE_URL is a loopback origin.
+SITE_URL=http://localhost:5173
+
+CLERK_PUBLISHABLE_KEY=pk_test_REPLACE_ME
+CLERK_SECRET_KEY=sk_test_REPLACE_ME
+ASSEMBLYAI_API_KEY=REPLACE_ME
+CREEM_API_KEY=creem_test_REPLACE_ME
+CREEM_WEBHOOK_SECRET=whsec_REPLACE_ME
+
+# Optional overrides for the values in wrangler.jsonc (local testing only).
+# CREEM_API_BASE=https://test-api.creem.io
+# CREEM_PRODUCT_PRO_MONTHLY=prod_REPLACE_ME
+# CREEM_PRODUCT_PRO_ANNUAL=prod_REPLACE_ME
