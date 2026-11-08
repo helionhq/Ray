@@ -35,7 +35,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_V,
 };
 
-use crate::config::CleanupMode;
 use crate::windows_util;
 
 const CF_UNICODETEXT: u32 = 13;
@@ -400,20 +399,20 @@ pub fn copy_text_with(text: &str, line_endings: LineEndings) -> Result<(), Strin
 }
 
 /// How line breaks are written to CF_UNICODETEXT. Windows text controls expect
-/// CRLF; `Preserve` keeps the bytes exactly as they were (Clean's existing
-/// behaviour) while `CrLf` normalises Structured's paragraphs and lists.
+/// CRLF; `Preserve` keeps the bytes exactly as they were (raw transcripts)
+/// while `CrLf` normalises Structured's paragraphs and lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEndings {
     Preserve,
     CrLf,
 }
 
-/// Structured output is pasted as CRLF, matching the direct-paste path. Clean,
-/// legacy (no mode) and unknown entries keep their bytes exactly.
-pub fn line_endings_for_mode(mode: Option<CleanupMode>) -> LineEndings {
+/// Structured output is pasted as CRLF, matching the direct-paste path. Raw
+/// (no cleanup) and legacy entries keep their bytes exactly.
+pub fn line_endings_for_mode(mode: Option<&str>) -> LineEndings {
     match mode {
-        Some(CleanupMode::Structured) => LineEndings::CrLf,
-        None | Some(CleanupMode::Clean) => LineEndings::Preserve,
+        Some(mode) if mode.eq_ignore_ascii_case("structured") => LineEndings::CrLf,
+        _ => LineEndings::Preserve,
     }
 }
 
@@ -705,17 +704,12 @@ mod tests {
     #[test]
     fn line_endings_follow_the_cleanup_mode() {
         assert_eq!(line_endings_for_mode(None), LineEndings::Preserve);
-        assert_eq!(
-            line_endings_for_mode(Some(CleanupMode::Clean)),
-            LineEndings::Preserve
-        );
-        assert_eq!(
-            line_endings_for_mode(Some(CleanupMode::Structured)),
-            LineEndings::CrLf
-        );
+        assert_eq!(line_endings_for_mode(Some("structured")), LineEndings::CrLf);
+        // Legacy entries from the retired Clean mode keep their bytes.
+        assert_eq!(line_endings_for_mode(Some("clean")), LineEndings::Preserve);
 
         assert_eq!(
-            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Structured))),
+            prepare_clipboard_text("a\nb", line_endings_for_mode(Some("structured"))),
             "a\r\nb"
         );
         assert_eq!(
@@ -723,7 +717,7 @@ mod tests {
             "a\nb"
         );
         assert_eq!(
-            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Clean))),
+            prepare_clipboard_text("a\nb", line_endings_for_mode(Some("clean"))),
             "a\nb"
         );
     }
