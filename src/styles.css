@@ -1591,6 +1591,174 @@ kbd {
   }
 }
 
+/* ----------------------------------------------------------------- sign in */
+
+/* Signed out there is no sidebar, so the caption spans the whole window. */
+.signin-screen .titlebar {
+  left: 0;
+}
+
+.signin {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 13px;
+  height: 100vh;
+  padding: 56px 32px 64px;
+  background: var(--bg);
+  text-align: center;
+}
+
+.signin .logo {
+  margin-bottom: 8px;
+}
+
+.signin h1 {
+  font-size: 22px;
+}
+
+.signin-copy {
+  max-width: 42ch;
+  color: var(--ink-2);
+  line-height: 1.6;
+}
+
+.signin-button {
+  min-width: 132px;
+  height: 34px;
+  margin-top: 6px;
+}
+
+.signin-waiting {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+.signin-hint {
+  max-width: 40ch;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.signin-error {
+  max-width: 44ch;
+  color: var(--live);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* ----------------------------------------------------------------- account */
+
+.account-user {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+}
+
+.account-user .row-copy {
+  flex: 1;
+}
+
+.account-avatar {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.plan-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  box-shadow: inset 0 0 0 1px var(--line-2);
+  color: var(--ink-2);
+  font: 500 10.5px/1 var(--font-mono);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.plan-badge.is-pro {
+  background: var(--ink);
+  box-shadow: none;
+  color: var(--bg);
+}
+
+.account-user + .row {
+  border-top: 1px solid var(--line);
+}
+
+.account-usage .row-copy {
+  flex: 1;
+}
+
+.meter {
+  height: 4px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.meter span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--ink);
+  transition: width 240ms var(--ease-out);
+}
+
+.account-upgrade {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.account-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  margin-top: 28px;
+  padding: 40px 24px;
+  color: var(--ink-2);
+}
+
+.account-error {
+  margin-top: 18px;
+  color: var(--live);
+  font-size: 12.5px;
+}
+
+.account-footnote {
+  margin-top: 22px;
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 /* ------------------------------------------------------------- responsive */
 
 @media (max-width: 820px) {

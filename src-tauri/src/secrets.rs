@@ -1,83 +1,71 @@
-//! API keys live in Windows Credential Manager under service `ray`.
+//! The Ray device token lives in Windows Credential Manager under service
+//! `ray`, account `session`.
 //!
-//! Environment variables are a development fallback only (useful for headless
-//! smoke tests); release builds never read keys from disk outside the OS store.
+//! Users no longer hold provider API keys. Credentials from the AssemblyAI,
+//! Vercel, and Groq integrations are removed on startup so a retired key can
+//! never linger in the OS store with no UI to clear it.
+//!
+//! `RAY_DEVICE_TOKEN` is a development and selftest convenience only; release
+//! builds never read the token from the environment.
 
 const SERVICE: &str = "ray";
+pub const SESSION: &str = "session";
 
-pub const ASSEMBLYAI: &str = "assemblyai";
-pub const VERCEL: &str = "vercel";
+/// Accounts Ray no longer uses. Startup deletes them from Credential Manager.
+pub const RETIRED: &[&str] = &["groq", "assemblyai", "vercel"];
 
-/// Providers Ray no longer supports. Their stored credentials must be removed
-/// so a retired key cannot linger in Credential Manager with no UI to clear it.
-pub const RETIRED: &[&str] = &["groq"];
-
-pub fn env_names(secret: &str) -> &'static [&'static str] {
-    match secret {
-        ASSEMBLYAI => &["ASSEMBLYAI_API_KEY", "RAY_ASSEMBLYAI_API_KEY"],
-        VERCEL => &[
-            "VERCEL_AI_GATEWAY_KEY",
-            "AI_GATEWAY_API_KEY",
-            "RAY_VERCEL_AI_GATEWAY_KEY",
-        ],
-        _ => &[],
-    }
+fn entry(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(SERVICE, account).map_err(|error| format!("Credential store: {error}"))
 }
 
-fn entry(secret: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(SERVICE, secret).map_err(|error| format!("Credential store: {error}"))
+fn credential(account: &str) -> Option<String> {
+    let entry = entry(account).ok()?;
+    let value = entry.get_password().ok()?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
-/// Debug-only switch used by the headless first-run test: pretend Credential
-/// Manager is empty so the env-var fallback (or the missing-key path) is
-/// exercised without touching the user's real credentials.
-fn ignore_stored_keys() -> bool {
-    cfg!(debug_assertions) && std::env::var_os("RAY_TEST_IGNORE_STORED_KEYS").is_some()
+fn env_token() -> Option<String> {
+    let value = std::env::var("RAY_DEVICE_TOKEN").ok()?;
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
-pub fn get(secret: &str) -> Option<String> {
-    if !ignore_stored_keys() {
-        if let Ok(entry) = entry(secret) {
-            if let Ok(value) = entry.get_password() {
-                let value = value.trim().to_string();
-                if !value.is_empty() {
-                    return Some(value);
-                }
-            }
+/// The stored device token. Debug builds also accept `RAY_DEVICE_TOKEN` so the
+/// app can be run against a local Worker without signing in.
+pub fn device_token() -> Option<String> {
+    credential(SESSION).or_else(|| {
+        if cfg!(debug_assertions) {
+            env_token()
+        } else {
+            None
         }
-    }
-    for name in env_names(secret) {
-        if let Ok(value) = std::env::var(name) {
-            let value = value.trim().to_string();
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-    }
-    None
+    })
 }
 
-pub fn has(secret: &str) -> bool {
-    get(secret).is_some()
+/// The selftest path may use `RAY_DEVICE_TOKEN` in any build profile; it is the
+/// headless replacement for the sign-in flow.
+pub fn selftest_device_token() -> Option<String> {
+    credential(SESSION).or_else(env_token)
 }
 
-pub fn set(secret: &str, value: &str) -> Result<(), String> {
+pub fn save_device_token(value: &str) -> Result<(), String> {
     let value = value.trim();
     if value.is_empty() {
-        return delete(secret);
+        return clear_device_token();
     }
-    entry(secret)?
+    entry(SESSION)?
         .set_password(value)
-        .map_err(|error| format!("Could not save key in Windows Credential Manager: {error}"))
+        .map_err(|error| format!("Could not save the Ray session: {error}"))
 }
 
-pub fn delete(secret: &str) -> Result<(), String> {
-    let entry = entry(secret)?;
+pub fn clear_device_token() -> Result<(), String> {
+    let entry = entry(SESSION)?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
         // Deleting a credential that is not there is not an error.
         Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(format!("Could not remove key: {error}")),
+        Err(error) => Err(format!("Could not remove the Ray session: {error}")),
     }
 }
 
@@ -114,8 +102,7 @@ mod tests {
 
     #[test]
     fn credential_manager_round_trip() {
-        // A dedicated entry so the user's real AssemblyAI/Vercel keys are
-        // never touched.
+        // A dedicated entry so the user's real session is never touched.
         let name = "ray-selftest-roundtrip";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
         entry
@@ -131,8 +118,7 @@ mod tests {
 
     #[test]
     fn retired_secret_migration_is_idempotent() {
-        // A dedicated entry so the user's real AssemblyAI/Vercel keys are
-        // never touched.
+        // A dedicated entry so the user's real credentials are never touched.
         let name = "ray-retired-selftest";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
         entry.set_password("retired-value").expect("store secret");
@@ -143,5 +129,15 @@ mod tests {
 
         // Second pass is a no-op: a missing entry is success, not an error.
         assert_eq!(remove_secret_if_present(name), Ok(false));
+    }
+
+    #[test]
+    fn every_retired_provider_is_removed() {
+        for provider in ["groq", "assemblyai", "vercel"] {
+            assert!(
+                RETIRED.contains(&provider),
+                "{provider} must be retired from Credential Manager"
+            );
+        }
     }
 }
