@@ -99,9 +99,15 @@ fn remove_secret_if_present(secret: &str) -> Result<bool, String> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Credential Manager calls from parallel test threads occasionally see
+    /// each other's in-flight writes; run the tests that touch it one at a time.
+    static CREDENTIAL_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn credential_manager_round_trip() {
+        let _guard = CREDENTIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A dedicated entry so the user's real session is never touched.
         let name = "ray-selftest-roundtrip";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
@@ -118,6 +124,7 @@ mod tests {
 
     #[test]
     fn retired_secret_migration_is_idempotent() {
+        let _guard = CREDENTIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A dedicated entry so the user's real credentials are never touched.
         let name = "ray-retired-selftest";
         let entry = keyring::Entry::new(SERVICE, name).expect("open credential");
