@@ -1,6 +1,7 @@
 {
   "api": {
-    "base_url": "https://ray.helionhq.com"
+    "base_url": "https://ray.helionhq.com",
+    "site_url": "https://ray.helionhq.com"
   },
   "known_names": [
     "Arham",

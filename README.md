@@ -10,7 +10,7 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar
 - **Streaming is always on.** Ray sends 16 kHz mono PCM to Ray's API while you talk (`/v1/stt/sync-live`, proxied to AssemblyAI Sync live), so stopping only waits for the tail and final decode (~0.5 s typical). If the live request fails, Ray falls back to Sync batch, then a server-side v2 batch proxy, using the locally buffered WAV.
 - **Cleanup** sends the transcript through Ray's OpenAI-compatible cleanup proxy (`/v1/cleanup/chat/completions`). Structured is the only mode: it rewrites for flow and can add paragraphs and lists. If cleanup fails, the raw transcript is pasted rather than lost.
 - **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard. Restore timing is adaptive (longer for Electron, Office, and browsers) and is skipped if anything else changed the clipboard meanwhile, so slow targets never paste the old contents. Transient dictation text is excluded from Win+V clipboard history and cloud clipboard. If the focused window is elevated, Ray says so instead of silently failing.
-- **History**, **dictionary**, **account**, and **settings** live in a monochrome Notion/Linear-style window. Closing it hides it; Ray stays in the tray.
+- **History**, **dictionary**, **account**, and **settings** live in a monochrome Notion/Linear-style window. Closing it hides it; Ray stays in the tray. History is kept locally on this PC. Ray's servers never store or log your audio or transcripts; cleanup sends the transcript, your dictionary terms, and the foreground app's name to AssemblyAI for processing.
 - The bar is always-on-top, click-through, non-focusable, hidden from the taskbar, and sits above the taskbar of the monitor with the focused window.
 
 ## Requirements
@@ -59,12 +59,16 @@ Vercel, and Groq integrations.
 ### Local development
 
 The API origin is `api.base_url` in `src-tauri/config/pipeline.json`
-(`https://ray.helionhq.com`). Point it at Wrangler with either a runtime
-override or the environment:
+(`https://ray.helionhq.com`) and the public site origin is `api.site_url`
+(which defaults to the effective API origin). Point them at Wrangler with
+either a runtime override or the environment:
 
 ```sh
-RAY_API_BASE=http://127.0.0.1:8787 pnpm tauri dev
+RAY_API_BASE=http://127.0.0.1:8787 RAY_SITE_URL=http://127.0.0.1:8787 pnpm tauri dev
 ```
+
+`RAY_SITE_URL` controls only the browser sign-in hand-off (`/desktop/sign-in`);
+the device token still goes to `RAY_API_BASE`.
 
 `RAY_DEVICE_TOKEN` is accepted as a development fallback when no stored session
 exists (debug builds, or any headless selftest). It is ignored by release
@@ -85,11 +89,24 @@ Every request uses `Authorization: Bearer ray_…` and goes to the same origin:
 | sign-in | `POST {api}/api/desktop/token`, `POST {api}/api/desktop/signout` |
 | billing | `POST {api}/api/billing/checkout`, `POST {api}/api/billing/portal` |
 
-Quota and auth errors stop a dictation immediately and never fall back to the
-batch endpoint or retry cleanup: `402 quota_exceeded` (Starter weekly limit),
-`429 fair_use` (Pro fair-use cap), `401 unauthorized` (the local session is
-cleared and the app asks you to sign in). If the cached account already says
-Starter is at its limit, Ray refuses to start recording and opens Account.
+Errors are classified by their JSON `error` code, never by HTTP status alone,
+because the Worker maps upstream failures to `502 upstream_error` /
+`503 upstream_busy` and enforces a per-user STT concurrency cap with
+`429 too_many_requests`. Only these codes change the dictation flow:
+
+- `402 quota_exceeded` (Starter weekly limit) and `429 fair_use` (Pro fair-use
+  cap) skip the batch fallback and show the limit message. Whatever was already
+  transcribed is still pasted and saved in History, including a live session
+  that hit the limit on a later rollover segment.
+- `401 unauthorized` clears the local session and asks you to sign in.
+- `upstream_error`, `upstream_busy`, `too_many_requests`, and every other code
+  follow the normal fallback path. Cleanup failures of any kind (including
+  402/429/403 `no_cleanup_grant`) paste the raw transcript instead of losing it.
+
+If the cached account already says Starter is at its limit, Ray refuses to
+start recording and opens Account — unless the cached week has already reset,
+in which case it refreshes `/api/me` first (and allows the recording if that
+refresh fails).
 
 ## Swapping the prompt or models
 

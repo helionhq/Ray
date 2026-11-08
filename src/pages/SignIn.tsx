@@ -55,8 +55,9 @@ export function SignInScreen() {
         <RayLogo />
         <h1>Sign in to start dictating</h1>
         <p className="signin-copy">
-          Ray uses your account for transcription and cleanup. Your audio and
-          text are never stored.
+          Ray uses your account for transcription and cleanup. Ray's servers
+          never store your audio or transcripts, and your History stays on this
+          PC.
         </p>
 
         {phase === "waiting" ? (

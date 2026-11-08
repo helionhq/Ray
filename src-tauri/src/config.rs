@@ -73,12 +73,17 @@ pub fn default_stt_prompt() -> String {
 #[serde(default)]
 pub struct ApiConfig {
     pub base_url: String,
+    /// The public site origin used for the browser sign-in hand-off. Defaults
+    /// to the effective API origin, so `RAY_API_BASE` development points the
+    /// sign-in page at the same local Worker.
+    pub site_url: Option<String>,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_API_BASE.into(),
+            site_url: None,
         }
     }
 }
@@ -93,6 +98,17 @@ pub fn resolve_api_base(configured: &str, env: Option<&str>) -> String {
             (!configured.is_empty()).then_some(configured)
         })
         .unwrap_or(DEFAULT_API_BASE);
+    value.trim_end_matches('/').to_string()
+}
+
+/// Resolve the public site origin: `RAY_SITE_URL` wins, then `api.site_url`,
+/// then the effective API origin.
+pub fn resolve_site_url(configured: Option<&str>, env: Option<&str>, api_base: &str) -> String {
+    let value = env
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| configured.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or(api_base);
     value.trim_end_matches('/').to_string()
 }
 
@@ -114,6 +130,16 @@ impl PipelineConfig {
         resolve_api_base(
             &self.api.base_url,
             std::env::var("RAY_API_BASE").ok().as_deref(),
+        )
+    }
+
+    /// The public site origin for `/desktop/sign-in`, with `RAY_SITE_URL`
+    /// taking precedence.
+    pub fn site_url(&self) -> String {
+        resolve_site_url(
+            self.api.site_url.as_deref(),
+            std::env::var("RAY_SITE_URL").ok().as_deref(),
+            &self.api_base(),
         )
     }
 }
@@ -265,7 +291,7 @@ impl RuntimeConfig {
         let pipeline_override = app_data.join("pipeline.json");
         let prompt_override = app_data.join("structured.md");
 
-        let pipeline = match std::fs::read_to_string(&pipeline_override) {
+        let mut pipeline = match std::fs::read_to_string(&pipeline_override) {
             Ok(text) => match serde_json::from_str::<PipelineConfig>(&text) {
                 Ok(config) => config,
                 Err(error) => {
@@ -275,6 +301,49 @@ impl RuntimeConfig {
             },
             Err(_) => PipelineConfig::default(),
         };
+        // A pre-launch override can name cleanup models that the Worker's
+        // allowlist no longer accepts. Passing them through would fail every
+        // cleanup forever with no UI to fix it, so keep only the shipped
+        // models and fall back to the built-in provider when none survive.
+        let defaults = PipelineConfig::default();
+        let allowed: Vec<String> = defaults
+            .cleanup
+            .providers
+            .iter()
+            .map(|provider| provider.model.to_lowercase())
+            .collect();
+        let ignored: Vec<String> = pipeline
+            .cleanup
+            .providers
+            .iter()
+            .filter(|provider| !allowed.contains(&provider.model.to_lowercase()))
+            .map(|provider| provider.model.clone())
+            .collect();
+        if !ignored.is_empty() {
+            eprintln!(
+                "[ray] ignoring cleanup model(s) that are not built in: {}; using the shipped model",
+                ignored.join(", ")
+            );
+        }
+        pipeline
+            .cleanup
+            .providers
+            .retain(|provider| allowed.contains(&provider.model.to_lowercase()));
+        // Use the built-in spelling so a differently-cased override cannot be
+        // rejected by the Worker's exact allowlist.
+        for provider in &mut pipeline.cleanup.providers {
+            if let Some(canonical) = defaults
+                .cleanup
+                .providers
+                .iter()
+                .find(|builtin| builtin.model.eq_ignore_ascii_case(&provider.model))
+            {
+                provider.model = canonical.model.clone();
+            }
+        }
+        if pipeline.cleanup.providers.is_empty() {
+            pipeline.cleanup.providers = defaults.cleanup.providers;
+        }
 
         let prompt = match std::fs::read_to_string(&prompt_override) {
             Ok(text) if !text.trim().is_empty() => text,
@@ -301,6 +370,7 @@ mod tests {
     fn embedded_pipeline_parses_and_matches_the_recommendation() {
         let config = PipelineConfig::default();
         assert_eq!(config.api.base_url, DEFAULT_API_BASE);
+        assert_eq!(config.api.site_url.as_deref(), Some(DEFAULT_API_BASE));
         assert_eq!(config.stt.sync_live.model, "universal-3-5-pro");
         assert_eq!(config.stt.batch.model, "universal-3-5-pro");
         assert_eq!(config.cleanup.providers[0].id, "ray");
@@ -335,6 +405,48 @@ mod tests {
             "https://example.test"
         );
         assert_eq!(resolve_api_base("", None), DEFAULT_API_BASE);
+    }
+
+    #[test]
+    fn site_url_env_and_config_fall_back_to_the_api_origin() {
+        assert_eq!(
+            resolve_site_url(None, None, "https://ray.helionhq.com"),
+            "https://ray.helionhq.com"
+        );
+        assert_eq!(
+            resolve_site_url(Some("https://ray.example/"), None, "https://api.example"),
+            "https://ray.example"
+        );
+        assert_eq!(
+            resolve_site_url(
+                Some("https://ray.example"),
+                Some("http://127.0.0.1:8787/"),
+                "https://api.example"
+            ),
+            "http://127.0.0.1:8787"
+        );
+        // Blank values fall through to the API origin.
+        assert_eq!(
+            resolve_site_url(Some("   "), Some(""), "https://api.example"),
+            "https://api.example"
+        );
+    }
+
+    #[test]
+    fn runtime_override_can_set_the_site_origin() {
+        let dir = temp_dir("site-url");
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"api":{"base_url":"http://127.0.0.1:8787","site_url":"https://ray.example"}}"#,
+        )
+        .unwrap();
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.pipeline.api.base_url, "http://127.0.0.1:8787");
+        assert_eq!(
+            runtime.pipeline.api.site_url.as_deref(),
+            Some("https://ray.example")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -374,15 +486,47 @@ mod tests {
 
         let runtime = RuntimeConfig::load(&dir);
         assert_eq!(runtime.pipeline.cleanup.max_tokens, 1_500);
-        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
-        assert_eq!(
-            runtime.pipeline.cleanup.providers[0].model,
-            "claude-sonnet-4-5"
-        );
+        // The legacy model is not in the built-in allowlist, so it is ignored
+        // instead of failing every cleanup forever.
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "ray");
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
         // A missing `api` object gets the default origin.
         assert_eq!(runtime.pipeline.api.base_url, DEFAULT_API_BASE);
         // Removed STT fields are simply absent; the surviving defaults apply.
         assert_eq!(runtime.pipeline.stt.sample_rate, 16_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_cleanup_models_are_filtered_against_the_built_in_list() {
+        let dir = temp_dir("legacy-models");
+        // One old model plus one shipped model: keep the shipped one only.
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"cleanup":{"providers":[
+                {"id":"old","model":"claude-sonnet-4-5"},
+                {"id":"ray","model":"GEMMA-4-31B"}
+            ]}}"#,
+        )
+        .unwrap();
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "ray");
+        // Matched case-insensitively and rewritten to the built-in spelling.
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // No allowlisted model at all: the shipped provider is restored.
+        let dir = temp_dir("legacy-models-none");
+        std::fs::write(
+            dir.join("pipeline.json"),
+            r#"{"cleanup":{"providers":[{"id":"a","model":"gpt-oss-120b"}]}}"#,
+        )
+        .unwrap();
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
         std::fs::remove_dir_all(&dir).ok();
     }
 

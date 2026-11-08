@@ -39,6 +39,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("history");
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [activatingPro, setActivatingPro] = useState(false);
   const updater = useUpdater();
   const refreshedAccount = useRef(false);
 
@@ -82,6 +83,9 @@ export default function App() {
       }),
       // Sign-in, sign-out, billing, and pipeline quota refreshes all land here.
       onEvent("account-changed", () => void refresh()),
+      // Decision 16: billing completion polls in the background; show the
+      // state until the plan flips to Pro (or the poll gives up).
+      onEvent<boolean>("billing-activating", (active) => setActivatingPro(active)),
     ];
     // Refresh the account on window focus, as the contract expects, so a
     // browsing round-trip (or a checkout in another window) is reflected as
@@ -114,6 +118,30 @@ export default function App() {
     void api.refreshAccount().catch(() => {});
   }, [snapshot?.auth.signed_in, snapshot?.auth.account]);
 
+  // Decision 15: refresh /api/me at the weekly reset boundary while the app
+  // runs, so cached usage from last week never blocks the first dictation of
+  // the new week. Re-armed whenever the reported reset time changes.
+  useEffect(() => {
+    const resetsAt = snapshot?.auth.account?.usage.resets_at;
+    if (!resetsAt) return;
+    const reset = new Date(resetsAt).getTime();
+    if (!Number.isFinite(reset)) return;
+    // A week is well inside setTimeout's 32-bit range; the extra second makes
+    // sure the server has crossed the boundary too.
+    const delay = Math.min(Math.max(0, reset - Date.now()) + 1_000, 7 * 24 * 60 * 60 * 1_000);
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          await api.refreshAccount();
+        } catch {
+          // Offline: the server remains authoritative at the next attempt.
+        }
+        await refresh();
+      })();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [snapshot?.auth.account?.usage.resets_at, refresh]);
+
   // Apply the store's theme before the snapshot paints, so a chosen theme
   // never flickers on a state refresh.
   const theme = snapshot?.settings.theme;
@@ -144,7 +172,10 @@ export default function App() {
     );
   }
 
-  if (!snapshot) {
+  // `auth.loaded` is false until the stored session has been read off the
+  // startup thread. Staying on the loading screen prevents a signed-in user
+  // from seeing the sign-in screen flash.
+  if (!snapshot || !snapshot.auth.loaded) {
     return (
       <div className="boot-screen">
         <TitleBar />
@@ -226,7 +257,12 @@ export default function App() {
             <DictionaryPage snapshot={snapshot} refresh={refresh} notify={notify} />
           )}
           {page === "account" && (
-            <AccountPage snapshot={snapshot} refresh={refresh} notify={notify} />
+            <AccountPage
+              snapshot={snapshot}
+              refresh={refresh}
+              notify={notify}
+              activatingPro={activatingPro}
+            />
           )}
           {page === "settings" && (
             <SettingsPage

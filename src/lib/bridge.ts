@@ -47,7 +47,8 @@ export interface Settings {
 
 export interface AccountUser {
   id: string;
-  email: string;
+  /** null when the server has no email for the account. */
+  email: string | null;
   name: string | null;
 }
 
@@ -66,11 +67,15 @@ export interface Account {
   status: string | null;
   cancel_at_period_end: boolean;
   current_period_end: string | null;
+  /** A subscription that needs a payment-method fix. */
+  billing_issue: "past_due" | "unpaid" | "paused" | string | null;
   usage: Usage;
 }
 
 export interface AuthState {
   signed_in: boolean;
+  /** False until the stored session has been read from Credential Manager. */
+  loaded: boolean;
   account: Account | null;
 }
 

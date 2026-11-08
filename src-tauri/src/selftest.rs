@@ -178,21 +178,40 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                     // Mirror the app: a failed live request falls back to the
                     // batch endpoint rather than losing the dictation.
                     eprintln!("[selftest] streaming failed: {error}; falling back to batch");
+                    let partial = error.partial.clone();
                     let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
                     let fallback_started = Instant::now();
-                    let text = match stt::transcribe_wav(
-                        &http,
-                        &api_base,
-                        &token,
-                        &keyterms,
-                        wav_bytes,
-                        &config.stt,
+                    let mut used_partial = false;
+                    // Both sequential fallbacks share the shipping budget.
+                    let text = match tokio::time::timeout(
+                        stt::batch_time_budget(&config.stt),
+                        stt::transcribe_wav(
+                            &http,
+                            &api_base,
+                            &token,
+                            &keyterms,
+                            wav_bytes,
+                            &config.stt,
+                        ),
                     )
                     .await
                     {
-                        Ok(text) => text,
-                        Err(error) => {
-                            eprintln!("[selftest] batch transcription failed: {error}");
+                        Ok(Ok(text)) => text,
+                        Ok(Err(batch_error)) => {
+                            if let Some(partial) = partial {
+                                used_partial = true;
+                                eprintln!(
+                                    "[selftest] note: live failed ({error}); batch failed \
+                                     ({batch_error}); keeping the transcribed segments"
+                                );
+                                partial
+                            } else {
+                                eprintln!("[selftest] batch transcription failed: {batch_error}");
+                                return 1;
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("[selftest] batch transcription timed out");
                             return 1;
                         }
                     };
@@ -200,25 +219,34 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                         "[selftest] timing stop_to_transcript_ms={} fallback=batch",
                         fallback_started.elapsed().as_millis()
                     );
-                    eprintln!("[selftest] note: live failed ({error}); batch succeeded");
+                    if !used_partial {
+                        eprintln!("[selftest] note: live failed ({error}); batch succeeded");
+                    }
                     text
                 }
             }
         } else {
             let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
             let stopped = Instant::now();
-            match stt::transcribe_wav(&http, &api_base, &token, &keyterms, wav_bytes, &config.stt)
-                .await
+            match tokio::time::timeout(
+                stt::batch_time_budget(&config.stt),
+                stt::transcribe_wav(&http, &api_base, &token, &keyterms, wav_bytes, &config.stt),
+            )
+            .await
             {
-                Ok(text) => {
+                Ok(Ok(text)) => {
                     println!(
                         "[selftest] timing stop_to_transcript_ms={}",
                         stopped.elapsed().as_millis()
                     );
                     text
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     eprintln!("[selftest] batch transcription failed: {error}");
+                    return 1;
+                }
+                Err(_) => {
+                    eprintln!("[selftest] batch transcription timed out");
                     return 1;
                 }
             }

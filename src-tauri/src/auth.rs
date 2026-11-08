@@ -8,16 +8,17 @@
 //! account `session`). Every API request then sends
 //! `Authorization: Bearer <device token>`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Digest;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use url::Url;
 
@@ -35,7 +36,10 @@ const URL_SAFE_NO_PAD: base64::engine::general_purpose::GeneralPurpose =
 #[serde(default)]
 pub struct AccountUser {
     pub id: String,
-    pub email: String,
+    /// `None` when the server sends `null`. The Worker now sends an empty
+    /// string when the email is unknown, but an old or partial response must
+    /// never fail the whole account load.
+    pub email: Option<String>,
     pub name: Option<String>,
 }
 
@@ -60,6 +64,9 @@ pub struct Account {
     pub status: Option<String>,
     pub cancel_at_period_end: bool,
     pub current_period_end: Option<String>,
+    /// Set when a non-entitled subscription still exists and needs a payment
+    /// method fix: "past_due", "unpaid", or "paused".
+    pub billing_issue: Option<String>,
     pub usage: Usage,
 }
 
@@ -73,11 +80,105 @@ impl Account {
                 .words_limit
                 .is_some_and(|limit| self.usage.words_used >= limit)
     }
+
+    /// True when the cached usage belongs to a week that has already reset.
+    /// Cached `words_used` must never block a new week's first dictation
+    /// (review decision 15).
+    pub fn usage_is_stale(&self) -> bool {
+        self.usage_is_stale_at(now_unix_seconds())
+    }
+
+    pub fn usage_is_stale_at(&self, now: u64) -> bool {
+        self.usage
+            .resets_at
+            .as_deref()
+            .and_then(parse_rfc3339_seconds)
+            .is_some_and(|resets_at| now >= resets_at)
+    }
+}
+
+/// Unix seconds for the current system clock.
+pub fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse the ISO-8601 UTC timestamps the Worker returns (`2026-11-09T00:00:00Z`)
+/// without pulling in a date-time dependency. Fractional seconds and explicit
+/// `±HH:MM` offsets are accepted; anything else is treated as unknown.
+pub fn parse_rfc3339_seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    // Every accepted component is ASCII, so this also guarantees the byte
+    // slices below fall on character boundaries.
+    if value.len() < 20 || !value.is_ascii() {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        std::str::from_utf8(&bytes[range]).ok()?.parse::<i64>().ok()
+    };
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let mut rest = &value[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &fraction[digits..];
+    }
+    let offset_seconds = match rest {
+        "Z" | "z" => 0i64,
+        _ if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) => {
+            let sign = if rest.starts_with('-') { -1 } else { 1 };
+            let hours = rest[1..3].parse::<i64>().ok()?;
+            let minutes = rest[4..6].parse::<i64>().ok()?;
+            if rest.as_bytes()[3] != b':' || hours > 23 || minutes > 59 {
+                return None;
+            }
+            sign * (hours * 3_600 + minutes * 60)
+        }
+        _ => return None,
+    };
+    // Days from 1970-01-01 (Howard Hinnant's civil-date algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_seconds;
+    u64::try_from(seconds).ok()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AuthState {
     pub signed_in: bool,
+    /// False until the stored token has been read off the startup thread. The
+    /// UI shows its loading screen instead of a signed-out flash while false.
+    pub loaded: bool,
     pub account: Option<Account>,
 }
 
@@ -94,15 +195,57 @@ pub struct Auth {
     /// Bumped on cancel/sign-out so an in-flight callback cannot resurrect a
     /// session the user abandoned.
     generation: AtomicU64,
+    /// Set once the credential store has been read (on a background thread).
+    loaded: AtomicBool,
+    /// Written before a sign-out clears the credential. If Credential Manager
+    /// deletion fails, the next launch still sees this marker and does not
+    /// resurrect the token.
+    signed_out_marker: Option<PathBuf>,
 }
 
 impl Auth {
-    pub fn load() -> Self {
+    /// Build an auth state without touching the credential store. Call
+    /// [`Auth::load_stored_token`] from a background thread, then emit
+    /// `account-changed` so the UI leaves its loading state.
+    pub fn new(signed_out_marker: Option<PathBuf>) -> Self {
         Self {
-            token: Mutex::new(secrets::device_token()),
+            token: Mutex::new(None),
             account: Mutex::new(None),
             pending: Mutex::new(None),
             generation: AtomicU64::new(0),
+            loaded: AtomicBool::new(false),
+            signed_out_marker,
+        }
+    }
+
+    /// Read the stored device token, unless a durable signed-out marker says
+    /// the previous sign-out could not finish. Blocking; call off the main
+    /// thread.
+    pub fn load_stored_token(&self) {
+        let signed_out = self
+            .signed_out_marker
+            .as_ref()
+            .is_some_and(|path| path.exists());
+        if !signed_out {
+            if let Some(token) = secrets::device_token() {
+                *self.token.lock().unwrap_or_else(|error| error.into_inner()) = Some(token);
+            }
+        }
+        self.loaded.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.loaded.load(Ordering::SeqCst)
+    }
+
+    /// Wait briefly for the background credential read. Deep links (and the
+    /// first hotkey press) can arrive before startup finishes; treating that
+    /// moment as signed out would drop a `ray://billing/success` or refuse to
+    /// record for a signed-in user.
+    pub async fn wait_loaded(&self, timeout: Duration) {
+        let started = Instant::now();
+        while !self.is_loaded() && started.elapsed() < timeout {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -127,16 +270,19 @@ impl Auth {
     pub fn state(&self) -> AuthState {
         AuthState {
             signed_in: self.is_signed_in(),
+            loaded: self.is_loaded(),
             account: self.account(),
         }
     }
 
-    /// Start a browser sign-in. The returned URL is safe to open externally.
-    pub fn begin_sign_in(&self, api_base: &str) -> Result<String, String> {
+    /// Start a browser sign-in. `site_url` is the public site origin (not the
+    /// API origin; it may differ in production). The returned URL is safe to
+    /// open externally.
+    pub fn begin_sign_in(&self, site_url: &str) -> Result<String, String> {
         let state = random_token(32);
         let verifier = random_token(32);
         let challenge = challenge_for(&verifier);
-        let sign_in_url = api::endpoint(api_base, "/desktop/sign-in");
+        let sign_in_url = api::endpoint(site_url, "/desktop/sign-in");
         let mut url = Url::parse(&sign_in_url)
             .map_err(|error| format!("Invalid Ray sign-in URL: {error}"))?;
         url.query_pairs_mut()
@@ -183,6 +329,8 @@ impl Auth {
             return Err("Ray returned an empty session token".into());
         }
         secrets::save_device_token(&token)?;
+        self.clear_signed_out_marker();
+        self.loaded.store(true, Ordering::SeqCst);
         *self.token.lock().unwrap_or_else(|error| error.into_inner()) = Some(token);
         *self
             .account
@@ -198,9 +346,13 @@ impl Auth {
             .unwrap_or_else(|error| error.into_inner()) = Some(account);
     }
 
-    /// Clear the local session. Used by sign-out and by a 401 from any API.
+    /// Clear the local session. Used by an explicit sign-out and by a 401 from
+    /// a request made with the current token.
     pub fn sign_out_local(&self) {
         self.cancel_sign_in();
+        // Persist the intent before touching Credential Manager: if the delete
+        // fails, the marker still stops the next launch from signing back in.
+        self.write_signed_out_marker();
         *self.token.lock().unwrap_or_else(|error| error.into_inner()) = None;
         *self
             .account
@@ -211,7 +363,50 @@ impl Auth {
         }
     }
 
-    /// The bar/pipeline check before recording starts.
+    /// Clear the session only if `token` is still the current one. A slow 401
+    /// from an old request must never sign out a session the user has since
+    /// replaced by signing in again.
+    pub fn sign_out_if_token(&self, token: &str) -> bool {
+        let mut current = self.token.lock().unwrap_or_else(|error| error.into_inner());
+        if current.as_deref() != Some(token) {
+            return false;
+        }
+        self.cancel_sign_in();
+        self.write_signed_out_marker();
+        *current = None;
+        drop(current);
+        *self
+            .account
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        if let Err(error) = secrets::clear_device_token() {
+            eprintln!("[ray] could not clear the Ray session: {error}");
+        }
+        true
+    }
+
+    fn write_signed_out_marker(&self) {
+        if let Some(path) = &self.signed_out_marker {
+            if let Err(error) = std::fs::write(path, b"signed out\n") {
+                eprintln!("[ray] could not persist the signed-out marker: {error}");
+            }
+        }
+    }
+
+    fn clear_signed_out_marker(&self) {
+        if let Some(path) = &self.signed_out_marker {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("[ray] could not remove the signed-out marker: {error}"),
+            }
+        }
+    }
+
+    /// The cached bar/pipeline check. The pipeline uses
+    /// `Dictation::block_reason_fresh`, which also handles a stale week; this
+    /// remains as the synchronous primitive its tests exercise.
+    #[cfg(test)]
     pub fn block_reason(&self) -> Option<&'static str> {
         if !self.is_signed_in() {
             return Some("Sign in to Ray to dictate");
@@ -305,6 +500,7 @@ pub enum DeepLinkOutcome {
 /// Handle a deep link on the Rust side. `Ok(Ignored)` means the URL was not a
 /// Ray auth/billing route.
 pub async fn handle_deep_link(
+    app: &AppHandle,
     auth: &Auth,
     http: &reqwest::Client,
     api_base: &str,
@@ -323,15 +519,22 @@ pub async fn handle_deep_link(
                 .await
                 .map_err(|error| error.to_string())?;
             // Cancel (or sign-out) raced the exchange: do not resurrect the
-            // session the user abandoned.
+            // session the user abandoned, and revoke the token we will not
+            // keep so it does not outlive the attempt.
             if auth.generation.load(Ordering::SeqCst) != generation {
+                signout(http, api_base, &token).await;
                 return Err("Sign-in was cancelled.".into());
             }
-            auth.complete_sign_in(token)?;
+            if let Err(error) = auth.complete_sign_in(token.clone()) {
+                // The token is valid but could not be stored; revoke it
+                // rather than leaving an orphaned credential on the server.
+                signout(http, api_base, &token).await;
+                return Err(error);
+            }
             match fetch_me(http, api_base, &auth.token().unwrap_or_default()).await {
                 Ok(account) => auth.set_account(account),
                 Err(error) if error.kind == ApiErrorKind::Unauthorized => {
-                    auth.sign_out_local();
+                    auth.sign_out_if_token(&token);
                     return Err(error.to_string());
                 }
                 // Signed in, but the account summary can be fetched later.
@@ -343,15 +546,69 @@ pub async fn handle_deep_link(
             if !auth.is_signed_in() {
                 return Ok(DeepLinkOutcome::Ignored);
             }
-            match refresh(auth, http, api_base).await {
-                Ok(state) => Ok(DeepLinkOutcome::Changed(Box::new(state))),
-                Err(error) => {
-                    eprintln!("[ray] could not refresh the account after billing: {error}");
-                    Ok(DeepLinkOutcome::Changed(Box::new(auth.state())))
-                }
-            }
+            // Creem's webhook can land a moment after the browser redirect, so
+            // poll instead of trusting one immediate `/api/me`.
+            Ok(DeepLinkOutcome::Changed(Box::new(
+                poll_for_pro(app, auth, http, api_base).await,
+            )))
         }
     }
+}
+
+/// Decision 16: poll `/api/me` at 1 s, 2 s, 4 s, … for ~45 s after billing,
+/// stopping as soon as the plan is Pro. `billing-activating` tells the Account
+/// page to show "Activating Pro…" for the duration.
+async fn poll_for_pro(
+    app: &AppHandle,
+    auth: &Auth,
+    http: &reqwest::Client,
+    api_base: &str,
+) -> AuthState {
+    const DELAYS_MS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 14_000];
+    let Some(token) = auth.token() else {
+        return auth.state();
+    };
+    emit_billing_activating(app, true);
+    // Make the "Activating Pro…" state visible even if the user was on
+    // another page (or the window was in the tray) when the browser bounced
+    // back.
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit_to("main", "navigate", "account");
+    let mut state = auth.state();
+    for delay in DELAYS_MS {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        if auth.token().as_deref() != Some(token.as_str()) {
+            break;
+        }
+        match fetch_me(http, api_base, &token).await {
+            Ok(account) => {
+                let is_pro = account.plan.eq_ignore_ascii_case("pro");
+                auth.set_account(account);
+                state = auth.state();
+                emit_account_changed(app, &state);
+                if is_pro {
+                    break;
+                }
+            }
+            Err(error) if error.kind == ApiErrorKind::Unauthorized => {
+                auth.sign_out_if_token(&token);
+                state = auth.state();
+                emit_account_changed(app, &state);
+                break;
+            }
+            Err(error) => eprintln!("[ray] could not refresh the account after billing: {error}"),
+        }
+    }
+    emit_billing_activating(app, false);
+    state
+}
+
+fn emit_billing_activating(app: &AppHandle, active: bool) {
+    let _ = app.emit("billing-activating", active);
 }
 
 pub async fn exchange_code(
@@ -437,7 +694,8 @@ pub async fn refresh(
             Ok(auth.state())
         }
         Err(error) if error.kind == ApiErrorKind::Unauthorized => {
-            auth.sign_out_local();
+            // Only the token this request actually used may be cleared.
+            auth.sign_out_if_token(&token);
             Err(error)
         }
         Err(error) => Err(error),
@@ -478,14 +736,7 @@ async fn billing_url(
         ApiError::other(format!("Could not read the billing response: {error}"))
     })?;
     if !status.is_success() {
-        return Err(
-            ApiError::from_response(status.as_u16(), &text).unwrap_or_else(|| {
-                ApiError::other(format!(
-                    "Ray could not open billing (HTTP {status}): {}",
-                    api::message_from_body(&text)
-                ))
-            }),
-        );
+        return Err(ApiError::from_http(status.as_u16(), &text));
     }
     let value: Value = serde_json::from_str(&text)
         .map_err(|error| ApiError::other(format!("Ray sent invalid JSON: {error}")))?;
@@ -496,10 +747,10 @@ async fn billing_url(
         .ok_or_else(|| ApiError::other("Ray returned no billing URL"))
 }
 
-/// Common handling for checkout and the portal: a 401 clears the local session.
-fn billing_error(app: &AppHandle, auth: &Auth, error: ApiError) -> String {
-    if error.kind == ApiErrorKind::Unauthorized {
-        auth.sign_out_local();
+/// Common handling for checkout and the portal: a 401 clears that request's
+/// session (only if its token is still the current one).
+fn billing_error(app: &AppHandle, auth: &Auth, token: &str, error: ApiError) -> String {
+    if error.kind == ApiErrorKind::Unauthorized && auth.sign_out_if_token(token) {
         emit_account_changed(app, &auth.state());
     }
     error.to_string()
@@ -509,10 +760,35 @@ fn emit_account_changed(app: &AppHandle, state: &AuthState) {
     let _ = app.emit("account-changed", state.clone());
 }
 
+/// Billing URLs come from the server, but opening an arbitrary scheme in the
+/// system browser is still a dangerous primitive. Production allows HTTPS
+/// only; debug builds also allow a local billing test page.
+pub fn billing_url_is_safe(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() == "https" {
+        return true;
+    }
+    if cfg!(debug_assertions) && parsed.scheme() == "http" {
+        return parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"));
+    }
+    false
+}
+
 fn open_browser(app: &AppHandle, url: &str) -> Result<(), String> {
     app.opener()
         .open_url(url, None::<&str>)
         .map_err(|error| format!("Could not open your browser: {error}"))
+}
+
+fn open_billing_url(app: &AppHandle, url: &str) -> Result<(), String> {
+    if !billing_url_is_safe(url) {
+        return Err("Ray returned an unsafe billing URL; not opening it.".into());
+    }
+    open_browser(app, url)
 }
 
 // ---------------------------------------------------------------------------
@@ -532,7 +808,7 @@ pub async fn sign_in(
     auth: State<'_, Arc<Auth>>,
     dictation: State<'_, Arc<Dictation>>,
 ) -> Result<(), String> {
-    let url = auth.begin_sign_in(&dictation.api_base())?;
+    let url = auth.begin_sign_in(&dictation.site_url())?;
     if let Err(error) = open_browser(&app, &url) {
         auth.cancel_sign_in();
         return Err(error);
@@ -590,7 +866,7 @@ pub async fn open_checkout(
     let token = auth
         .token()
         .ok_or_else(|| "Sign in to Ray first.".to_string())?;
-    let url = billing_url(
+    let url = match billing_url(
         dictation.http(),
         &dictation.api_base(),
         &token,
@@ -598,8 +874,40 @@ pub async fn open_checkout(
         Some(json!({ "interval": interval })),
     )
     .await
-    .map_err(|error| billing_error(&app, &auth, error))?;
-    open_browser(&app, &url)
+    {
+        Ok(url) => url,
+        Err(error) if error.code.as_deref() == Some("already_subscribed") => {
+            // Refresh so the Account page shows Pro, and tell the user why
+            // checkout did not open.
+            if let Ok(state) = refresh(&auth, dictation.http(), &dictation.api_base()).await {
+                emit_account_changed(&app, &state);
+            } else {
+                emit_account_changed(&app, &auth.state());
+            }
+            return Err("You're already on Pro.".into());
+        }
+        Err(error) if error.code.as_deref() == Some("billing_issue") => {
+            // Decision 9: the account needs a payment-method fix, so send the
+            // user to the portal instead of a second checkout.
+            if let Ok(state) = refresh(&auth, dictation.http(), &dictation.api_base()).await {
+                emit_account_changed(&app, &state);
+            }
+            let portal = billing_url(
+                dictation.http(),
+                &dictation.api_base(),
+                &token,
+                "/api/billing/portal",
+                None,
+            )
+            .await;
+            if let Ok(portal) = portal {
+                open_billing_url(&app, &portal)?;
+            }
+            return Err("Payment issue: update your card in the billing portal.".into());
+        }
+        Err(error) => return Err(billing_error(&app, &auth, &token, error)),
+    };
+    open_billing_url(&app, &url)
 }
 
 #[tauri::command]
@@ -619,8 +927,8 @@ pub async fn open_billing_portal(
         None,
     )
     .await
-    .map_err(|error| billing_error(&app, &auth, error))?;
-    open_browser(&app, &url)
+    .map_err(|error| billing_error(&app, &auth, &token, error))?;
+    open_billing_url(&app, &url)
 }
 
 /// Re-read the account and tell every window. Used by the pipeline after a
@@ -669,12 +977,7 @@ mod tests {
     }
 
     fn auth_with_pending() -> Auth {
-        let auth = Auth {
-            token: Mutex::new(None),
-            account: Mutex::new(None),
-            pending: Mutex::new(None),
-            generation: AtomicU64::new(0),
-        };
+        let auth = Auth::new(None);
         auth.begin_sign_in("https://ray.example").expect("url");
         auth
     }
@@ -763,12 +1066,7 @@ mod tests {
 
     #[test]
     fn sign_in_url_carries_state_and_challenge() {
-        let auth = Auth {
-            token: Mutex::new(None),
-            account: Mutex::new(None),
-            pending: Mutex::new(None),
-            generation: AtomicU64::new(0),
-        };
+        let auth = Auth::new(None);
         let raw = auth
             .begin_sign_in("https://ray.helionhq.com")
             .expect("sign-in url");
@@ -820,13 +1118,142 @@ mod tests {
     }
 
     #[test]
+    fn an_account_with_a_null_or_empty_email_still_loads() {
+        let null_email: Account = serde_json::from_str(
+            r#"{"user":{"id":"user_1","email":null,"name":null},"plan":"starter"}"#,
+        )
+        .expect("null email must deserialize");
+        assert_eq!(null_email.user.email, None);
+
+        // The Worker now sends "" for an unknown email; keep that too.
+        let empty_email: Account =
+            serde_json::from_str(r#"{"user":{"id":"user_1","email":""},"plan":"starter"}"#)
+                .expect("empty email must deserialize");
+        assert_eq!(empty_email.user.email.as_deref(), Some(""));
+
+        let issue: Account = serde_json::from_str(
+            r#"{"plan":"starter","billing_issue":"past_due","user":{"id":"u","email":"a@b.com"}}"#,
+        )
+        .expect("billing_issue must deserialize");
+        assert_eq!(issue.billing_issue.as_deref(), Some("past_due"));
+        let none: Account = serde_json::from_str(r#"{"plan":"pro","billing_issue":null}"#).unwrap();
+        assert_eq!(none.billing_issue, None);
+    }
+
+    #[test]
+    fn cached_usage_is_stale_once_the_reset_time_passes() {
+        // 2026-11-09T00:00:00Z
+        let reset = 1_794_182_400u64;
+        let account = Account {
+            plan: "starter".into(),
+            usage: Usage {
+                words_used: 1_000,
+                words_limit: Some(1_000),
+                resets_at: Some("2026-11-09T00:00:00Z".into()),
+                ..Usage::default()
+            },
+            ..Account::default()
+        };
+        assert!(!account.usage_is_stale_at(reset - 1));
+        assert!(account.usage_is_stale_at(reset));
+        assert!(account.usage_is_stale_at(reset + 60));
+        // Missing or unparseable timestamps are not treated as stale.
+        let mut missing = account.clone();
+        missing.usage.resets_at = None;
+        assert!(!missing.usage_is_stale_at(reset));
+        missing.usage.resets_at = Some("not a date".into());
+        assert!(!missing.usage_is_stale_at(reset));
+    }
+
+    #[test]
+    fn rfc3339_parsing_handles_offsets_and_fractions() {
+        assert_eq!(
+            parse_rfc3339_seconds("2026-11-09T00:00:00Z"),
+            Some(1_794_182_400)
+        );
+        assert_eq!(
+            parse_rfc3339_seconds("2026-11-09T00:00:00.000Z"),
+            Some(1_794_182_400)
+        );
+        // 01:00+01:00 is the same instant as 00:00Z.
+        assert_eq!(
+            parse_rfc3339_seconds("2026-11-09T01:00:00+01:00"),
+            Some(1_794_182_400)
+        );
+        assert_eq!(parse_rfc3339_seconds(""), None);
+        assert_eq!(parse_rfc3339_seconds("2026-13-09T00:00:00Z"), None);
+        assert_eq!(parse_rfc3339_seconds("2026-11-09 00:00:00Z"), None);
+    }
+
+    #[test]
+    fn a_401_only_clears_the_token_that_made_the_request() {
+        let auth = Auth::new(None);
+        *auth.token.lock().unwrap() = Some("ray_new".into());
+        auth.set_account(Account::default());
+
+        // A stale request with the old token must not sign the user out.
+        assert!(!auth.sign_out_if_token("ray_old"));
+        assert_eq!(auth.token().as_deref(), Some("ray_new"));
+        assert!(auth.account().is_some());
+
+        // The token that made the request does clear it.
+        assert!(auth.sign_out_if_token("ray_new"));
+        assert_eq!(auth.token(), None);
+        assert!(auth.account().is_none());
+        // A second 401 for the same old token is a no-op.
+        assert!(!auth.sign_out_if_token("ray_new"));
+    }
+
+    #[test]
+    fn sign_out_marker_prevents_a_failed_credential_delete_from_signing_back_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "ray-auth-marker-test-{}-{}",
+            std::process::id(),
+            random_token(6)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("signed-out");
+        let auth = Auth::new(Some(marker.clone()));
+        auth.sign_out_local();
+        assert!(marker.exists(), "sign-out must persist its intent");
+
+        // Even if a token is still readable from Credential Manager, a later
+        // launch must stay signed out.
+        let reloaded = Auth::new(Some(marker.clone()));
+        reloaded.load_stored_token();
+        assert!(reloaded.is_loaded());
+        assert!(!reloaded.is_signed_in());
+
+        // A successful sign-in removes the marker.
+        reloaded.complete_sign_in("ray_fresh".into()).unwrap();
+        assert!(!marker.exists());
+        assert_eq!(reloaded.token().as_deref(), Some("ray_fresh"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn billing_urls_require_https_in_release_and_allow_local_debug() {
+        assert!(billing_url_is_safe("https://checkout.creem.io/session"));
+        assert!(!billing_url_is_safe("javascript:alert(1)"));
+        assert!(!billing_url_is_safe("file:///C:/Windows/System32/calc.exe"));
+        assert!(!billing_url_is_safe("not a url"));
+        // Debug builds may use a local test page, never a remote http origin.
+        assert_eq!(
+            billing_url_is_safe("http://127.0.0.1:8787/billing"),
+            cfg!(debug_assertions)
+        );
+        assert!(!billing_url_is_safe("http://example.com/billing"));
+    }
+
+    #[test]
     fn auth_state_serializes_for_the_webview() {
         let state = AuthState {
             signed_in: true,
+            loaded: true,
             account: Some(Account {
                 user: AccountUser {
                     id: "user_1".into(),
-                    email: "a@b.com".into(),
+                    email: Some("a@b.com".into()),
                     name: Some("Arham".into()),
                 },
                 plan: "starter".into(),
@@ -847,20 +1274,16 @@ mod tests {
 
     #[test]
     fn block_reason_requires_a_session_before_a_quota() {
-        let auth = Auth {
-            token: Mutex::new(None),
-            account: Mutex::new(Some(Account {
-                plan: "starter".into(),
-                usage: Usage {
-                    words_used: 1_000,
-                    words_limit: Some(1_000),
-                    ..Usage::default()
-                },
-                ..Account::default()
-            })),
-            pending: Mutex::new(None),
-            generation: AtomicU64::new(0),
-        };
+        let auth = Auth::new(None);
+        auth.set_account(Account {
+            plan: "starter".into(),
+            usage: Usage {
+                words_used: 1_000,
+                words_limit: Some(1_000),
+                ..Usage::default()
+            },
+            ..Account::default()
+        });
         assert_eq!(auth.block_reason(), Some("Sign in to Ray to dictate"));
         *auth.token.lock().unwrap() = Some("ray_test".into());
         assert_eq!(auth.block_reason(), Some("Weekly limit reached"));

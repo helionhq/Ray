@@ -26,6 +26,9 @@ use crate::windows_util;
 struct Session {
     capture: Capture,
     stream: Option<LiveSession>,
+    /// The device token this session's live request was started with. A 401
+    /// must only clear this token, never a newer one from a later sign-in.
+    token: String,
     started: Instant,
     target: Option<windows_util::Foreground>,
     keyterms: Vec<String>,
@@ -168,6 +171,15 @@ impl Dictation {
             .api_base()
     }
 
+    /// The public site origin used for the browser sign-in hand-off.
+    pub fn site_url(&self) -> String {
+        self.config
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .pipeline
+            .site_url()
+    }
+
     pub fn reload_config(&self, app_data: &Path) {
         let config = RuntimeConfig::load(app_data);
         *self
@@ -191,7 +203,7 @@ impl Dictation {
         }
         // A genuinely new session: presses from here on are no longer stale.
         self.reset_processing_window();
-        if let Some(reason) = self.auth.block_reason() {
+        if let Some(reason) = self.block_reason_fresh().await {
             self.block_dictation(reason).await;
             return;
         }
@@ -318,6 +330,7 @@ impl Dictation {
         *self.session.lock().await = Some(Session {
             capture,
             stream,
+            token,
             started,
             target,
             keyterms,
@@ -347,6 +360,7 @@ impl Dictation {
         let Session {
             capture,
             stream,
+            token: session_token,
             started,
             target,
             keyterms,
@@ -410,6 +424,14 @@ impl Dictation {
         let mut raw: Option<String> = None;
         let mut from_stream = false;
         let mut stt_error: Option<ApiError> = None;
+        // Text from live segments that completed before a failure. It is the
+        // last-resort transcript if both batch fallbacks also fail, and the
+        // required result when a later rollover segment hits the limit.
+        let mut partial: Option<String> = None;
+        // Shown after the transcript is pasted: the dictation is never lost
+        // because of a quota, auth, or cleanup failure.
+        let mut quota_notice: Option<String> = None;
+        let mut auth_notice = false;
 
         if let Some(stream) = stream {
             let timeout = Duration::from_millis(pipeline.stt.force_endpoint_timeout_ms + 5_000);
@@ -419,13 +441,40 @@ impl Dictation {
                     from_stream = true;
                 }
                 Ok(_) => eprintln!("[ray] streaming returned no text; trying batch"),
-                Err(error) if error.is_fatal() => {
-                    self.finish_with_error(error).await;
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("[ray] streaming failed; trying batch: {error}");
-                    stt_error = Some(error);
+                Err(failure) => {
+                    partial = failure.partial.clone();
+                    if failure.is_fatal() {
+                        if partial
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            // Decision 5: a later rollover segment hit quota (or
+                            // the session expired). Keep and paste what was
+                            // already transcribed, then show the reason.
+                            raw = partial.take();
+                            from_stream = true;
+                            match failure.error.kind {
+                                ApiErrorKind::Unauthorized => {
+                                    if self.auth.sign_out_if_token(&session_token) {
+                                        let _ = self.app.emit("account-changed", self.auth.state());
+                                    }
+                                    auth_notice = true;
+                                }
+                                ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+                                    quota_notice = Some(failure.error.to_string());
+                                }
+                                ApiErrorKind::Other => {}
+                            }
+                        } else {
+                            // Nothing was transcribed yet, so there is no
+                            // transcript to lose.
+                            self.finish_with_error(failure.error, &session_token).await;
+                            return;
+                        }
+                    } else {
+                        eprintln!("[ray] streaming failed; trying batch: {}", failure.error);
+                        stt_error = Some(failure.error);
+                    }
                 }
             }
         }
@@ -435,10 +484,9 @@ impl Dictation {
                 let http = self.http.clone();
                 let stt_config = pipeline.stt.clone();
                 let terms = keyterms.clone();
-                // Let Sync batch and the Worker's v2 proxy reach their own
-                // deadline; the margin only guards against a hung task.
-                let timeout =
-                    stt::batch_time_budget(&pipeline.stt).saturating_add(Duration::from_secs(15));
+                // Sync batch and the Worker's v2 proxy run sequentially; the
+                // budget covers both worst cases plus a margin.
+                let timeout = stt::batch_time_budget(&pipeline.stt);
                 match tokio::time::timeout(
                     timeout,
                     stt::transcribe_wav(&http, &api_base, &token, &terms, wav, &stt_config),
@@ -448,8 +496,30 @@ impl Dictation {
                     Ok(Ok(text)) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) if error.is_fatal() => {
-                        self.finish_with_error(error).await;
-                        return;
+                        if partial
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            // The fallback hit quota mid-dictation: never drop
+                            // the live segments that already exist.
+                            raw = partial.take();
+                            from_stream = true;
+                            match error.kind {
+                                ApiErrorKind::Unauthorized => {
+                                    if self.auth.sign_out_if_token(&token) {
+                                        let _ = self.app.emit("account-changed", self.auth.state());
+                                    }
+                                    auth_notice = true;
+                                }
+                                ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+                                    quota_notice = Some(error.to_string());
+                                }
+                                ApiErrorKind::Other => {}
+                            }
+                        } else {
+                            self.finish_with_error(error, &token).await;
+                            return;
+                        }
                     }
                     Ok(Err(error)) => {
                         eprintln!("[ray] batch transcription failed: {error}");
@@ -460,6 +530,15 @@ impl Dictation {
                         stt_error = Some(ApiError::other("timed out"));
                     }
                 }
+            }
+        }
+
+        // Both fallbacks failed, but live segments did produce text: paste
+        // that instead of reporting a failed dictation.
+        if raw.is_none() {
+            if let Some(partial) = partial.take() {
+                raw = Some(partial);
+                from_stream = true;
             }
         }
 
@@ -491,20 +570,20 @@ impl Dictation {
         let cleanup_config = &pipeline.cleanup;
         let mut text = raw_text.clone();
         let mut note: Option<String> = None;
+        let mut cleaned = false;
         if cleanup_enabled && pipeline.cleanup.enabled {
             let dictionary = self.store.dictionary();
             let app_name = target
                 .as_ref()
                 .and_then(|target| target.app.clone())
                 .unwrap_or_else(|| "Unknown app".into());
-            let token = self.auth.token().unwrap_or_default();
             let timeout = Duration::from_millis(cleanup_config.timeout_ms + 6_000);
             match tokio::time::timeout(
                 timeout,
                 cleanup::cleanup(
                     &self.http,
                     &api_base,
-                    &token,
+                    &session_token,
                     cleanup_config,
                     cleanup::CleanupInput {
                         template: &cleanup_prompt,
@@ -519,11 +598,27 @@ impl Dictation {
             {
                 Ok(result) => {
                     if let Some(error) = result.fatal {
-                        self.finish_with_error(error).await;
-                        return;
+                        // Any cleanup failure keeps the raw transcript. A 402/
+                        // 429/403 already arrives here as a normal failure;
+                        // only a Ray session error is left, and it must still
+                        // paste what the user said before signing out.
+                        match error.kind {
+                            ApiErrorKind::Unauthorized => {
+                                if self.auth.sign_out_if_token(&session_token) {
+                                    let _ = self.app.emit("account-changed", self.auth.state());
+                                }
+                                auth_notice = true;
+                            }
+                            ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+                                quota_notice = Some(error.to_string());
+                            }
+                            ApiErrorKind::Other => {}
+                        }
+                    } else {
+                        cleaned = result.provider.is_some();
+                        text = result.text;
+                        note = result.note;
                     }
-                    text = result.text;
-                    note = result.note;
                 }
                 Err(_) => {
                     note = Some("Cleanup timed out; pasted the raw transcript".into());
@@ -542,7 +637,8 @@ impl Dictation {
             duration_ms,
             // Structured is the only cleanup mode, but the field stays for
             // older History entries and for the CRLF clipboard convention.
-            mode: (cleanup_enabled && pipeline.cleanup.enabled).then(|| "structured".to_string()),
+            // A raw transcript (cleanup failed or was disabled) is mode null.
+            mode: cleaned.then(|| "structured".to_string()),
         };
         let history_saved = match self.store.add_history(entry) {
             Ok(()) => true,
@@ -567,7 +663,7 @@ impl Dictation {
 
         // Structured output is multi-line (paragraphs and list markers). The
         // Windows clipboard convention for CF_UNICODETEXT is CRLF.
-        let line_endings = if cleanup_enabled && pipeline.cleanup.enabled {
+        let line_endings = if cleaned {
             paste::LineEndings::CrLf
         } else {
             paste::LineEndings::Preserve
@@ -625,6 +721,17 @@ impl Dictation {
                     "The paste task failed ({error}) and the text couldn't be copied ({copy_error}). History couldn't save it either; the transcript is kept until Ray quits."
                 )),
             },
+        }
+        // The transcript is pasted and saved by now. Only then explain the
+        // limit or the expired session, so the post-paste bar message never
+        // replaces the user's words.
+        if auth_notice {
+            notes.push("Sign in to Ray to dictate".into());
+            self.show_main();
+        }
+        if let Some(message) = quota_notice {
+            notes.push(message);
+            self.open_main_on("account");
         }
         let warned = !notes.is_empty();
         let warning = notes.join(" ");
@@ -694,16 +801,74 @@ impl Dictation {
         self.fail(reason).await;
     }
 
-    /// A quota/auth error from the Ray API: stop the session immediately with
-    /// the right message, never fall back to batch, never paste, never retry
-    /// cleanup. 401 also clears the local session and prompts sign-in.
-    async fn finish_with_error(&self, error: ApiError) {
+    /// The cached quota gate. Decision 15: cached usage whose `resets_at` has
+    /// passed is stale, so ask `/api/me` once (short timeout) before refusing
+    /// to record. If that refresh fails, allow the recording and let the
+    /// server decide.
+    async fn block_reason_fresh(&self) -> Option<&'static str> {
+        // A hotkey press can beat the background credential read on launch.
+        self.auth.wait_loaded(Duration::from_millis(500)).await;
+        if !self.auth.is_signed_in() {
+            return Some("Sign in to Ray to dictate");
+        }
+        let account = self.auth.account();
+        let over_limit = account
+            .as_ref()
+            .is_some_and(|account| account.starter_is_over_limit());
+        if !over_limit {
+            return None;
+        }
+        if !account
+            .as_ref()
+            .is_some_and(|account| account.usage_is_stale())
+        {
+            return Some("Weekly limit reached");
+        }
+        let api_base = self.api_base();
+        let http = self.http.clone();
+        match tokio::time::timeout(
+            Duration::from_secs(4),
+            auth::refresh(&self.auth, &http, &api_base),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            // A 401 already cleared the token; treat it as signed out.
+            Ok(Err(error)) if error.kind == ApiErrorKind::Unauthorized => {}
+            // Unreachable or failed refresh: do not lock the user out of a
+            // week that has already rolled over.
+            Ok(Err(_)) | Err(_) => return None,
+        }
+        if !self.auth.is_signed_in() {
+            return Some("Sign in to Ray to dictate");
+        }
+        if self
+            .auth
+            .account()
+            .is_some_and(|account| account.starter_is_over_limit())
+        {
+            return Some("Weekly limit reached");
+        }
+        None
+    }
+
+    /// A fatal STT error with no transcript to paste: stop the session with
+    /// the right message. `token` is the token the failed request used, so a
+    /// stale 401 can never clear a newer session.
+    async fn finish_with_error(&self, error: ApiError, token: &str) {
         let kind = error.kind;
+        let mut signed_out = false;
         let message = match kind {
             ApiErrorKind::Unauthorized => {
-                self.auth.sign_out_local();
-                let _ = self.app.emit("account-changed", self.auth.state());
-                "Sign in to Ray to dictate".to_string()
+                signed_out = self.auth.sign_out_if_token(token);
+                if signed_out {
+                    let _ = self.app.emit("account-changed", self.auth.state());
+                    "Sign in to Ray to dictate".to_string()
+                } else {
+                    // The current session is newer than this request; do not
+                    // tell the user to sign in again.
+                    error.to_string()
+                }
             }
             ApiErrorKind::QuotaExceeded => error
                 .message
@@ -716,7 +881,11 @@ impl Dictation {
             ApiErrorKind::Other => error.to_string(),
         };
         match kind {
-            ApiErrorKind::Unauthorized => self.show_main(),
+            ApiErrorKind::Unauthorized => {
+                if signed_out {
+                    self.show_main();
+                }
+            }
             ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
                 self.open_main_on("account");
                 // The proxy's count is authoritative; refresh the meter.
