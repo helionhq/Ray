@@ -13,8 +13,9 @@
  *   email); only the two configured products grant Pro.
  *
  * Clerk (optional): Svix-verified `user.deleted` cancels the user's renewing
- * Creem subscriptions (best effort), revokes every device, and soft-deletes
- * the user. Disabled (503) when CLERK_WEBHOOK_SECRET is unset.
+ * Creem subscriptions (best effort), revokes every device, clears the user's
+ * email/name/Creem customer id, and soft-deletes the user. Disabled (503)
+ * when CLERK_WEBHOOK_SECRET is unset.
  *
  * Request bodies are never logged.
  */
@@ -67,6 +68,12 @@ interface SubscriptionStatements {
   applied: boolean;
   ignored?: string;
   statements: D1PreparedStatement[];
+  /**
+   * Set only when the event activates Pro (`active`/`trialing`): the user id
+   * whose in-flight checkout this event proves completed. A late or duplicate
+   * event for an old subscription must not release the claim.
+   */
+  checkoutCompletedFor: string | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -93,7 +100,12 @@ async function subscriptionStatements(
     productId === null ||
     !entitledProductIds(env).includes(productId)
   ) {
-    return { applied: false, ignored: "product_not_allowed", statements: [] };
+    return {
+      applied: false,
+      ignored: "product_not_allowed",
+      statements: [],
+      checkoutCompletedFor: null,
+    };
   }
 
   let userId: string | null = null;
@@ -109,7 +121,12 @@ async function subscriptionStatements(
     userId = existing?.id ?? null;
   }
   if (userId === null) {
-    return { applied: false, ignored: "user_not_found", statements: [] };
+    return {
+      applied: false,
+      ignored: "user_not_found",
+      statements: [],
+      checkoutCompletedFor: null,
+    };
   }
 
   const statements: D1PreparedStatement[] = [];
@@ -140,10 +157,16 @@ async function subscriptionStatements(
       updated_at: event.eventTimestamp,
     }),
   );
-  // The subscription now exists, so the checkout that created it is no longer
-  // in flight; a new one would be a duplicate charge.
-  statements.push(clearPendingCheckoutStatement(env.DB, userId));
-  return { applied: true, statements };
+  // Only an active/trialing subscription proves a checkout completed. A
+  // canceled/expired event for an old subscription, delivered late, must not
+  // release a newer in-flight checkout claim.
+  const activatesPro =
+    event.status === "active" || event.status === "trialing";
+  return {
+    applied: true,
+    statements,
+    checkoutCompletedFor: activatesPro ? userId : null,
+  };
 }
 
 export function registerWebhookRoutes(app: Hono<AppContext>): void {
@@ -206,6 +229,7 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
       let applied = false;
       let ignored: string | undefined;
       let statements: D1PreparedStatement[] = [];
+      let checkoutCompletedFor: string | null = null;
       try {
         const parsed = parseCreemWebhook(event, {
           monthlyProductId: c.env.CREEM_PRODUCT_PRO_MONTHLY,
@@ -219,6 +243,7 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
           applied = result.applied;
           ignored = result.ignored;
           statements = result.statements;
+          checkoutCompletedFor = result.checkoutCompletedFor;
         } else {
           ignored = parsed.reason;
         }
@@ -258,6 +283,21 @@ export function registerWebhookRoutes(app: Hono<AppContext>): void {
 
       if (duplicate) {
         return c.json({ received: true, duplicate: true });
+      }
+
+      // The slot is released only when this event was newly applied (the
+      // marker above proves it was not a duplicate) and it activates Pro.
+      // Releasing it for any other event would reopen the double-checkout
+      // window this claim exists to close.
+      if (checkoutCompletedFor !== null) {
+        try {
+          await clearPendingCheckoutStatement(
+            c.env.DB,
+            checkoutCompletedFor,
+          ).run();
+        } catch {
+          // The 15-minute TTL releases the claim; the event was applied.
+        }
       }
 
       try {

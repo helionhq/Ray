@@ -32,7 +32,8 @@ export interface UpsertUserInput {
   createdAt: number;
 }
 
-/** The user upsert used by Clerk auth and webhook ingestion. */
+/** The user upsert used by Clerk auth and webhook ingestion. Never modifies a
+ * deleted user, so a late webhook cannot restore cleared PII. */
 export function upsertUserStatement(
   db: D1Database,
   input: UpsertUserInput,
@@ -43,7 +44,8 @@ export function upsertUserStatement(
        VALUES (?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          email = COALESCE(users.email, excluded.email),
-         name = COALESCE(users.name, excluded.name)`,
+         name = COALESCE(users.name, excluded.name)
+       WHERE users.deleted_at IS NULL`,
     )
     .bind(input.id, input.email, input.name, input.createdAt);
 }
@@ -82,7 +84,7 @@ export function setCreemCustomerIdStatement(
 ): D1PreparedStatement {
   return db
     .prepare(
-      "UPDATE users SET creem_customer_id = ? WHERE id = ? AND (creem_customer_id IS NULL OR creem_customer_id != ?)",
+      "UPDATE users SET creem_customer_id = ? WHERE id = ? AND deleted_at IS NULL AND (creem_customer_id IS NULL OR creem_customer_id != ?)",
     )
     .bind(customerId, userId, customerId);
 }
@@ -130,7 +132,11 @@ export function releasePendingCheckoutStatement(
     .bind(userId, createdAt);
 }
 
-/** The subscription webhook proves the checkout completed (or was abandoned). */
+/**
+ * Releases the in-flight checkout claim for a user. Only an `active`/
+ * `trialing` webhook that was newly applied proves a checkout completed; a
+ * late or duplicate event for an old subscription must not call this.
+ */
 export function clearPendingCheckoutStatement(
   db: D1Database,
   userId: string,
@@ -447,7 +453,11 @@ export async function revokeAllDevices(
   return result.meta.changes ?? 0;
 }
 
-/** Soft-deletes a user; `getUser` stops returning the row immediately. */
+/**
+ * Soft-deletes a user and clears the PII Ray no longer needs. Subscription
+ * and usage rows stay for accounting and fair-use records; `getUser` stops
+ * returning the row immediately.
+ */
 export function markUserDeletedStatement(
   db: D1Database,
   userId: string,
@@ -455,7 +465,9 @@ export function markUserDeletedStatement(
 ): D1PreparedStatement {
   return db
     .prepare(
-      "UPDATE users SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+      `UPDATE users
+       SET email = NULL, name = NULL, creem_customer_id = NULL, deleted_at = ?
+       WHERE id = ? AND deleted_at IS NULL`,
     )
     .bind(now, userId);
 }

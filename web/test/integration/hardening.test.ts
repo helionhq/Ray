@@ -385,6 +385,64 @@ describe("billing integrity — one checkout at a time", () => {
       .first<{ count: number }>();
     expect(row?.count).toBe(0);
   });
+
+  it("keeps the claim when an old subscription event arrives late", async () => {
+    const userId = "user_pending_old_event";
+    await seedUser(userId);
+    await env.DB.prepare(
+      "INSERT INTO pending_checkouts (user_id, created_at) VALUES (?, ?)",
+    )
+      .bind(userId, nowSeconds())
+      .run();
+
+    // The old subscription ended after the new checkout was claimed; its
+    // delayed event must not release the new claim.
+    const response = await deliverCreem(
+      creemSubscriptionEvent({
+        eventType: "subscription.canceled",
+        status: "canceled",
+        metadata: { user_id: userId },
+        customer: { id: `cust_${userId}` },
+        subscriptionId: `sub_old_${userId}`,
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await jsonOf(response)).toMatchObject({ applied: true });
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM pending_checkouts WHERE user_id = ?",
+    )
+      .bind(userId)
+      .first<{ count: number }>();
+    expect(row?.count).toBe(1);
+  });
+
+  it("keeps a new claim when an activation event is redelivered", async () => {
+    const userId = "user_pending_duplicate";
+    await seedUser(userId);
+    const event = creemSubscriptionEvent({
+      metadata: { user_id: userId },
+      customer: { id: `cust_${userId}` },
+      subscriptionId: `sub_${userId}`,
+    });
+    expect(
+      await jsonOf(await deliverCreem(event)),
+    ).toMatchObject({ applied: true });
+
+    // A later checkout is claimed, then Creem redelivers the old activation.
+    await env.DB.prepare(
+      "INSERT INTO pending_checkouts (user_id, created_at) VALUES (?, ?)",
+    )
+      .bind(userId, nowSeconds())
+      .run();
+    const duplicate = await deliverCreem(event);
+    expect(await jsonOf(duplicate)).toMatchObject({ duplicate: true });
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM pending_checkouts WHERE user_id = ?",
+    )
+      .bind(userId)
+      .first<{ count: number }>();
+    expect(row?.count).toBe(1);
+  });
 });
 
 describe("billing integrity — refunds and disputes revoke Pro", () => {
@@ -723,6 +781,52 @@ describe("Clerk user.deleted webhook", () => {
       id: "msg_delete_1",
     });
     expect(await jsonOf(duplicate)).toMatchObject({ duplicate: true });
+  });
+
+  it("clears PII on deletion and a late webhook cannot restore it", async () => {
+    const userId = "user_clerk_forget";
+    await seedUser(userId);
+    await env.DB.prepare(
+      "UPDATE users SET name = ?, creem_customer_id = ? WHERE id = ?",
+    )
+      .bind("Deleted Person", "cust_clerk_forget", userId)
+      .run();
+
+    const response = await deliverClerk(userDeletedEvent(userId), {
+      id: "msg_clerk_forget",
+    });
+    expect(response.status).toBe(200);
+
+    const selectPii = () =>
+      env.DB.prepare(
+        "SELECT email, name, creem_customer_id FROM users WHERE id = ?",
+      )
+        .bind(userId)
+        .first<{
+          email: string | null;
+          name: string | null;
+          creem_customer_id: string | null;
+        }>();
+    expect(await selectPii()).toEqual({
+      email: null,
+      name: null,
+      creem_customer_id: null,
+    });
+
+    // Creem repeats the metadata and customer email on later events; they
+    // must not repopulate the cleared columns.
+    await deliverCreem(
+      creemSubscriptionEvent({
+        metadata: { user_id: userId },
+        customer: { id: "cust_clerk_forget", email: "late@example.com" },
+        subscriptionId: "sub_clerk_forget",
+      }),
+    );
+    expect(await selectPii()).toEqual({
+      email: null,
+      name: null,
+      creem_customer_id: null,
+    });
   });
 
   it("cancels still-renewing Creem subscriptions on deletion", async () => {

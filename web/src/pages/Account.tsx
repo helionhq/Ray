@@ -766,6 +766,9 @@ function AccountPageInner() {
   useEffect(() => {
     if (!isLoaded || !isSignedIn || !me || me.plan === "pro") return;
     if (me.billing_issue) return;
+    // Match the disabled upgrade CTAs: another checkout while activation is
+    // pending can create a second subscription and charge the account twice.
+    if (activating || activationTimedOut) return;
     const query = new URLSearchParams(location.search);
     if (query.get("checkout") !== "1") return;
     const interval = query.get("interval");
@@ -775,7 +778,16 @@ function AccountPageInner() {
     // Drop checkout=1 so a refresh or a back-navigation doesn't fire again.
     navigate(`/account?interval=${interval}`, { replace: true });
     void checkout(interval);
-  }, [isLoaded, isSignedIn, me, location.search, navigate, checkout]);
+  }, [
+    isLoaded,
+    isSignedIn,
+    me,
+    location.search,
+    navigate,
+    checkout,
+    activating,
+    activationTimedOut,
+  ]);
 
   const revokeDevices = useCallback(async () => {
     setBusy("devices");

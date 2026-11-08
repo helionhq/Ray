@@ -94,10 +94,12 @@ export function PrivacyPage() {
       <h2>Retention</h2>
       <p>
         Account, subscription, and weekly usage rows are kept while your account
-        exists, so we can run your plan and enforce its limits. Device tokens
-        stay until they are revoked or you sign out. Payment records may be kept
-        by Creem for accounting and legal reasons. Write to us to request
-        deletion of your Ray account.
+        exists, so we can run your plan and enforce its limits. When your account
+        is deleted, we remove your email address, name, and billing customer id;
+        subscription and weekly usage records are kept without them for
+        accounting and legal reasons. Device tokens stay until they are revoked
+        or you sign out. Payment records may be kept by Creem for accounting and
+        legal reasons. Write to us to request deletion of your Ray account.
       </p>
 
       <h2>Your choices and rights</h2>
