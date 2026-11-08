@@ -25,7 +25,8 @@ function SignUpInner() {
   useEffect(() => {
     // Remember the direct desktop params too, in case Clerk's flow drops the
     // query while it moves the hash around.
-    rememberRedirect(queryRedirect ?? desktopRedirect);
+    rememberRedirect(queryRedirect);
+    rememberRedirect(desktopRedirect);
   }, [queryRedirect, desktopRedirect]);
 
   const exactPath =

@@ -25,7 +25,8 @@ function SignInInner() {
   useEffect(() => {
     // Remember the direct desktop params too, in case Clerk's flow drops the
     // query while it moves the hash around.
-    rememberRedirect(queryRedirect ?? desktopRedirect);
+    rememberRedirect(queryRedirect);
+    rememberRedirect(desktopRedirect);
   }, [queryRedirect, desktopRedirect]);
 
   // Only fall back to the remembered destination once Clerk has started its
