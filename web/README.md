@@ -27,7 +27,8 @@ pnpm workspace in `pnpm-workspace.yaml`.
 pnpm install                       # from the repo root
 cd web
 
-cp .dev.vars.example .dev.vars     # fill in test keys; never commit this file
+cp .dev.vars.example .dev.vars     # Worker secrets; never commit this file
+cp .env.example .env.local         # Site build-time vars; never commit this file
 
 # Create the local D1 database and apply migrations.
 pnpm db:migrate:local
@@ -41,6 +42,18 @@ pnpm dev:worker
 # see the site's vite.config.ts). Built assets are served by the Worker.
 pnpm dev
 ```
+
+The two-terminal flow above is the normal local setup: Vite serves the site
+with hot reload on `http://localhost:5173` and proxies `/api/*` and `/v1/*`
+to `http://127.0.0.1:8787`, which is the port `wrangler dev` binds by default
+(the same address is in `vite.config.ts`). Sign-in, account and billing work
+through that proxy because the browser only ever talks to the Vite origin.
+If Vite picks a different port (5173 is busy), update `SITE_URL` in
+`.dev.vars` to match, because it drives Clerk's authorized parties.
+
+To exercise the production wiring instead, run `pnpm build` and then
+`pnpm dev:worker`: the Worker serves `dist/` with the SPA fallback, so deep
+routes such as `/account` and `/desktop/sign-in` work on a hard refresh.
 
 Smoke test the API:
 
@@ -69,6 +82,7 @@ placeholder before deploying.
 |---|---|---|
 | `SITE_URL` | var | Public origin, e.g. `https://ray.helionhq.com` |
 | `CLERK_PUBLISHABLE_KEY` | var | Clerk publishable key (`pk_test_…` / `pk_live_…`) |
+| `VITE_CLERK_PUBLISHABLE_KEY` | build-time env | Same key as `CLERK_PUBLISHABLE_KEY`, consumed by Vite when building the site (`web/.env.local`, `web/.env.production`, or CI env). It is public by design — never put a secret in a `VITE_*` variable. |
 | `CLERK_SECRET_KEY` | secret | Clerk backend key (`sk_test_…` / `sk_live_…`) |
 | `ASSEMBLYAI_API_KEY` | secret | AssemblyAI key used for STT and the LLM gateway |
 | `CREEM_API_KEY` | secret | Creem API key (`creem_test_…` / `creem_…`) |
@@ -102,11 +116,20 @@ wrangler secret put CREEM_WEBHOOK_SECRET
 4. Add `SITE_URL` (and, for local development, `http://localhost:5173`) to the
    Clerk application's allowed origins / authorized parties.
 5. The site reads its publishable key at build time from
-   `VITE_CLERK_PUBLISHABLE_KEY`. Create `web/.env.local` for local builds:
+   `VITE_CLERK_PUBLISHABLE_KEY`; it must be the same Clerk application as the
+   Worker's `CLERK_PUBLISHABLE_KEY`. For local development:
 
    ```bash
-   VITE_CLERK_PUBLISHABLE_KEY=pk_test_…
+   cp .env.example .env.local
+   # edit .env.local:
+   # VITE_CLERK_PUBLISHABLE_KEY=pk_test_…
    ```
+
+   For production builds set the same variable in CI or in
+   `web/.env.production` (both are ignored by git). `pnpm deploy` builds
+   first, so a deploy without the variable produces a site that renders the
+   "auth not configured" notice; the API keeps working. Without the variable
+   at all, the public marketing pages still build and work.
 
 The Worker verifies the Clerk session JWT with `@clerk/backend` `verifyToken`,
 passing `authorizedParties` derived from `SITE_URL`, and fetches the user's
@@ -163,13 +186,20 @@ Schema lives in `migrations/`. Add new migrations as
 ```bash
 cd web
 pnpm build                 # vite build -> dist/
-pnpm deploy                # build + wrangler deploy
+pnpm deploy                # vite build + wrangler deploy
 ```
+
+`pnpm deploy` is the only deploy command: it builds the site first (so the
+`VITE_CLERK_PUBLISHABLE_KEY` must be in the environment or `.env.production`
+at that moment) and then uploads the Worker and `dist/` together.
 
 `wrangler.jsonc` configures one Worker:
 
 - `main: worker/index.ts`
-- static assets from `./dist` with SPA fallback
+- static assets from `./dist`
+- `not_found_handling: "single-page-application"`, so client routes such as
+  `/account`, `/desktop/sign-in`, `/billing/success`, `/privacy` and `/terms`
+  return the SPA HTML (200) on a hard refresh instead of a 404
 - `run_worker_first: ["/api/*", "/v1/*"]`, so the site is served directly from
   assets and only API routes invoke the Worker
 - the `DB` D1 binding
@@ -182,6 +212,8 @@ Deployment checklist:
 
 - [ ] `wrangler.jsonc` placeholders replaced (`SITE_URL`, Clerk publishable
       key, Creem product ids)
+- [ ] `VITE_CLERK_PUBLISHABLE_KEY` set for the build and equal to the Worker's
+      `CLERK_PUBLISHABLE_KEY`
 - [ ] all four secrets set with `wrangler secret put`
 - [ ] `wrangler d1 create` + `pnpm db:migrate:remote`
 - [ ] Clerk authorized parties include the production origin

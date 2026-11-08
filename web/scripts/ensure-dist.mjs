@@ -1,7 +1,9 @@
 /**
  * `wrangler dev` requires assets.directory to exist. The real site is built by
- * Vite (`pnpm build`), but while developing the API alone we create an empty
- * placeholder so the Worker can start.
+ * Vite (`pnpm build` -> `dist/`), but while developing the API alone (or
+ * running this Worker before ever building the site) we create an empty
+ * placeholder so the Worker can start. A real build is never overwritten:
+ * only a missing index.html is created.
  */
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
