@@ -1,5 +1,14 @@
 /** Worker bindings and the objects stored in Hono's request context. */
 
+/**
+ * Minimal shape of the Workers Rate Limiting binding. Keeping our own
+ * interface (instead of relying on a lib-specific global type) makes the
+ * binding injectable and mockable in tests.
+ */
+export interface RateLimitBinding {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 export interface Env {
   DB: D1Database;
 
@@ -17,7 +26,24 @@ export interface Env {
   CLERK_SECRET_KEY: string;
   ASSEMBLYAI_API_KEY: string;
   CREEM_API_KEY: string;
-  CREEM_WEBHOOK_SECRET: string;
+  /**
+   * Optional on purpose: a missing secret fails webhook verification closed
+   * (401) rather than crashing with an unhandled error.
+   */
+  CREEM_WEBHOOK_SECRET?: string;
+  /**
+   * Optional: Clerk's `user.deleted` webhook is disabled (503) when unset.
+   */
+  CLERK_WEBHOOK_SECRET?: string;
+
+  // Workers Rate Limiting bindings. Optional so a missing binding degrades to
+  // "not rate limited" with a one-time warning instead of failing every
+  // request (the vitest/miniflare runtime may not provide them).
+  RATE_LIMIT_AUTHORIZE?: RateLimitBinding;
+  RATE_LIMIT_BILLING?: RateLimitBinding;
+  RATE_LIMIT_REVOKE_ALL?: RateLimitBinding;
+  RATE_LIMIT_DESKTOP_TOKEN?: RateLimitBinding;
+  RATE_LIMIT_WEBHOOKS?: RateLimitBinding;
 }
 
 export interface UserRow {

@@ -209,6 +209,15 @@ describe("desktop hand-off", () => {
     });
     expect(me.status).toBe(401);
   });
+
+  it("registers /api/devices/revoke-all behind Clerk auth", async () => {
+    const response = await SELF.fetch(
+      "https://ray.test/api/devices/revoke-all",
+      { method: "POST" },
+    );
+    expect(response.status).toBe(401);
+    expect(await jsonOf(response)).toMatchObject({ error: "unauthorized" });
+  });
 });
 
 describe("usage weeks", () => {
@@ -269,7 +278,10 @@ describe("Creem webhooks", () => {
     const body = JSON.stringify(event);
     const signature =
       signatureOverride ??
-      (await hmacSha256Hex(env.CREEM_WEBHOOK_SECRET, body));
+      (await hmacSha256Hex(
+        String(env.CREEM_WEBHOOK_SECRET),
+        body,
+      ));
     return SELF.fetch("https://ray.test/api/webhooks/creem", {
       method: "POST",
       headers: {
@@ -385,6 +397,30 @@ describe("quota enforcement", () => {
     const weekStart = weekBounds(nowSeconds()).weekStart;
     await addWords(env.DB, "user_quota", weekStart, 1_000);
 
+    const response = await SELF.fetch("https://ray.test/v1/stt/sync", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
+      },
+      body: "audio",
+    });
+
+    expect(response.status).toBe(402);
+    expect(await jsonOf(response)).toMatchObject({
+      error: "quota_exceeded",
+      plan: "starter",
+      words_used: 1_000,
+      words_limit: 1_000,
+    });
+  });
+
+  it("does not apply the weekly quota to cleanup (grants only)", async () => {
+    await seedUser("user_quota_cleanup");
+    const token = await seedDevice("user_quota_cleanup");
+    const weekStart = weekBounds(nowSeconds()).weekStart;
+    await addWords(env.DB, "user_quota_cleanup", weekStart, 1_000);
+
     const response = await SELF.fetch(
       "https://ray.test/v1/cleanup/chat/completions",
       {
@@ -393,16 +429,19 @@ describe("quota enforcement", () => {
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ model: "gemma-4-31b", messages: [] }),
+        body: JSON.stringify({
+          model: "gemma-4-31b",
+          messages: [{ role: "user", content: "hi" }],
+        }),
       },
     );
 
-    expect(response.status).toBe(402);
+    // Decision 1: an over-quota user without a grant gets no_cleanup_grant,
+    // never quota_exceeded, so the dictation that crossed the line can still
+    // be cleaned up.
+    expect(response.status).toBe(403);
     expect(await jsonOf(response)).toMatchObject({
-      error: "quota_exceeded",
-      plan: "starter",
-      words_used: 1_000,
-      words_limit: 1_000,
+      error: "no_cleanup_grant",
     });
   });
 
@@ -435,17 +474,14 @@ describe("quota enforcement", () => {
     expect(meBody["plan"]).toBe("pro");
     expect(meBody["usage"]).toMatchObject({ words_limit: null });
 
-    const response = await SELF.fetch(
-      "https://ray.test/v1/cleanup/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ model: "gemma-4-31b", messages: [] }),
+    const response = await SELF.fetch("https://ray.test/v1/stt/sync", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/octet-stream",
       },
-    );
+      body: "audio",
+    });
     expect(response.status).toBe(429);
     const body = await jsonOf(response);
     expect(body["error"]).toBe("fair_use");

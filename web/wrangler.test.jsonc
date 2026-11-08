@@ -11,6 +11,34 @@
       "migrations_dir": "migrations"
     }
   ],
+  // Same limiter wiring as production so tests exercise the real bindings.
+  "ratelimits": [
+    {
+      "name": "RATE_LIMIT_AUTHORIZE",
+      "namespace_id": "4201",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_BILLING",
+      "namespace_id": "4202",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_REVOKE_ALL",
+      "namespace_id": "4203",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_DESKTOP_TOKEN",
+      "namespace_id": "4204",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_WEBHOOKS",
+      "namespace_id": "4205",
+      "simple": { "limit": 120, "period": 60 }
+    }
+  ],
   // Test-only dummy values. Never use real keys here.
   "vars": {
     "SITE_URL": "https://ray.test",
@@ -19,6 +47,7 @@
     "ASSEMBLYAI_API_KEY": "test_assemblyai_key",
     "CREEM_API_KEY": "creem_test_placeholder",
     "CREEM_WEBHOOK_SECRET": "whsec_test_placeholder",
+    "CLERK_WEBHOOK_SECRET": "whsec_c2VjcmV0X2Zvcl90ZXN0cw==",
     "CREEM_API_BASE": "https://test-api.creem.io",
     "CREEM_PRODUCT_PRO_MONTHLY": "prod_test_monthly",
     "CREEM_PRODUCT_PRO_ANNUAL": "prod_test_annual",

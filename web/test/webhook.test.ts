@@ -78,6 +78,15 @@ describe("shouldApplyUpdate", () => {
     expect(shouldApplyUpdate(200, 199)).toBe(false);
     expect(shouldApplyUpdate(200, 100)).toBe(false);
   });
+
+  it("lets terminal statuses win equal-timestamp ties", () => {
+    expect(shouldApplyUpdate(100, 100, "active", "revoked")).toBe(true);
+    expect(shouldApplyUpdate(100, 100, "revoked", "active")).toBe(false);
+    expect(shouldApplyUpdate(100, 100, "active", "expired")).toBe(true);
+    expect(shouldApplyUpdate(100, 100, "expired", "active")).toBe(false);
+    // Non-terminal ties still apply (different event types share timestamps).
+    expect(shouldApplyUpdate(100, 100, "active", "trialing")).toBe(true);
+  });
 });
 
 describe("parseCreemWebhook — subscription events", () => {
@@ -224,13 +233,117 @@ describe("parseCreemWebhook — checkout.completed", () => {
   });
 });
 
+function revocationEvent(
+  eventType: "refund.created" | "dispute.created",
+  overrides: Record<string, unknown> = {},
+): unknown {
+  return {
+    id: "evt_revocation",
+    eventType,
+    created_at: UPDATED_AT_MS,
+    object: {
+      id: eventType === "refund.created" ? "ref_1" : "disp_1",
+      object: eventType === "refund.created" ? "refund" : "dispute",
+      status: "succeeded",
+      transaction: {
+        id: "tran_1",
+        object: "transaction",
+        subscription: "sub_1",
+        customer: "cust_1",
+      },
+      subscription: {
+        id: "sub_1",
+        object: "subscription",
+        product: "prod_monthly",
+        customer: "cust_1",
+        status: "active",
+        current_period_end_date: "2026-12-08T12:00:00.000Z",
+        updated_at: UPDATED_AT_MS,
+        metadata: { user_id: "user_1" },
+      },
+      checkout: {
+        id: "ch_1",
+        metadata: { user_id: "user_1" },
+      },
+      customer: { id: "cust_1", email: "a@b.com" },
+      created_at: UPDATED_AT_MS,
+      ...overrides,
+    },
+  };
+}
+
+describe("parseCreemWebhook — refunds and disputes", () => {
+  it("parses refund.created as an immediately revoked subscription", () => {
+    const parsed = parseCreemWebhook(
+      revocationEvent("refund.created"),
+      { monthlyProductId: "prod_monthly", annualProductId: "prod_annual" },
+    );
+    if (parsed.kind !== "subscription") throw new Error("unreachable");
+    expect(parsed.subscription).toEqual({
+      subscriptionId: "sub_1",
+      status: "revoked",
+      productId: "prod_monthly",
+      interval: "monthly",
+      customerId: "cust_1",
+      customerEmail: "a@b.com",
+      metadataUserId: "user_1",
+      currentPeriodEnd: Math.floor(
+        Date.parse("2026-12-08T12:00:00.000Z") / 1000,
+      ),
+      cancelAtPeriodEnd: false,
+      eventTimestamp: UPDATED_AT_MS,
+    });
+  });
+
+  it("parses dispute.created even without subscription metadata", () => {
+    const parsed = parseCreemWebhook(
+      revocationEvent("dispute.created", {
+        subscription: {
+          id: "sub_1",
+          object: "subscription",
+          product: "prod_monthly",
+          customer: "cust_1",
+          current_period_end_date: "2026-12-08T12:00:00.000Z",
+          updated_at: UPDATED_AT_MS,
+        },
+      }),
+    );
+    if (parsed.kind !== "subscription") throw new Error("unreachable");
+    expect(parsed.subscription.status).toBe("revoked");
+    expect(parsed.subscription.productId).toBe("prod_monthly");
+    expect(parsed.subscription.metadataUserId).toBe("user_1");
+  });
+
+  it("falls back to transaction.subscription for the id", () => {
+    const event = revocationEvent("refund.created", {
+      subscription: {
+        object: "subscription",
+        product: "prod_monthly",
+        updated_at: UPDATED_AT_MS,
+      },
+    }) as { object: Record<string, unknown> };
+    const parsed = parseCreemWebhook(event);
+    if (parsed.kind !== "subscription") throw new Error("unreachable");
+    expect(parsed.subscription.subscriptionId).toBe("sub_1");
+  });
+
+  it("ignores revocations without a subscription", () => {
+    expect(
+      parseCreemWebhook({
+        id: "evt_x",
+        eventType: "refund.created",
+        object: { id: "ref_1" },
+      }),
+    ).toEqual({
+      kind: "ignored",
+      reason: "revocation_without_subscription",
+    });
+  });
+});
+
 describe("parseCreemWebhook — other events", () => {
-  it("ignores refunds, disputes and credits", () => {
-    for (const eventType of [
-      "refund.created",
-      "dispute.created",
-      "credits.granted",
-    ]) {
+  it("ignores credits and unknown events", () => {
+    for (const eventType of ["credits.granted", "customer.created"]) {
       const parsed = parseCreemWebhook({
         id: `evt_${eventType}`,
         eventType,

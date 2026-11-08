@@ -15,6 +15,10 @@ ASSEMBLYAI_API_KEY=REPLACE_ME
 CREEM_API_KEY=creem_test_REPLACE_ME
 CREEM_WEBHOOK_SECRET=whsec_REPLACE_ME
 
+# Optional: enables POST /api/webhooks/clerk (Svix-signed `user.deleted`).
+# Leave unset to keep that endpoint disabled (it answers 503).
+# CLERK_WEBHOOK_SECRET=whsec_REPLACE_ME
+
 # Optional overrides for the values in wrangler.jsonc (local testing only).
 # CREEM_API_BASE=https://test-api.creem.io
 # CREEM_PRODUCT_PRO_MONTHLY=prod_REPLACE_ME
