@@ -77,7 +77,7 @@ pub struct Account {
     pub billing_issue: Option<String>,
     /// The active no-card trial; null for paid subscriptions and Starter.
     pub trial: Option<Trial>,
-    /// This PC is over the free-account limit and has no paid plan.
+    /// This account is over the per-PC free-account limit and has no paid plan.
     pub free_blocked: bool,
     pub usage: Usage,
 }
@@ -533,7 +533,9 @@ pub async fn handle_deep_link(
                     "This sign-in link is invalid or has expired. Try signing in again.".into(),
                 );
             };
-            let token = exchange_code(http, api_base, &code, &verifier)
+            let app_data = app.path().app_data_dir().ok();
+            let device_id = crate::device::device_id(app_data.as_deref());
+            let token = exchange_code(http, api_base, &code, &verifier, device_id.as_deref())
                 .await
                 .map_err(|error| error.to_string())?;
             // Cancel (or sign-out) raced the exchange: do not resurrect the
@@ -636,14 +638,16 @@ pub async fn exchange_code(
     api_base: &str,
     code: &str,
     verifier: &str,
+    device_id: Option<&str>,
 ) -> Result<String, ApiError> {
     let mut payload = json!({ "code": code, "verifier": verifier });
     // Required by the server: the device id drives the per-PC free limit and
-    // the trial. If the registry value cannot be read the field is omitted and
-    // the exchange is rejected rather than signing in without one. The raw
-    // GUID is never sent or logged.
-    if let Some(device_id) = crate::device::device_id() {
-        payload["device_id"] = Value::String(device_id);
+    // the trial. It is the hashed registry value, or the persisted random
+    // fallback when the registry is unreadable; the raw GUID is never sent or
+    // logged. If neither is available the field is omitted and the exchange is
+    // rejected rather than signing in without one.
+    if let Some(device_id) = device_id {
+        payload["device_id"] = Value::String(device_id.to_string());
     }
     let response = http
         .post(api::endpoint(api_base, "/api/desktop/token"))

@@ -262,6 +262,13 @@ function userDeletedEvent(userId: string): unknown {
 describe("billing integrity — product gating", () => {
   it("does not grant Pro for a product outside the allowlist", async () => {
     await seedUser("user_other_product");
+    // An old trial keeps this device account on Starter; the trial retry on
+    // /api/me must not grant a new one and mask the product gating.
+    await env.DB.prepare(
+      "UPDATE users SET trial_started_at = ? WHERE id = ?",
+    )
+      .bind(nowSeconds() - 30 * 86_400, "user_other_product")
+      .run();
     const token = await seedDevice("user_other_product");
 
     const response = await deliverCreem(

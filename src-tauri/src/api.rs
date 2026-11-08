@@ -17,7 +17,8 @@ pub enum ApiErrorKind {
     Unauthorized,
     QuotaExceeded,
     FairUse,
-    /// This PC has used up its free accounts; only a paid plan can dictate.
+    /// This account has used up its PC's free accounts; only a paid plan can
+    /// dictate.
     DeviceLimit,
     Other,
 }
@@ -85,7 +86,7 @@ impl ApiError {
             ApiErrorKind::Unauthorized => "Your session expired. Sign in to Ray again.".into(),
             ApiErrorKind::QuotaExceeded => "Weekly limit reached".into(),
             ApiErrorKind::FairUse => "Fair-use limit reached, resets Monday".into(),
-            ApiErrorKind::DeviceLimit => "Free limit reached on this PC".into(),
+            ApiErrorKind::DeviceLimit => "Free limit reached on this account".into(),
             ApiErrorKind::Other => String::new(),
         });
         Some(Self {
@@ -219,14 +220,14 @@ mod tests {
 
         let device_limit = ApiError::from_response(
             402,
-            r#"{"error":"device_limit","message":"This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating."}"#,
+            r#"{"error":"device_limit","message":"This account can't use the free plan because too many accounts were created on one PC. Upgrade to Pro to keep dictating."}"#,
         )
         .expect("402 with device_limit is typed");
         assert_eq!(device_limit.kind, ApiErrorKind::DeviceLimit);
         assert_eq!(
             device_limit.message.as_deref(),
             Some(
-                "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating."
+                "This account can't use the free plan because too many accounts were created on one PC. Upgrade to Pro to keep dictating."
             )
         );
         assert!(device_limit.is_fatal());
@@ -235,7 +236,7 @@ mod tests {
             .expect("a bare device_limit is typed");
         assert_eq!(
             device_limit_default.to_string(),
-            "Free limit reached on this PC"
+            "Free limit reached on this account"
         );
 
         let unauthorized =

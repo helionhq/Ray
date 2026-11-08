@@ -62,8 +62,8 @@ export interface UserRow {
   free_blocked_at: number | null;
   /**
    * The week (`week_start`) whose pre-Starter totals are snapshotted. Set when
-   * a no-card trial ends mid-week; later weeks keep the old value and need no
-   * adjustment.
+   * Pro ends mid-week (trial over, or a paid subscription canceled, expired,
+   * refunded, or downgraded); later weeks are unaffected.
    */
   starter_baseline_week: number | null;
   starter_baseline_words: number;

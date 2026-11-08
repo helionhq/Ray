@@ -185,22 +185,60 @@ export function trialEndsAt(trial: TrialState): number | null {
 }
 
 /**
- * True when a no-card trial ended during the current week and the account is
- * now on Starter. Trial usage still sits in this week's `usage_weeks` row, so
- * it must not count against the Starter allowance: only usage recorded after
- * the trial ended does.
+ * When a stored subscription stopped granting Pro: the paid-through time for
+ * a period that ran out, or the status-change time for a revocation or
+ * payment failure. False when the row was never entitled (another product) or
+ * its end is outside the current week.
  */
-export function trialEndedThisWeek(
-  plan: PlanView,
-  subscriptions: readonly SubscriptionRow[],
-  trial: TrialState,
+function subscriptionEndedThisWeek(
+  subscription: SubscriptionRow,
+  entitledProducts: readonly string[],
   nowSeconds: number,
   weekStart: number,
 ): boolean {
-  if (plan.plan !== "starter" || subscriptions.length > 0) return false;
+  if (!isAllowedProduct(subscription.product_id, entitledProducts)) {
+    return false;
+  }
+  const periodStatus =
+    subscription.status === "canceled" ||
+    subscription.status === "scheduled_cancel" ||
+    subscription.status === "expired";
+  // A terminated period ends at its paid-through time. revoked/unpaid/
+  // past_due/paused end at the status change; Creem's subscription
+  // `updated_at` is that timestamp (ms).
+  const endedAt =
+    periodStatus && subscription.current_period_end !== null
+      ? subscription.current_period_end
+      : Math.floor(subscription.updated_at / 1000);
+  return endedAt !== null && endedAt <= nowSeconds && endedAt >= weekStart;
+}
+
+/**
+ * True when the account was on Pro earlier in the current week and is now on
+ * Starter, so this week's usage may include Pro usage that must not count
+ * against the Starter allowance. Covers the no-card trial ending and a paid
+ * subscription ending (period over, refund/revocation, or payment failure).
+ */
+export function proEndedThisWeek(
+  plan: PlanView,
+  subscriptions: readonly SubscriptionRow[],
+  trial: TrialState,
+  entitledProducts: readonly string[],
+  nowSeconds: number,
+  weekStart: number,
+): boolean {
+  if (plan.plan !== "starter") return false;
   const endsAt = trialEndsAt(trial);
-  return (
-    endsAt !== null && endsAt <= nowSeconds && endsAt >= weekStart
+  if (endsAt !== null && endsAt <= nowSeconds && endsAt >= weekStart) {
+    return true;
+  }
+  return subscriptions.some((subscription) =>
+    subscriptionEndedThisWeek(
+      subscription,
+      entitledProducts,
+      nowSeconds,
+      weekStart,
+    ),
   );
 }
 

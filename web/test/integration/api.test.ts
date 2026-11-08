@@ -515,6 +515,13 @@ describe("quota enforcement", () => {
 
   it("returns 402 when the Starter weekly audio budget is spent", async () => {
     await seedUser("user_audio_quota");
+    // An old trial keeps this device account on Starter, so /api/me does not
+    // retry (and grant) a trial before the audio check.
+    await env.DB.prepare(
+      "UPDATE users SET trial_started_at = ? WHERE id = ?",
+    )
+      .bind(nowSeconds() - 30 * 86_400, "user_audio_quota")
+      .run();
     const token = await seedDevice("user_audio_quota");
     const weekStart = weekBounds(nowSeconds()).weekStart;
     await addUsage(env.DB, "user_audio_quota", weekStart, 0, 3_600);

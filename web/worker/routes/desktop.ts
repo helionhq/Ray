@@ -214,9 +214,9 @@ export function registerDesktopRoutes(app: Hono<AppContext>): void {
       });
 
       // The row must exist before the decision: the conditional UPDATE orders
-      // rows by created_at/rowid, so concurrent sign-ins serialize to exactly
-      // three free accounts and a re-sign-in by an account that was already
-      // here is never blocked.
+      // rows by rowid (insertion order), so concurrent sign-ins serialize to
+      // exactly three free accounts and a re-sign-in by an account that was
+      // already here is never blocked.
       const blockedResult = await markFreeBlockedIfOverDeviceLimitStatement(
         c.env.DB,
         { userId: authCode.user_id, deviceRowId, now },

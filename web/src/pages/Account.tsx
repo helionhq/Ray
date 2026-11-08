@@ -441,8 +441,9 @@ function AccountView({
 
           {me.free_blocked ? (
             <p className="account-alert" role="status">
-              This PC has reached its limit of free accounts. Upgrade to Pro to
-              keep dictating.
+              This account can&rsquo;t use the free plan because too many
+              accounts were created on one PC. Upgrade to Pro to keep
+              dictating.
             </p>
           ) : null}
 

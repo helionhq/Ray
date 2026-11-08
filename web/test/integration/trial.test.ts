@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import app from "../../worker/index";
 import type { Env } from "../../worker/env";
-import { addUsage } from "../../worker/db";
+import {
+  addUsage,
+  markFreeBlockedIfOverDeviceLimitStatement,
+} from "../../worker/db";
 import {
   pkceChallenge,
   randomToken,
@@ -142,13 +145,16 @@ async function signIn(userId: string, deviceId: string): Promise<string> {
   return String(token);
 }
 
-async function fetchMe(token: string): Promise<Record<string, unknown>> {
+async function fetchMe(
+  token: string,
+  overrides: Partial<Env> = {},
+): Promise<Record<string, unknown>> {
   const response = await app.request(
     new Request("https://ray.test/api/me", {
       headers: { authorization: `Bearer ${token}` },
     }),
     undefined,
-    workerEnv(),
+    workerEnv(overrides),
   );
   expect(response.status).toBe(200);
   return jsonOf(response);
@@ -278,8 +284,49 @@ describe("14-day no-card trial", () => {
     expect(response.status).toBe(200);
     expect(keySeen).toBe("ip:198.51.100.23");
     expect(await trialStartedAt(userId)).toBeNull();
-    const me = await fetchMe(String((await jsonOf(response))["token"]));
+    const me = await fetchMe(String((await jsonOf(response))["token"]), {
+      RATE_LIMIT_TRIAL: {
+        limit: async () => ({ success: false }),
+      },
+    });
     expect(me["plan"]).toBe("starter");
+  });
+
+  it("retries a brake-denied trial on the next device request", async () => {
+    const userId = "user_trial_retry";
+    await seedUser(userId);
+    const { code, verifier } = await seedAuthCode(userId);
+
+    const response = await app.request(
+      new Request("https://ray.test/api/desktop/token", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "cf-connecting-ip": "198.51.100.24",
+        },
+        body: JSON.stringify({
+          code,
+          verifier,
+          device_id: randomToken(),
+        }),
+      }),
+      undefined,
+      workerEnv({
+        RATE_LIMIT_TRIAL: {
+          limit: async () => ({ success: false }),
+        },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await trialStartedAt(userId)).toBeNull();
+    const token = String((await jsonOf(response))["token"]);
+
+    // The limited window has passed: the same signed-in device retries the
+    // grant on its next authenticated request.
+    const me = await fetchMe(token);
+    expect(me["plan"]).toBe("pro");
+    expect(me["trial"]).not.toBeNull();
+    expect(await trialStartedAt(userId)).not.toBeNull();
   });
 
   it("does not start when the user has ever had a subscription row", async () => {
@@ -373,6 +420,41 @@ describe("14-day no-card trial", () => {
 
     // The Starter allowance starts at the trial's end, so dictation works
     // immediately; only the words it produces count.
+    stubSyncSuccess();
+    const response = await app.request(
+      sttRequest(token),
+      undefined,
+      workerEnv(),
+    );
+    expect(response.status).toBe(200);
+
+    const after = await fetchMe(token);
+    expect(after["usage"]).toMatchObject({ words_used: 1 });
+  });
+
+  it("does not charge paid usage against Starter when a subscription ends mid-week", async () => {
+    const userId = "user_paid_midweek";
+    await seedUser(userId);
+    const now = nowSeconds();
+    const weekStart = weekBounds(now).weekStart;
+    // A paid period that ended earlier this week, including when the test runs
+    // in the first minute after the Monday boundary.
+    const periodEnd = Math.max(weekStart, now - 60);
+    await seedSubscription(userId, {
+      status: "canceled",
+      currentPeriodEnd: periodEnd,
+    });
+    await addUsage(env.DB, userId, weekStart, 6_000);
+
+    const token = await seedDevice(userId);
+    const me = await fetchMe(token);
+    expect(me["plan"]).toBe("starter");
+    expect(me["usage"]).toMatchObject({
+      words_used: 0,
+      words_limit: 1_000,
+    });
+
+    // Only usage produced after the paid period ends counts against Starter.
     stubSyncSuccess();
     const response = await app.request(
       sttRequest(token),
@@ -479,6 +561,53 @@ describe("per-PC free-account limit", () => {
     expect(states.filter((value) => value === null)).toHaveLength(3);
   });
 
+  it("orders the PC limit by insertion order, not the request clock", async () => {
+    const deviceId = randomToken();
+    const deviceHash = await sha256Hex(deviceId);
+    const now = nowSeconds();
+    const earlier = ["order_a", "order_b", "order_c"];
+    for (const suffix of earlier) {
+      await seedUser(`user_pc_${suffix}`);
+      await env.DB.prepare(
+        `INSERT INTO devices (id, user_id, token_hash, created_at, device_hash)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+        .bind(
+          `dev_${suffix}`,
+          `user_pc_${suffix}`,
+          await sha256Hex(`token_${suffix}`),
+          now,
+          deviceHash,
+        )
+        .run();
+    }
+    // Inserted after the three rows above but carrying an earlier clock
+    // reading, which is what a concurrent token handler can produce when it
+    // reads `now` before its INSERT.
+    await seedUser("user_pc_order_d");
+    await env.DB.prepare(
+      `INSERT INTO devices (id, user_id, token_hash, created_at, device_hash)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        "dev_order_d",
+        "user_pc_order_d",
+        await sha256Hex("token_order_d"),
+        now - 60,
+        deviceHash,
+      )
+      .run();
+
+    const result = await markFreeBlockedIfOverDeviceLimitStatement(env.DB, {
+      userId: "user_pc_order_d",
+      deviceRowId: "dev_order_d",
+      now,
+    }).run();
+
+    expect((result.meta.changes ?? 0) > 0).toBe(true);
+    expect(await freeBlockedAt("user_pc_order_d")).not.toBeNull();
+  });
+
   it("revoked device rows still count toward the PC limit", async () => {
     const deviceId = randomToken();
     const deviceHash = await sha256Hex(deviceId);
@@ -540,7 +669,7 @@ describe("per-PC free-account limit", () => {
     expect(await jsonOf(response)).toMatchObject({
       error: "device_limit",
       message:
-        "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating.",
+        "This account can't use the free plan because too many accounts were created on one PC. Upgrade to Pro to keep dictating.",
     });
     expect((await fetchMe(token))["free_blocked"]).toBe(true);
   });

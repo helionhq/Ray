@@ -356,7 +356,8 @@ trial** that starts on the first desktop sign-in. Quota failures are
 - `GET /api/me` also returns `trial: null | { ends_at }` and
   `free_blocked: boolean`. While `trial` is non-null the plan is `"pro"` but
   `interval`/`status` stay null (there is no subscription); show "Pro trial ·
-  N days left". `free_blocked` means the PC is over the free-account limit.
+  N days left". `free_blocked` means the account is over the per-PC
+  free-account limit (and the flag applies on every PC).
 - `POST /api/billing/checkout` returns `409 { error: "billing_issue" }` while
   a payment issue is outstanding, and `409 { error: "already_subscribed" }`
   only for a paid Pro account (checkout is allowed during the trial).
@@ -420,19 +421,27 @@ trial** that starts on the first desktop sign-in. Quota failures are
   the account resolves as Pro with `trial: { ends_at }`; a paid subscription
   wins. Trial grants are also throttled by the per-IP `RATE_LIMIT_TRIAL`
   binding (3/minute per Cloudflare location): over the limit, sign-in succeeds
-  but no trial is granted. When the trial ends mid-week, the first post-trial
-  request snapshots the week's usage and Starter counts only what comes after,
-  so trial words/audio do not consume the new Starter allowance.
+  but no trial is granted, and the grant is retried on the next authenticated
+  device `/api/me` request under the same limiter. When Pro ends mid-week (the
+  trial ending, or a paid subscription canceled, expired, refunded, or
+  downgraded), the first Starter request snapshots the week's usage and Starter
+  counts only what comes after, so Pro words/audio do not consume the new
+  Starter allowance.
 - **Per-PC free limit.** The desktop sends `device_id =
   base64url(SHA-256("ray-device-v1:" + MachineGuid))`; the raw GUID never
-  leaves the PC. The Worker stores `SHA-256(device_id)` in
-  `devices.device_hash` and, after inserting each sign-in row, runs one
-  conditional `UPDATE` that compares rows by `created_at`/`rowid`. A fourth or
-  later distinct account is marked `users.free_blocked_at`: sign-in still
-  succeeds, but it gets no trial and, without a paid plan, every STT request
-  answers `402 device_limit`. An account that already has an earlier row for
-  the hash is never blocked, including when it re-signs in after a fourth
-  account exists. The limit is disclosed in the landing FAQ and Terms.
+  leaves the PC. When the registry value is unreadable, the app hashes a
+  random per-install value persisted in its app-data directory instead. The
+  Worker stores `SHA-256(device_id)` in `devices.device_hash` and, after
+  inserting each sign-in row, runs one conditional `UPDATE` that compares rows
+  by `rowid` (insertion order; `created_at` is read before the INSERT and can
+  disagree with it). A fourth or later distinct account is marked
+  `users.free_blocked_at`: sign-in still succeeds, but it gets no trial and,
+  without a paid plan, every STT request answers `402 device_limit` ("This
+  account can't use the free plan because too many accounts were created on
+  one PC."). The flag is account-wide, so it applies on every PC. An account
+  that already has an earlier row for the hash is never blocked, including
+  when it re-signs in after a fourth account exists. The limit is disclosed in
+  the landing FAQ and Terms.
 - **Residual abuse risk.** `device_id` is client-supplied; a modified client
   can omit nothing (the API rejects that) but can send a fresh random value per
   account, which defeats the per-PC rule and gives each account a trial. The

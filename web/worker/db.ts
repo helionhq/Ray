@@ -184,21 +184,23 @@ export async function getUsageWords(
 /**
  * Usage that counts against the current plan.
  *
- * A trial that ends mid-week leaves its words and audio in the same
- * `usage_weeks` row as the post-trial Starter usage. When the trial ended in
- * the current week, the first post-trial call snapshots that week's totals and
- * later calls subtract them, so only usage recorded after `trial_ends_at`
- * counts against Starter. The snapshot is idempotent (`starter_baseline_week`
- * names the week it belongs to), and later weeks need no adjustment.
+ * A Pro stretch that ends mid-week (the no-card trial ending, or a paid
+ * subscription being canceled, expiring, refunded, or downgraded) leaves its
+ * words and audio in the same `usage_weeks` row as the Starter usage that
+ * follows. When Pro ended in the current week, the first Starter call
+ * snapshots that week's totals and later calls subtract them, so only usage
+ * recorded after the transition counts against Starter. The snapshot is
+ * idempotent (`starter_baseline_week` names the week it belongs to), and
+ * later weeks are unaffected.
  */
 export async function usageForPlan(
   db: D1Database,
   user: UserRow,
   weekStart: number,
   usage: WeeklyUsage,
-  trialEndedThisWeek: boolean,
+  proEndedThisWeek: boolean,
 ): Promise<WeeklyUsage> {
-  if (!trialEndedThisWeek) return usage;
+  if (!proEndedThisWeek) return usage;
 
   let baselineWeek = user.starter_baseline_week;
   let baselineWords = user.starter_baseline_words;
@@ -490,9 +492,12 @@ export const DEVICE_ACCOUNT_LIMIT = 3;
 /**
  * Marks the account as over the per-PC free limit. Call after inserting the
  * new device row, and only that row's id is passed: the condition compares
- * rows by `created_at` then `rowid`, so concurrent sign-ins serialize to
+ * rows by `rowid` (insertion order), so concurrent sign-ins serialize to
  * exactly three free accounts, and a re-sign-in by an account that already
- * has an earlier row for this device is never blocked. Revoked rows still
+ * has an earlier row for this device is never blocked. `rowid` is assigned in
+ * D1's serialized write order and is never reused here (device rows are only
+ * inserted), unlike `created_at`, which is read before the INSERT and can
+ * disagree with insertion order across a second boundary. Revoked rows still
  * count: signing out must not reset the limit.
  */
 export function markFreeBlockedIfOverDeviceLimitStatement(
@@ -513,13 +518,7 @@ export function markFreeBlockedIfOverDeviceLimitStatement(
            JOIN devices AS d_earlier
              ON d_earlier.device_hash = d_self.device_hash
             AND d_earlier.user_id = d_self.user_id
-            AND (
-              d_earlier.created_at < d_self.created_at
-              OR (
-                d_earlier.created_at = d_self.created_at
-                AND d_earlier.rowid < d_self.rowid
-              )
-            )
+            AND d_earlier.rowid < d_self.rowid
            WHERE d_self.id = ?
          )
          AND (
@@ -527,13 +526,7 @@ export function markFreeBlockedIfOverDeviceLimitStatement(
            FROM devices AS d_self
            JOIN devices AS d_earlier
              ON d_earlier.device_hash = d_self.device_hash
-            AND (
-              d_earlier.created_at < d_self.created_at
-              OR (
-                d_earlier.created_at = d_self.created_at
-                AND d_earlier.rowid < d_self.rowid
-              )
-            )
+            AND d_earlier.rowid < d_self.rowid
            WHERE d_self.id = ?
          ) >= ?`,
     )

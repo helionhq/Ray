@@ -107,7 +107,7 @@ export interface MeResponse {
    * `interval` and `status` stay null because there is no subscription.
    */
   trial: { ends_at: string } | null;
-  /** True when this PC is over the per-PC free-account limit. */
+  /** True when this account is over the per-PC free-account limit. */
   free_blocked: boolean;
   usage: {
     words_used: number;

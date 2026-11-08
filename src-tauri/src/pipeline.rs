@@ -470,7 +470,7 @@ impl Dictation {
                                 }
                                 ApiErrorKind::DeviceLimit => {
                                     quota_notice =
-                                        Some("Free limit reached on this PC".to_string());
+                                        Some("Free limit reached on this account".to_string());
                                 }
                                 ApiErrorKind::Other => {}
                             }
@@ -541,7 +541,7 @@ impl Dictation {
                                 }
                                 ApiErrorKind::DeviceLimit => {
                                     quota_notice =
-                                        Some("Free limit reached on this PC".to_string());
+                                        Some("Free limit reached on this account".to_string());
                                 }
                                 ApiErrorKind::Other => {}
                             }
@@ -642,7 +642,8 @@ impl Dictation {
                                 quota_notice = Some(error.to_string());
                             }
                             ApiErrorKind::DeviceLimit => {
-                                quota_notice = Some("Free limit reached on this PC".to_string());
+                                quota_notice =
+                                    Some("Free limit reached on this account".to_string());
                             }
                             ApiErrorKind::Other => {}
                         }
@@ -910,7 +911,7 @@ impl Dictation {
                 .message
                 .clone()
                 .unwrap_or_else(|| "Fair-use limit reached, resets Monday".into()),
-            ApiErrorKind::DeviceLimit => "Free limit reached on this PC".to_string(),
+            ApiErrorKind::DeviceLimit => "Free limit reached on this account".to_string(),
             ApiErrorKind::Other => error.to_string(),
         };
         match kind {

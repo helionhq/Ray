@@ -5,6 +5,7 @@ import {
   entitledProductIds,
   isEntitled,
   normalizeInterval,
+  proEndedThisWeek,
   resolveBillingIssue,
   resolvePlan,
   terminalStatusRank,
@@ -371,6 +372,84 @@ describe("resolvePlan — 14-day no-card trial", () => {
       resolvePlan([], NOW, PRODUCTS, { startedAt: null, freeBlocked: false })
         .plan,
     ).toBe("starter");
+  });
+});
+
+describe("proEndedThisWeek", () => {
+  const WEEK_START = NOW - 3 * 86_400;
+  const NO_TRIAL = { startedAt: null, freeBlocked: false };
+
+  it("is true for a trial that ended earlier this week", () => {
+    const trial = { startedAt: NOW - TRIAL_SECONDS - 60, freeBlocked: false };
+    const plan = resolvePlan([], NOW, PRODUCTS, trial);
+    expect(
+      proEndedThisWeek(plan, [], trial, PRODUCTS, NOW, WEEK_START),
+    ).toBe(true);
+  });
+
+  it("is true for a paid period that ended this week", () => {
+    const cancelled = subscription({
+      status: "canceled",
+      current_period_end: NOW - 60,
+    });
+    const plan = resolvePlan([cancelled], NOW, PRODUCTS);
+    expect(
+      proEndedThisWeek(
+        plan,
+        [cancelled],
+        NO_TRIAL,
+        PRODUCTS,
+        NOW,
+        WEEK_START,
+      ),
+    ).toBe(true);
+  });
+
+  it("is true when a refund revoked a paid subscription this week", () => {
+    const revoked = subscription({
+      status: "revoked",
+      current_period_end: FUTURE,
+      updated_at: (NOW - 60) * 1000,
+    });
+    const plan = resolvePlan([revoked], NOW, PRODUCTS);
+    expect(
+      proEndedThisWeek(
+        plan,
+        [revoked],
+        NO_TRIAL,
+        PRODUCTS,
+        NOW,
+        WEEK_START,
+      ),
+    ).toBe(true);
+  });
+
+  it("is false when Pro ended before this week or is still active", () => {
+    const expired = subscription({
+      status: "expired",
+      current_period_end: PAST,
+    });
+    expect(
+      proEndedThisWeek(
+        resolvePlan([expired], NOW, PRODUCTS),
+        [expired],
+        NO_TRIAL,
+        PRODUCTS,
+        NOW,
+        WEEK_START,
+      ),
+    ).toBe(false);
+    const active = subscription();
+    expect(
+      proEndedThisWeek(
+        resolvePlan([active], NOW, PRODUCTS),
+        [active],
+        NO_TRIAL,
+        PRODUCTS,
+        NOW,
+        WEEK_START,
+      ),
+    ).toBe(false);
   });
 });
 

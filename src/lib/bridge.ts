@@ -76,7 +76,7 @@ export interface Account {
   billing_issue: "past_due" | "unpaid" | "paused" | string | null;
   /** The active no-card Pro trial; null for paid subscriptions and Starter. */
   trial: Trial | null;
-  /** This PC is over the free-account limit and has no paid plan. */
+  /** This account is over the per-PC free-account limit and has no paid plan. */
   free_blocked: boolean;
   usage: Usage;
 }

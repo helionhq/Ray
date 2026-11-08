@@ -9,8 +9,8 @@ import type { AppContext } from "./env";
 import { getUsage, listSubscriptions, usageForPlan } from "./db";
 import {
   entitledProductIds,
+  proEndedThisWeek,
   resolvePlan,
-  trialEndedThisWeek,
 } from "./lib/plan";
 import { decideQuota, quotaLimits } from "./lib/quota";
 import { isoFromUnixSeconds, nowSeconds, weekBounds } from "./lib/weeks";
@@ -27,10 +27,11 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
     listSubscriptions(c.env.DB, user.id),
     getUsage(c.env.DB, user.id, week.weekStart),
   ]);
+  const products = entitledProductIds(c.env);
   const plan = resolvePlan(
     subscriptions,
     now,
-    entitledProductIds(c.env),
+    products,
     trial,
   );
 
@@ -43,7 +44,7 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
       {
         error: "device_limit",
         message:
-          "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating.",
+          "This account can't use the free plan because too many accounts were created on one PC. Upgrade to Pro to keep dictating.",
       },
       402,
     );
@@ -54,7 +55,14 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
     user,
     week.weekStart,
     rawUsage,
-    trialEndedThisWeek(plan, subscriptions, trial, now, week.weekStart),
+    proEndedThisWeek(
+      plan,
+      subscriptions,
+      trial,
+      products,
+      now,
+      week.weekStart,
+    ),
   );
 
   const decision = decideQuota(

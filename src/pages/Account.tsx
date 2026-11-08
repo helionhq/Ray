@@ -317,10 +317,13 @@ export function AccountPage({
             {account.free_blocked && (
               <div className="row">
                 <div className="row-copy">
-                  <div className="label">Free limit reached on this PC</div>
+                  <div className="label">
+                    Free limit reached on this account
+                  </div>
                   <div className="help">
-                    This PC has reached its limit of free accounts. Upgrade to
-                    Pro to keep dictating.
+                    This account can&rsquo;t use the free plan because too many
+                    accounts were created on one PC. Upgrade to Pro to keep
+                    dictating.
                   </div>
                 </div>
               </div>

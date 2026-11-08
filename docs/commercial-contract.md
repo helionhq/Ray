@@ -25,8 +25,10 @@ deviate, keep the deviation minimal and record it in your final report.
     over the trial at all times.
   - Trial-farming brake: trial grants are additionally rate limited per IP
     (Workers Rate Limiting, 3 starts/minute per Cloudflare location by default).
-    Over the limit, sign-in still succeeds but no trial is granted. This is an
-    abuse brake, not an enforcement boundary; device ids are client-supplied.
+    Over the limit, sign-in still succeeds but no trial is granted; the grant is
+    retried on the next authenticated device `/api/me` request under the same
+    limiter. This is an abuse brake, not an enforcement boundary; device ids are
+    client-supplied.
 
   - Audio abuse budget: AssemblyAI bills audio time, not words, so the Worker also
     meters the bytes streamed to it. Hidden weekly caps: Starter **60 minutes**
@@ -142,7 +144,10 @@ Google blocks OAuth inside embedded webviews, so sign-in happens in the system b
 The desktop reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` with
 `KEY_READ | KEY_WOW64_64KEY` and sends
 `device_id = base64url(SHA-256("ray-device-v1:" + guid))` in the token JSON body. The
-raw GUID is never sent or logged. `device_id` is **required**: token exchange rejects a
+raw GUID is never sent or logged. If the registry value is missing or unreadable
+(managed or privacy-hardened installs), the app generates a random per-install value
+once, stores it as `device-id` in the app-data directory, and hashes it the same way, so
+those machines can still sign in. `device_id` is **required**: token exchange rejects a
 missing or malformed value with `400 invalid_request`.
 
 The Worker validates `device_id` as a 43-character base64url value and stores
@@ -153,13 +158,15 @@ that applies only when:
 - the account has **no earlier row** for that `device_hash` (so a re-sign-in is never
   blocked), and
 - at least three **distinct other accounts** have an earlier row for the same hash,
-  ordered by `created_at` then `rowid` (revoked rows included).
+  ordered by `rowid` (insertion order; `created_at` is read before the INSERT and can
+  disagree with it), revoked rows included.
 
-The earlier-row ordering makes the decision atomic: concurrent sign-ins serialize to
-exactly three free accounts, and a re-sign-in by one of the first three is always
+The insertion-order comparison makes the decision atomic: concurrent sign-ins serialize
+to exactly three free accounts, and a re-sign-in by one of the first three is always
 allowed, even after a fourth account exists. A free-blocked account still signs in, so it
 can reach the upgrade buttons, but free STT answers `402 device_limit` and no trial
-starts. Only a paid Pro subscription restores dictation.
+starts. The flag is account-wide, so it also applies on other PCs; only a paid Pro
+subscription restores dictation.
 
 `device_id` is client-supplied, and a modified client can send a fresh random value per
 account. The per-PC rule is a deterrent, not an attestation boundary. The additional
@@ -203,7 +210,7 @@ Auth kinds: **clerk** = Clerk session JWT (site); **device** = device token (des
   "current_period_end": null,        // ISO string or null
   "billing_issue": null,             // null | "past_due" | "unpaid" | "paused"
   "trial": null,                     // null | { "ends_at": "2026-11-23T12:00:00Z" }
-  "free_blocked": false,             // this PC is over the free-account limit
+  "free_blocked": false,             // this account is over the per-PC free-account limit
   "usage": {
     "words_used": 412,
     "words_limit": 1000,             // null for Pro and trial (never expose hidden caps)
@@ -239,7 +246,7 @@ a subscription row and whose `trial_started_at` is within the last 14 days is **
 | 400 | `invalid_request`, `invalid_messages`, `model_not_allowed`, `invalid_keyterms`, `invalid_interval`, `invalid_audio` | malformed request |
 | 401 | `unauthorized` | invalid/revoked device token or Clerk session; the desktop signs out |
 | 402 | `quota_exceeded` | Starter weekly word or audio limit (STT only) |
-| 402 | `device_limit` | this PC has used its free accounts and the user has no paid plan (STT only) |
+| 402 | `device_limit` | this account is over the per-PC free-account limit and has no paid plan (STT only) |
 | 403 | `no_cleanup_grant` | no unexpired cleanup grant, or the tagged transcript exceeds the granted words + 25 |
 | 409 | `billing_issue`, `already_subscribed`, `no_billing_account`, `checkout_pending` | checkout/portal state |
 | 413 | `payload_too_large` (request/audio body) or `message_too_large` (cleanup system/user message) | input over its cap |
@@ -249,10 +256,12 @@ a subscription row and whose `trial_started_at` is within the last 14 days is **
 | 502 | `upstream_error` | upstream 401/402/403/5xx, unreachable, or timed out |
 | 503 | `upstream_busy` | upstream 429 |
 
-`device_limit` is `402 { "error": "device_limit", "message": "This PC has reached its
-limit of free accounts. Upgrade to Pro to keep dictating." }`. The desktop classifies it
-like `quota_exceeded`: the session stops without a batch fallback, the bar shows "Free
-limit reached on this PC", and Account opens.
+`device_limit` is `402 { "error": "device_limit", "message": "This account can't use the
+free plan because too many accounts were created on one PC. Upgrade to Pro to keep
+dictating." }`. The flag is account-wide: signing in on a shared PC suppresses free STT
+(and a trial) for that account everywhere until it has a paid subscription. The desktop
+classifies it like `quota_exceeded`: the session stops without a batch fallback, the bar
+shows "Free limit reached on this account", and Account opens.
 
 There is no separate `rate_limited` code: every rate limit is
 `429 { "error": "too_many_requests" }`. The desktop classifies Ray errors by the JSON
@@ -317,7 +326,7 @@ only `quota_exceeded`/`fair_use`/`device_limit` skip the fallback. The site trea
 Quota errors (no fallback should be attempted by the desktop for these):
 - `402 { "error": "quota_exceeded", "message": "…", "plan": "starter", "words_used", "words_limit", "resets_at" }`
 - `429 { "error": "fair_use", "message": "…", "resets_at" }` (Pro or trial over the hidden audio cap)
-- `402 { "error": "device_limit", "message": "This PC has reached its limit of free accounts. Upgrade to Pro to keep dictating." }`
+- `402 { "error": "device_limit", "message": "This account can't use the free plan because too many accounts were created on one PC. Upgrade to Pro to keep dictating." }`
 - `401 { "error": "unauthorized" }` → desktop treats as signed out.
 
 ### Cleanup proxy details
@@ -470,21 +479,24 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
     audio time (`FAIR_USE_WEEKLY_AUDIO_SECONDS` = 25,200 = 7 h). The no-card trial uses
     `TRIAL_WEEKLY_AUDIO_SECONDS` = 10,800 (3 h). Errors keep the existing
     `quota_exceeded` / `fair_use` shapes. Audio numbers are never exposed in `/api/me`.
-    When the trial ends during the current week, `users.starter_baseline_week` /
+    When Pro ends during the current week (the trial ending, or a paid subscription
+    canceled, expired, refunded, or downgraded), `users.starter_baseline_week` /
     `starter_baseline_words` / `starter_baseline_audio_seconds` snapshot that week's
-    totals at the first post-trial request; Starter counts only usage above the
-    baseline, so trial usage does not consume the new Starter allowance.
+    totals at the first Starter request; Starter counts only usage above the baseline, so
+    Pro usage does not consume the new Starter allowance.
 18. **No-card 14-day trial.** `users.trial_started_at` is set once by the first successful
     desktop token exchange, and only when the account has no subscription row, is not
     free-blocked, is under the per-IP trial-grant rate limit, and the request included a
     valid `device_id` (required by the API). The trial resolves as Pro with
     `trial: { ends_at }` in `/api/me`; paid subscriptions always take precedence. Checkout
     is allowed during a trial but still refused for a paid subscription. If the trial
-    rate limiter denies, sign-in still succeeds and the account stays Starter.
+    rate limiter denies, sign-in still succeeds and the account stays Starter; the grant
+    is retried on the next authenticated device `/api/me` request under the same limiter.
 19. **Per-PC free limit.** `devices.device_hash` stores `SHA-256(device_id)`. After
     inserting the new device row, one conditional `UPDATE` marks the account
     `free_blocked_at` only when it has no earlier row for that hash and at least three
-    distinct accounts have earlier rows. The fourth and later distinct accounts get no
-    trial; a free-blocked non-paying account gets `402 device_limit` on STT. A
-    re-sign-in by an earlier account is never blocked. A paid subscription works
-    normally. `/api/me` exposes `free_blocked`.
+    distinct accounts have earlier rows, ordered by `rowid` (insertion order). The
+    fourth and later distinct accounts get no trial; a free-blocked non-paying account
+    gets `402 device_limit` on STT. A re-sign-in by an earlier account is never blocked.
+    A paid subscription works normally. `/api/me` exposes `free_blocked`, and the flag is
+    account-wide (it applies on every PC).
