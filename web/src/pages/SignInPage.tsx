@@ -3,9 +3,10 @@ import { SignIn } from "@clerk/react";
 import { AuthShell } from "../components/AuthShell";
 import { AuthNotConfigured } from "../components/AuthNotConfigured";
 import { clerkEnabled } from "../lib/clerk";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { useLocation } from "../lib/router";
 import {
+  desktopRedirectFromSearch,
   readRememberedRedirect,
   rememberRedirect,
   safeRedirect,
@@ -17,9 +18,16 @@ function SignInInner() {
     "redirect_url",
   );
 
+  // state/challenge may be on this URL when a Clerk email link opened in a
+  // new tab, where sessionStorage from the original tab isn't available.
+  const desktopRedirect = desktopRedirectFromSearch(location.search);
+
   useEffect(() => {
+    // Remember the direct desktop params too, in case Clerk's flow drops the
+    // query while it moves the hash around.
     rememberRedirect(queryRedirect);
-  }, [queryRedirect]);
+    rememberRedirect(desktopRedirect);
+  }, [queryRedirect, desktopRedirect]);
 
   // Only fall back to the remembered destination once Clerk has started its
   // own flow; a fresh visit shouldn't inherit an old tab's redirect.
@@ -30,6 +38,7 @@ function SignInInner() {
   const inFlow = Boolean(location.hash) || exactPath !== "/sign-in";
   const redirectUrl =
     safeRedirect(queryRedirect) ??
+    desktopRedirect ??
     (inFlow ? readRememberedRedirect() : null) ??
     "/account";
   const signUpUrl = `/sign-up?redirect_url=${encodeURIComponent(redirectUrl)}`;
@@ -51,7 +60,12 @@ function SignInInner() {
 }
 
 export function SignInPage() {
-  usePageTitle("Sign in");
+  usePageMeta({
+    title: "Sign in",
+    description: "Sign in to your Ray account.",
+    path: "/sign-in",
+    noindex: true,
+  });
   if (!clerkEnabled) return <AuthNotConfigured />;
   return <SignInInner />;
 }

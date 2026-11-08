@@ -12,6 +12,26 @@ export function formatDate(iso: string | null) {
     month: "long",
     day: "numeric",
     year: "numeric",
+    // Server timestamps are UTC; format them in UTC so a date never slips a
+    // day for viewers west of Greenwich.
+    timeZone: "UTC",
+  });
+}
+
+/** e.g. "Monday, November 9 at 00:00 UTC" — always in UTC. */
+export function formatResetAt(iso: string | null) {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+    timeZoneName: "short",
   });
 }
 

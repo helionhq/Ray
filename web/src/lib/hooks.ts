@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
 
-const BASE_TITLE = "Ray — Fast, clean dictation for Windows";
-
 export function usePrefersDark() {
   const [dark, setDark] = useState(
     () =>
@@ -18,10 +16,4 @@ export function usePrefersDark() {
   }, []);
 
   return dark;
-}
-
-export function usePageTitle(title?: string) {
-  useEffect(() => {
-    document.title = title ? `${title} — Ray` : BASE_TITLE;
-  }, [title]);
 }

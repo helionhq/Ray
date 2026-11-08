@@ -38,11 +38,21 @@ export const PLANS = {
 
 export const BILLING_INTERVALS: BillingInterval[] = ["monthly", "annual"];
 
+/** Every reset sentence on the site uses this, always in UTC. */
+export const RESET_LABEL = `${PLANS.starter.resetDay} ${PLANS.starter.resetTime}`;
+
 export function proPrice(interval: BillingInterval) {
   return PLANS.pro[interval];
 }
 
 export const DOWNLOAD_URL = "https://github.com/helionhq/Ray/releases/latest";
+
+/**
+ * The public origin, used for canonical/OG URLs. It MUST match the Worker's
+ * `SITE_URL` var in `wrangler.jsonc` (and `web/.dev.vars` locally): the
+ * Worker derives Clerk's authorized parties from `SITE_URL`, so a mismatch
+ * makes sign-in fail.
+ */
 export const SITE_ORIGIN = "https://ray.helionhq.com";
 export const BILLING_SUCCESS_DEEPLINK = "ray://billing/success";
 export const REPOSITORY_URL = "https://github.com/helionhq/Ray";

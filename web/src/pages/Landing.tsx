@@ -1,13 +1,16 @@
 import { useState, type ReactNode } from "react";
+import { useAuth } from "@clerk/react";
 import {
   DOWNLOAD_URL,
   PLANS,
   PRIVACY_LINE,
+  RESET_LABEL,
   proPrice,
   type BillingInterval,
 } from "../content";
+import { clerkEnabled } from "../lib/clerk";
 import { formatNumber } from "../lib/format";
-import { usePageTitle } from "../lib/hooks";
+import { usePageMeta } from "../lib/head";
 import { Link } from "../lib/router";
 import {
   AppsIcon,
@@ -28,7 +31,7 @@ import { SiteHeader } from "../components/SiteHeader";
 
 const starterFeatures = [
   `${formatNumber(PLANS.starter.weeklyWords)} words a week`,
-  `Resets every ${PLANS.starter.resetDay}`,
+  `Resets ${RESET_LABEL}`,
   "Live transcription",
   "Structured cleanup",
   "Personal dictionary",
@@ -37,8 +40,7 @@ const starterFeatures = [
 ];
 
 const proFeatures = [
-  "Unlimited words",
-  "No weekly reset",
+  "Unlimited words · fair use applies",
   "Everything in Starter",
   "Live transcription + Structured cleanup",
   "Cancel anytime",
@@ -50,9 +52,10 @@ const faqs: { question: string; answer: ReactNode }[] = [
     answer: (
       <>
         Audio and transcripts are sent over a Cloudflare Worker to AssemblyAI
-        to be transcribed and cleaned up, then discarded. {PRIVACY_LINE} We
-        keep only your account details, your subscription, and your weekly word
-        count.{" "}
+        to be transcribed and cleaned up, then discarded from our servers.{" "}
+        {PRIVACY_LINE} We keep only your account details, your subscription,
+        your weekly word count, and device sign-ins. Your local History stays
+        on your PC.{" "}
         <Link to="/privacy">Read the privacy policy</Link>.
       </>
     ),
@@ -60,7 +63,7 @@ const faqs: { question: string; answer: ReactNode }[] = [
   {
     question: "What counts as a word?",
     answer:
-      "Ray counts whitespace-separated words in the final transcript. Punctuation doesn't add to the count, and the cleanup pass never counts twice.",
+      "Ray counts the words in the final transcript. Punctuation doesn't add to the count, and the cleanup pass never counts twice.",
   },
   {
     question: "What happens when I reach the Starter limit?",
@@ -176,6 +179,44 @@ function CleanupDemo() {
   );
 }
 
+function GetProCta({ interval }: { interval: BillingInterval }) {
+  if (!clerkEnabled) {
+    return (
+      <Link
+        className="btn btn-primary btn-block"
+        to={`/sign-up?redirect_url=${encodeURIComponent(
+          `/account?interval=${interval}`,
+        )}`}
+      >
+        Get Pro
+        <ArrowRightIcon size={15} />
+      </Link>
+    );
+  }
+  return <ClerkGetProCta interval={interval} />;
+}
+
+function ClerkGetProCta({ interval }: { interval: BillingInterval }) {
+  const { isLoaded, isSignedIn } = useAuth();
+  // Before Clerk resolves, /account is the safe destination either way: a
+  // signed-in visitor stays there, a signed-out one is sent to sign-in with
+  // the interval preserved in the redirect URL.
+  const to = !isLoaded
+    ? `/account?interval=${interval}`
+    : isSignedIn
+      ? `/account?interval=${interval}&checkout=1`
+      : `/sign-up?redirect_url=${encodeURIComponent(
+          `/account?interval=${interval}`,
+        )}`;
+
+  return (
+    <Link className="btn btn-primary btn-block" to={to}>
+      Get Pro
+      <ArrowRightIcon size={15} />
+    </Link>
+  );
+}
+
 function Pricing() {
   const [interval, setInterval] = useState<BillingInterval>("monthly");
   const price = proPrice(interval);
@@ -258,13 +299,7 @@ function Pricing() {
               ) : null}
             </p>
 
-            <Link
-              className="btn btn-primary btn-block"
-              to={`/sign-up?redirect_url=${encodeURIComponent("/account")}`}
-            >
-              Get Pro
-              <ArrowRightIcon size={15} />
-            </Link>
+            <GetProCta interval={interval} />
 
             <ul className="plan-features">
               {proFeatures.map((feature) => (
@@ -287,7 +322,7 @@ function Pricing() {
 }
 
 export function LandingPage() {
-  usePageTitle();
+  usePageMeta({ path: "/" });
 
   return (
     <div className="site">
@@ -353,7 +388,7 @@ export function LandingPage() {
                 <h3>Keep working</h3>
                 <p>
                   The cleaned text is pasted into the app you were already
-                  using. Your clipboard is restored, untouched.
+                  using. Ray restores your clipboard afterwards.
                 </p>
               </li>
             </ol>
@@ -433,8 +468,8 @@ export function LandingPage() {
                   </span>
                   <h3>Private by default</h3>
                   <p>
-                    Your audio and transcripts are processed to give you text,
-                    then discarded. {PRIVACY_LINE}
+                    Your audio and transcripts are sent to AssemblyAI to be
+                    transcribed and cleaned up. {PRIVACY_LINE}
                   </p>
                 </div>
                 <div className="privacy-route" aria-hidden="true">
@@ -446,7 +481,9 @@ export function LandingPage() {
                 </div>
                 <p className="privacy-note">
                   <LockIcon size={14} />
-                  Only account, subscription, and weekly word counts are stored.
+                  Only your account, subscription, weekly word counts, and
+                  device sign-ins are stored on our servers. History stays on
+                  your PC.
                 </p>
               </article>
             </div>
