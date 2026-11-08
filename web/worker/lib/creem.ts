@@ -247,6 +247,15 @@ export function parseCreemWebhook(
     }
     const product =
       recordAt(subscription, "product") ?? recordAt(object, "product");
+    const checkoutMetadata = recordAt(object, "metadata");
+    const subscriptionMetadata = recordAt(subscription, "metadata");
+    const metadata =
+      checkoutMetadata || subscriptionMetadata
+        ? {
+            ...(checkoutMetadata ?? {}),
+            ...(subscriptionMetadata ?? {}),
+          }
+        : null;
     return buildSubscriptionEvent({
       raw: subscription,
       eventType,
@@ -256,8 +265,7 @@ export function parseCreemWebhook(
       product,
       productId:
         stringAt(product, "id") ?? stringAt(subscription, "product"),
-      metadata:
-        recordAt(subscription, "metadata") ?? recordAt(object, "metadata"),
+      metadata,
       statusFallback: "active",
       options,
     });

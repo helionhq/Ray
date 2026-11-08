@@ -194,6 +194,8 @@ describe("parseCreemWebhook — checkout.completed", () => {
           status: "active",
           product: "prod_annual",
           customer: "cust_checkout",
+          // Empty subscription metadata must not hide checkout metadata.
+          metadata: {},
           current_period_end_date: "2027-11-08T12:00:00.000Z",
           updated_at: UPDATED_AT_MS,
         },
