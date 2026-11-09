@@ -9,7 +9,7 @@ import type { AppContext } from "./env";
 import { getUsage, listSubscriptions, usageForPlan } from "./db";
 import {
   entitledProductIds,
-  proEndedThisWeek,
+  proEndedAtThisWeek,
   resolvePlan,
 } from "./lib/plan";
 import { decideQuota, quotaLimits } from "./lib/quota";
@@ -55,7 +55,7 @@ export const quotaGuard: MiddlewareHandler<AppContext> = async (c, next) => {
     user,
     week.weekStart,
     rawUsage,
-    proEndedThisWeek(
+    proEndedAtThisWeek(
       plan,
       subscriptions,
       trial,

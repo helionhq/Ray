@@ -483,7 +483,9 @@ API. Where a decision names a cap or code, that value is the shipped behaviour.
     canceled, expired, refunded, or downgraded), `users.starter_baseline_week` /
     `starter_baseline_words` / `starter_baseline_audio_seconds` snapshot that week's
     totals at the first Starter request; Starter counts only usage above the baseline, so
-    Pro usage does not consume the new Starter allowance.
+    Pro usage does not consume the new Starter allowance. `starter_baseline_pro_ended_at`
+    records which Pro end the snapshot belongs to, so a second Pro-to-Starter transition
+    in the same week takes a fresh snapshot instead of reusing the stale one.
 18. **No-card 14-day trial.** `users.trial_started_at` is set once by the first successful
     desktop token exchange, and only when the account has no subscription row, is not
     free-blocked, is under the per-IP trial-grant rate limit, and the request included a

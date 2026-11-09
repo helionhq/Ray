@@ -98,6 +98,44 @@ function stubFetch(
   return calls;
 }
 
+/** Wraps D1 so every `usage_weeks` write fails, like a transient D1 error. */
+function dbWithFailingUsageWrites(db: D1Database): D1Database {
+  const guardStatement = (
+    statement: D1PreparedStatement,
+  ): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, property) {
+        if (property === "run") {
+          return async () => {
+            throw new Error("transient D1 failure");
+          };
+        }
+        const value = Reflect.get(target, property);
+        if (typeof value !== "function") return value;
+        if (property === "bind") {
+          return (...args: unknown[]) =>
+            guardStatement(value.apply(target, args));
+        }
+        return value.bind(target);
+      },
+    });
+
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "prepare") {
+        return (query: string) => {
+          const statement = target.prepare(query);
+          return query.includes("INSERT INTO usage_weeks")
+            ? guardStatement(statement)
+            : statement;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 /** Consumes a streamed request body like a real upstream would. */
 async function drainBody(init: RequestInit | undefined): Promise<void> {
   const body = init?.body as ReadableStream<Uint8Array> | undefined;
@@ -311,6 +349,34 @@ describe("word counting and cleanup grants on STT responses", () => {
     expect(grant?.words).toBe(2);
     expect(grant?.calls_left).toBe(6);
     expect(grant!.expires_at).toBeGreaterThan(nowSeconds());
+  });
+
+  it("still returns the transcript when the word usage write fails", async () => {
+    await seedUser("user_usage_write_failure");
+    const token = await seedDevice("user_usage_write_failure");
+    stubFetch(
+      () =>
+        new Response(
+          JSON.stringify({ text: "hello world", words: [{}, {}] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const response = await app.request(
+        syncRequest(token),
+        undefined,
+        { ...workerEnv(), DB: dbWithFailingUsageWrites(env.DB) },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        text: "hello world",
+        words: [{}, {}],
+      });
+      expect(error).toHaveBeenCalledWith("failed to record stt word usage");
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("counts CJK characters when there is no words array", async () => {

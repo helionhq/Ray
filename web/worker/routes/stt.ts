@@ -143,7 +143,13 @@ async function recordWords(
     }
     return;
   }
-  await addUsage(c.env.DB, c.get("user").id, weekStart, words);
+  try {
+    await addUsage(c.env.DB, c.get("user").id, weekStart, words);
+  } catch {
+    // An occasional quota undercount is acceptable; the transcript that was
+    // already produced must still reach the user.
+    console.error("failed to record stt word usage");
+  }
   try {
     // Every counted transcription earns cleanup capacity (decision 1).
     await grantCleanup(

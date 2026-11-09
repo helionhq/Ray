@@ -9,7 +9,7 @@ import {
 import { requireEither } from "../auth";
 import {
   entitledProductIds,
-  proEndedThisWeek,
+  proEndedAtThisWeek,
   resolveBillingIssue,
   resolvePlan,
 } from "../lib/plan";
@@ -62,7 +62,7 @@ export function registerMeRoutes(app: Hono<AppContext>): void {
       user,
       week.weekStart,
       rawUsage,
-      proEndedThisWeek(
+      proEndedAtThisWeek(
         plan,
         subscriptions,
         trial,

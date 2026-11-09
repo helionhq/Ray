@@ -187,17 +187,17 @@ export function trialEndsAt(trial: TrialState): number | null {
 /**
  * When a stored subscription stopped granting Pro: the paid-through time for
  * a period that ran out, or the status-change time for a revocation or
- * payment failure. False when the row was never entitled (another product) or
+ * payment failure. Null when the row was never entitled (another product) or
  * its end is outside the current week.
  */
-function subscriptionEndedThisWeek(
+function subscriptionEndedAtThisWeek(
   subscription: SubscriptionRow,
   entitledProducts: readonly string[],
   nowSeconds: number,
   weekStart: number,
-): boolean {
+): number | null {
   if (!isAllowedProduct(subscription.product_id, entitledProducts)) {
-    return false;
+    return null;
   }
   const periodStatus =
     subscription.status === "canceled" ||
@@ -210,7 +210,48 @@ function subscriptionEndedThisWeek(
     periodStatus && subscription.current_period_end !== null
       ? subscription.current_period_end
       : Math.floor(subscription.updated_at / 1000);
-  return endedAt !== null && endedAt <= nowSeconds && endedAt >= weekStart;
+  if (endedAt === null || endedAt > nowSeconds || endedAt < weekStart) {
+    return null;
+  }
+  return endedAt;
+}
+
+/**
+ * The latest moment Pro stopped granting access in the current week, or null
+ * when the account is still Pro or Pro did not end this week. The timestamp
+ * identifies which transition a Starter baseline snapshot belongs to, so a
+ * second Pro-to-Starter transition in the same week can replace a stale
+ * baseline.
+ */
+export function proEndedAtThisWeek(
+  plan: PlanView,
+  subscriptions: readonly SubscriptionRow[],
+  trial: TrialState,
+  entitledProducts: readonly string[],
+  nowSeconds: number,
+  weekStart: number,
+): number | null {
+  if (plan.plan !== "starter") return null;
+  let endedAt: number | null = null;
+  const trialEnd = trialEndsAt(trial);
+  if (trialEnd !== null && trialEnd <= nowSeconds && trialEnd >= weekStart) {
+    endedAt = trialEnd;
+  }
+  for (const subscription of subscriptions) {
+    const subscriptionEnd = subscriptionEndedAtThisWeek(
+      subscription,
+      entitledProducts,
+      nowSeconds,
+      weekStart,
+    );
+    if (
+      subscriptionEnd !== null &&
+      (endedAt === null || subscriptionEnd > endedAt)
+    ) {
+      endedAt = subscriptionEnd;
+    }
+  }
+  return endedAt;
 }
 
 /**
@@ -227,18 +268,15 @@ export function proEndedThisWeek(
   nowSeconds: number,
   weekStart: number,
 ): boolean {
-  if (plan.plan !== "starter") return false;
-  const endsAt = trialEndsAt(trial);
-  if (endsAt !== null && endsAt <= nowSeconds && endsAt >= weekStart) {
-    return true;
-  }
-  return subscriptions.some((subscription) =>
-    subscriptionEndedThisWeek(
-      subscription,
+  return (
+    proEndedAtThisWeek(
+      plan,
+      subscriptions,
+      trial,
       entitledProducts,
       nowSeconds,
       weekStart,
-    ),
+    ) !== null
   );
 }
 

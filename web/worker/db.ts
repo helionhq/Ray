@@ -21,7 +21,7 @@ export async function getUser(
       `SELECT id, email, name, creem_customer_id, created_at,
               trial_started_at, free_blocked_at,
               starter_baseline_week, starter_baseline_words,
-              starter_baseline_audio_seconds
+              starter_baseline_audio_seconds, starter_baseline_pro_ended_at
        FROM users WHERE id = ? AND deleted_at IS NULL`,
     )
     .bind(id)
@@ -189,38 +189,56 @@ export async function getUsageWords(
  * words and audio in the same `usage_weeks` row as the Starter usage that
  * follows. When Pro ended in the current week, the first Starter call
  * snapshots that week's totals and later calls subtract them, so only usage
- * recorded after the transition counts against Starter. The snapshot is
- * idempotent (`starter_baseline_week` names the week it belongs to), and
- * later weeks are unaffected.
+ * recorded after the transition counts against Starter. `proEndedAt` names the
+ * Pro end the snapshot belongs to (`starter_baseline_pro_ended_at`), so a
+ * second transition in the same week takes a fresh snapshot instead of
+ * reusing the stale one; later weeks are unaffected.
  */
 export async function usageForPlan(
   db: D1Database,
   user: UserRow,
   weekStart: number,
   usage: WeeklyUsage,
-  proEndedThisWeek: boolean,
+  proEndedAt: number | null,
 ): Promise<WeeklyUsage> {
-  if (!proEndedThisWeek) return usage;
+  if (proEndedAt === null) return usage;
 
   let baselineWeek = user.starter_baseline_week;
   let baselineWords = user.starter_baseline_words;
   let baselineAudio = user.starter_baseline_audio_seconds;
-  if (baselineWeek !== weekStart) {
+  let baselineProEnd = user.starter_baseline_pro_ended_at;
+  if (
+    baselineWeek !== weekStart ||
+    baselineProEnd === null ||
+    proEndedAt > baselineProEnd
+  ) {
     await db
       .prepare(
         `UPDATE users
          SET starter_baseline_week = ?,
              starter_baseline_words = ?,
-             starter_baseline_audio_seconds = ?
+             starter_baseline_audio_seconds = ?,
+             starter_baseline_pro_ended_at = ?
          WHERE id = ? AND deleted_at IS NULL
-           AND (starter_baseline_week IS NULL OR starter_baseline_week != ?)`,
+           AND (starter_baseline_week IS NULL OR starter_baseline_week != ?
+                OR starter_baseline_pro_ended_at IS NULL
+                OR starter_baseline_pro_ended_at < ?)`,
       )
-      .bind(weekStart, usage.words, usage.audioSeconds, user.id, weekStart)
+      .bind(
+        weekStart,
+        usage.words,
+        usage.audioSeconds,
+        proEndedAt,
+        user.id,
+        weekStart,
+        proEndedAt,
+      )
       .run();
     const row = await db
       .prepare(
         `SELECT starter_baseline_week, starter_baseline_words,
-                starter_baseline_audio_seconds
+                starter_baseline_audio_seconds,
+                starter_baseline_pro_ended_at
          FROM users WHERE id = ? AND deleted_at IS NULL`,
       )
       .bind(user.id)
@@ -228,14 +246,22 @@ export async function usageForPlan(
         starter_baseline_week: number | null;
         starter_baseline_words: number;
         starter_baseline_audio_seconds: number;
+        starter_baseline_pro_ended_at: number | null;
       }>();
     if (row) {
       baselineWeek = row.starter_baseline_week;
       baselineWords = row.starter_baseline_words;
       baselineAudio = row.starter_baseline_audio_seconds;
+      baselineProEnd = row.starter_baseline_pro_ended_at;
     }
   }
-  if (baselineWeek !== weekStart) return usage;
+  if (
+    baselineWeek !== weekStart ||
+    baselineProEnd === null ||
+    proEndedAt > baselineProEnd
+  ) {
+    return usage;
+  }
   return {
     words: Math.max(0, usage.words - baselineWords),
     audioSeconds: Math.max(0, usage.audioSeconds - baselineAudio),

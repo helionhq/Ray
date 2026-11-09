@@ -68,6 +68,12 @@ export interface UserRow {
   starter_baseline_week: number | null;
   starter_baseline_words: number;
   starter_baseline_audio_seconds: number;
+  /**
+   * The Pro end (unix seconds) the baseline snapshot was taken for. Null for
+   * snapshots predating this column; a newer Pro end in the same week
+   * replaces the baseline.
+   */
+  starter_baseline_pro_ended_at: number | null;
 }
 
 export interface SubscriptionRow {

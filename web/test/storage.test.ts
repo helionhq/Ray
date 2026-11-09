@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import {
   acquireSttLease,
   addSttFailure,
+  addUsage,
   consumeCleanupGrant,
   getSttFailures,
   getSubscription,
@@ -13,6 +14,7 @@ import {
   STT_LEASE_LIMIT,
   upsertSubscriptionIfNewer,
   upsertUser,
+  usageForPlan,
 } from "../worker/db";
 import type { SubscriptionRow } from "../worker/env";
 import { nowSeconds, weekBounds } from "../worker/lib/weeks";
@@ -334,5 +336,73 @@ describe("subscription ordering", () => {
     expect((await getSubscription(env.DB, "sub_ties"))?.status).toBe(
       "active",
     );
+  });
+});
+
+describe("Starter baseline after repeated Pro ends", () => {
+  it("re-snapshots when a later Pro end lands in the same week", async () => {
+    const userId = "user_baseline_repeat";
+    await seedUser(userId);
+    const weekStart = 1_760_000_000;
+    const trialEnd = weekStart + 3_600;
+    const refundAt = weekStart + 2 * 86_400;
+
+    // The trial's usage earlier in the week is snapshotted when it ends.
+    await addUsage(env.DB, userId, weekStart, 500);
+    let user = await getUser(env.DB, userId);
+    expect(user).not.toBeNull();
+    expect(
+      await usageForPlan(
+        env.DB,
+        user!,
+        weekStart,
+        { words: 500, audioSeconds: 0 },
+        trialEnd,
+      ),
+    ).toEqual({ words: 0, audioSeconds: 0 });
+    expect(
+      (await getUser(env.DB, userId))?.starter_baseline_pro_ended_at,
+    ).toBe(trialEnd);
+
+    // The user upgrades and is refunded in the same week. The Pro usage must
+    // not count against the new Starter allowance.
+    await addUsage(env.DB, userId, weekStart, 200);
+    user = await getUser(env.DB, userId);
+    expect(
+      await usageForPlan(
+        env.DB,
+        user!,
+        weekStart,
+        { words: 700, audioSeconds: 0 },
+        refundAt,
+      ),
+    ).toEqual({ words: 0, audioSeconds: 0 });
+    expect(
+      (await getUser(env.DB, userId))?.starter_baseline_pro_ended_at,
+    ).toBe(refundAt);
+
+    // Starter usage after the refund counts against the fresh baseline.
+    await addUsage(env.DB, userId, weekStart, 100);
+    user = await getUser(env.DB, userId);
+    expect(
+      await usageForPlan(
+        env.DB,
+        user!,
+        weekStart,
+        { words: 800, audioSeconds: 0 },
+        refundAt,
+      ),
+    ).toEqual({ words: 100, audioSeconds: 0 });
+
+    // A stale request carrying the earlier Pro end cannot reset the baseline.
+    expect(
+      await usageForPlan(
+        env.DB,
+        user!,
+        weekStart,
+        { words: 800, audioSeconds: 0 },
+        trialEnd,
+      ),
+    ).toEqual({ words: 100, audioSeconds: 0 });
   });
 });
