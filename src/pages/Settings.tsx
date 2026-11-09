@@ -1,34 +1,14 @@
-import {
-  Fragment,
-  useEffect,
-  useRef,
-  useState,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type ReactNode,
-} from "react";
-import type {
-  CleanupMode,
-  Provider,
-  Settings,
-  Snapshot,
-  Theme,
-} from "../lib/bridge";
+import { useState } from "react";
+import type { Settings, Snapshot, Theme } from "../lib/bridge";
 import { api } from "../lib/bridge";
 import { applyTheme } from "../lib/theme";
-import { hotkeyLabel } from "../lib/format";
+import { ShortcutSetting } from "../components/ShortcutSetting";
 import {
   updatesSupported,
   type UpdateCheck,
   type Updater,
 } from "../lib/updater";
-import {
-  AlertIcon,
-  CheckIcon,
-  ChevronIcon,
-  EyeIcon,
-  EyeOffIcon,
-  MoreIcon,
-} from "../components/Icons";
+import { ChevronIcon } from "../components/Icons";
 
 interface Props {
   snapshot: Snapshot;
@@ -37,90 +17,10 @@ interface Props {
   updater: Updater;
 }
 
-type Drafts = Record<Provider, string>;
-type Reveals = Record<Provider, boolean>;
-type ProviderFlags = Record<Provider, boolean>;
-type KeyTest = "connected" | "failed" | null;
-
-const emptyDrafts: Drafts = { assemblyai: "", vercel: "" };
-const hidden: Reveals = { assemblyai: false, vercel: false };
-const unflagged: ProviderFlags = {
-  assemblyai: false,
-  vercel: false,
-};
-const untested: Record<Provider, KeyTest> = { assemblyai: null, vercel: null };
-
-const cleanupModeHelp: Record<CleanupMode, string> = {
-  clean: "Fixes fillers and grammar, keeping your wording.",
-  structured: "Rewrites for flow, with paragraphs and lists.",
-};
-
 export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
-  const [drafts, setDrafts] = useState<Drafts>(emptyDrafts);
-  const [reveals, setReveals] = useState<Reveals>(hidden);
-  const [replacing, setReplacing] = useState<ProviderFlags>(unflagged);
-  const [testStates, setTestStates] = useState<Record<Provider, KeyTest>>(untested);
-  const [testErrors, setTestErrors] = useState<Partial<Record<Provider, string>>>({});
-  const [menuFor, setMenuFor] = useState<Provider | null>(null);
-  const [menuPosition, setMenuPosition] = useState<{
-    top: number;
-    right: number;
-  } | null>(null);
-  const [armedRemove, setArmedRemove] = useState<Provider | null>(null);
-  const [focusAfterRemove, setFocusAfterRemove] = useState<Provider | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [checked, setChecked] = useState<UpdateCheck | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const moreRefs = useRef<Partial<Record<Provider, HTMLButtonElement | null>>>({});
-  const keyVersions = useRef<Record<Provider, number>>({
-    assemblyai: 0,
-    vercel: 0,
-  });
 
-  useEffect(() => {
-    if (!armedRemove) return;
-    const timer = window.setTimeout(() => setArmedRemove(null), 4000);
-    return () => window.clearTimeout(timer);
-  }, [armedRemove]);
-
-  useEffect(() => {
-    const provider = menuFor;
-    if (provider === null) return;
-    const activeProvider: Provider = provider;
-    const menu = menuRef.current;
-    menu
-      ?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
-      ?.focus();
-
-    function closeOnOutside(event: PointerEvent) {
-      const target = event.target as Node;
-      if (menu?.contains(target)) return;
-      if (moreRefs.current[activeProvider]?.contains(target)) return;
-      setMenuFor(null);
-    }
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      setMenuFor(null);
-      moreRefs.current[activeProvider]?.focus();
-    }
-    function close() {
-      setMenuFor(null);
-    }
-
-    document.addEventListener("pointerdown", closeOnOutside);
-    document.addEventListener("keydown", closeOnEscape);
-    window.addEventListener("scroll", close, true);
-    window.addEventListener("resize", close);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutside);
-      document.removeEventListener("keydown", closeOnEscape);
-      window.removeEventListener("scroll", close, true);
-      window.removeEventListener("resize", close);
-    };
-  }, [menuFor]);
-
-  const saved = snapshot.keys;
   const canCheck = updatesSupported();
   const checking = updater.checking;
   const updateBusy = updater.phase !== "idle";
@@ -171,75 +71,6 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
     } catch (error) {
       setChecked({ status: "error", message: String(error) });
       notify("Couldn't check for updates");
-    }
-  }
-
-  async function saveKey(provider: Provider) {
-    const value = drafts[provider].trim();
-    if (!value) return;
-    keyVersions.current[provider] += 1;
-    setBusy(`save-${provider}`);
-    try {
-      await api.saveSecret(provider, value);
-      setDrafts((current) => ({ ...current, [provider]: "" }));
-      setReveals((current) => ({ ...current, [provider]: false }));
-      setReplacing((current) => ({ ...current, [provider]: false }));
-      setTestStates((current) => ({ ...current, [provider]: null }));
-      setTestErrors((current) => ({ ...current, [provider]: undefined }));
-      await refresh();
-      notify("Key saved in Windows Credential Manager");
-    } catch (error) {
-      notify(String(error));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function testKey(provider: Provider) {
-    const version = keyVersions.current[provider];
-    setBusy(`test-${provider}`);
-    setTestErrors((current) => ({ ...current, [provider]: undefined }));
-    try {
-      if (drafts[provider].trim()) {
-        await api.saveSecret(provider, drafts[provider].trim());
-        setDrafts((current) => ({ ...current, [provider]: "" }));
-        setReveals((current) => ({ ...current, [provider]: false }));
-        setReplacing((current) => ({ ...current, [provider]: false }));
-      }
-      const message = await api.testSecret(provider);
-      if (keyVersions.current[provider] !== version) return;
-      setTestStates((current) => ({ ...current, [provider]: "connected" }));
-      notify(message);
-      await refresh();
-    } catch (error) {
-      if (keyVersions.current[provider] !== version) return;
-      setTestStates((current) => ({ ...current, [provider]: "failed" }));
-      setTestErrors((current) => ({ ...current, [provider]: String(error) }));
-      notify(String(error));
-    } finally {
-      setBusy((current) => (current === `test-${provider}` ? null : current));
-    }
-  }
-
-  async function removeKey(provider: Provider) {
-    keyVersions.current[provider] += 1;
-    setBusy(`remove-${provider}`);
-    try {
-      await api.clearSecret(provider);
-      setMenuFor(null);
-      setArmedRemove(null);
-      setTestStates((current) => ({ ...current, [provider]: null }));
-      setTestErrors((current) => ({ ...current, [provider]: undefined }));
-      setReplacing((current) => ({ ...current, [provider]: false }));
-      setDrafts((current) => ({ ...current, [provider]: "" }));
-      setReveals((current) => ({ ...current, [provider]: false }));
-      setFocusAfterRemove(provider);
-      await refresh();
-      notify("Key removed");
-    } catch (error) {
-      notify(String(error));
-    } finally {
-      setBusy(null);
     }
   }
 
@@ -295,275 +126,6 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
     }
   }
 
-  function toggleKeyMenu(provider: Provider, trigger: HTMLButtonElement) {
-    if (menuFor === provider) {
-      setMenuFor(null);
-      return;
-    }
-    const rect = trigger.getBoundingClientRect();
-    setMenuPosition({
-      top: rect.bottom + 6,
-      right: Math.max(12, window.innerWidth - rect.right),
-    });
-    setArmedRemove(null);
-    setMenuFor(provider);
-  }
-
-  function beginReplace(provider: Provider) {
-    keyVersions.current[provider] += 1;
-    setReplacing((current) => ({ ...current, [provider]: true }));
-    setTestStates((current) => ({ ...current, [provider]: null }));
-    setTestErrors((current) => ({ ...current, [provider]: undefined }));
-    setMenuFor(null);
-  }
-
-  function onMenuKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
-    const items = Array.from(
-      event.currentTarget.querySelectorAll<HTMLButtonElement>(
-        '[role="menuitem"]:not(:disabled)',
-      ),
-    );
-    if (event.key === "Tab") {
-      setMenuFor(null);
-      return;
-    }
-    if (items.length === 0) return;
-    const index = items.indexOf(document.activeElement as HTMLButtonElement);
-    let next: number;
-    switch (event.key) {
-      case "ArrowDown":
-        next = (index + 1) % items.length;
-        break;
-      case "ArrowUp":
-        next = (index - 1 + items.length) % items.length;
-        break;
-      case "Home":
-        next = 0;
-        break;
-      case "End":
-        next = items.length - 1;
-        break;
-      default:
-        return;
-    }
-    event.preventDefault();
-    items[next]?.focus();
-  }
-
-  function keyRow(
-    provider: Provider,
-    label: string,
-    help: string,
-    placeholder: string,
-  ) {
-    const isSaved = saved[provider];
-    const isBusy = busy?.endsWith(provider) ?? false;
-    const isReplacing = replacing[provider];
-    const isTesting = busy === `test-${provider}`;
-    const editing = !isSaved || isReplacing;
-    const testState = testStates[provider];
-    const menuOpen = menuFor === provider;
-    const menuId = `key-menu-${provider}`;
-
-    let status: ReactNode;
-    if (isTesting) {
-      status = (
-        <span className="key-status" aria-live="polite">
-          <span className="status-spinner" aria-hidden="true" />
-          Testing…
-        </span>
-      );
-    } else if (testState === "connected") {
-      status = (
-        <span className="key-status is-ok" aria-live="polite">
-          <CheckIcon size={13} />
-          Connected
-        </span>
-      );
-    } else if (testState === "failed") {
-      status = (
-        <span
-          className="key-status is-error"
-          aria-live="polite"
-          title={testErrors[provider]}
-        >
-          <AlertIcon size={13} />
-          Test failed
-        </span>
-      );
-    } else if (isSaved) {
-      status = (
-        <span className="key-status">
-          <span className="status-dot" aria-hidden="true" />
-          Saved
-        </span>
-      );
-    } else {
-      status = (
-        <span className="key-status is-muted">
-          <span className="status-dot is-empty" aria-hidden="true" />
-          Not set
-        </span>
-      );
-    }
-
-    return (
-      <Fragment key={provider}>
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">{label}</div>
-            <div className="help">{help}</div>
-          </div>
-          <div className="key">
-            {status}
-            <button
-              type="button"
-              className="btn btn-ghost"
-              aria-label={`Test ${label} key`}
-              onClick={() => void testKey(provider)}
-              disabled={isBusy || (!isSaved && !drafts[provider].trim())}
-            >
-              Test
-            </button>
-            {isSaved && !isReplacing && (
-              <button
-                ref={(node) => {
-                  moreRefs.current[provider] = node;
-                }}
-                type="button"
-                className="key-more"
-                aria-haspopup="menu"
-                aria-expanded={menuOpen}
-                aria-controls={menuOpen ? menuId : undefined}
-                aria-label={`More actions for ${label}`}
-                title={`More actions for ${label}`}
-                disabled={isBusy}
-                onClick={(event) => toggleKeyMenu(provider, event.currentTarget)}
-              >
-                <MoreIcon size={16} />
-              </button>
-            )}
-            {menuOpen && menuPosition && (
-              <div
-                id={menuId}
-                ref={menuRef}
-                className="key-menu"
-                role="menu"
-                aria-label={`${label} key actions`}
-                style={{ top: menuPosition.top, right: menuPosition.right }}
-                onKeyDown={onMenuKeyDown}
-              >
-                <button
-                  type="button"
-                  role="menuitem"
-                  disabled={isBusy}
-                  onClick={() => beginReplace(provider)}
-                >
-                  Replace key
-                </button>
-                <div className="menu-sep" role="separator" />
-                <button
-                  type="button"
-                  role="menuitem"
-                  className={`is-danger${
-                    armedRemove === provider ? " is-armed" : ""
-                  }`}
-                  disabled={isBusy}
-                  onClick={() => {
-                    if (armedRemove === provider) {
-                      void removeKey(provider);
-                    } else {
-                      setArmedRemove(provider);
-                    }
-                  }}
-                >
-                  {armedRemove === provider ? "Confirm remove" : "Remove key"}
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-        {editing && (
-          <div className="key-editor" key={`${provider}-editor`}>
-            <div className="key-wrap">
-              <input
-                className="input"
-                type={reveals[provider] ? "text" : "password"}
-                value={drafts[provider]}
-                onChange={(event) =>
-                  setDrafts((current) => ({
-                    ...current,
-                    [provider]: event.target.value,
-                  }))
-                }
-                onKeyDown={(event) => {
-                  if (
-                    event.key === "Enter" &&
-                    drafts[provider].trim() &&
-                    !isBusy
-                  ) {
-                    event.preventDefault();
-                    void saveKey(provider);
-                  }
-                }}
-                placeholder={
-                  isSaved ? "Paste a new key" : placeholder
-                }
-                aria-label={`${label} API key`}
-                spellCheck={false}
-                autoComplete="off"
-                autoFocus={isReplacing || focusAfterRemove === provider}
-              />
-              <button
-                type="button"
-                className="reveal"
-                onClick={() =>
-                  setReveals((current) => ({
-                    ...current,
-                    [provider]: !current[provider],
-                  }))
-                }
-                aria-label={reveals[provider] ? "Hide key" : "Show key"}
-              >
-                {reveals[provider] ? (
-                  <EyeOffIcon size={14} />
-                ) : (
-                  <EyeIcon size={14} />
-                )}
-              </button>
-            </div>
-            <button
-              type="button"
-              className="btn"
-              aria-label={`Save ${label} key`}
-              onClick={() => void saveKey(provider)}
-              disabled={!drafts[provider].trim() || isBusy}
-            >
-              Save
-            </button>
-            {isReplacing && (
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={() => {
-                  setReplacing((current) => ({
-                    ...current,
-                    [provider]: false,
-                  }));
-                  setDrafts((current) => ({ ...current, [provider]: "" }));
-                  setReveals((current) => ({ ...current, [provider]: false }));
-                }}
-                disabled={isBusy}
-              >
-                Cancel
-              </button>
-            )}
-          </div>
-        )}
-      </Fragment>
-    );
-  }
-
   const devices = snapshot.devices;
   const selectedDevice = snapshot.settings.input_device;
   const hasSelected =
@@ -575,48 +137,21 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
         <div>
           <h1>Settings</h1>
           <p className="sub">
-            Keys stay in Windows Credential Manager. Only audio and text go to
-            the services below.
+            Only audio, the transcript, your dictionary terms, and the
+            foreground app name go to Ray, which sends them to AssemblyAI for
+            transcription and cleanup. History stays on this PC.
           </p>
         </div>
       </header>
-
-      <div className="group-label">Transcription</div>
-      <div className="card">
-        {keyRow(
-          "assemblyai",
-          "AssemblyAI",
-          "Streaming speech-to-text, with batch upload as a fallback.",
-          "Paste your AssemblyAI key",
-        )}
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">Stream while I speak</div>
-            <div className="help">Stopping only waits for the last few words.</div>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={snapshot.settings.streaming_enabled}
-            aria-label="Stream while speaking"
-            className="switch"
-            disabled={busy !== null}
-            onClick={() =>
-              void update(
-                { streaming_enabled: !snapshot.settings.streaming_enabled },
-                "streaming",
-              )
-            }
-          />
-        </div>
-      </div>
 
       <div className="group-label">Cleanup</div>
       <div className="card">
         <div className="row">
           <div className="row-copy">
             <div className="label">Clean up transcripts</div>
-            <div className="help">Turns raw speech into ready-to-send text.</div>
+            <div className="help">
+              Rewrites speech for flow, with paragraphs and lists.
+            </div>
           </div>
           <button
             type="button"
@@ -633,39 +168,11 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
             }
           />
         </div>
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">Mode</div>
-            <div className="help">
-              Clean fixes fillers and grammar. Structured rewrites for flow.
-            </div>
-          </div>
-          <div className="segmented" role="group" aria-label="Cleanup mode">
-            {(["clean", "structured"] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                aria-pressed={snapshot.settings.cleanup_mode === mode}
-                disabled={busy !== null || !snapshot.settings.cleanup_enabled}
-                title={cleanupModeHelp[mode]}
-                onClick={() => void update({ cleanup_mode: mode }, "mode")}
-              >
-                {mode === "clean" ? "Clean" : "Structured"}
-              </button>
-            ))}
-          </div>
-        </div>
       </div>
 
       <div className="group-label">General</div>
       <div className="card">
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">Dictation shortcut</div>
-            <div className="help">Press once to start, again to paste. Esc cancels.</div>
-          </div>
-          <kbd>{hotkeyLabel()}</kbd>
-        </div>
+        <ShortcutSetting notify={notify} />
 
         <div className="row">
           <div className="row-copy">
@@ -813,7 +320,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
           <button
             type="button"
             className="btn btn-ghost"
-            title="Reload pipeline.json, cleanup.md and structured.md overrides"
+            title="Reload pipeline.json and structured.md overrides"
             onClick={async () => {
               try {
                 await api.reloadConfig();

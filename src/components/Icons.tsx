@@ -42,6 +42,13 @@ export const SettingsIcon = (props: IconProps) => (
   </Icon>
 );
 
+export const AccountIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <circle cx="12" cy="8.5" r="3.5" />
+    <path d="M5.5 19.5c.8-3.2 3.3-5 6.5-5s5.7 1.8 6.5 5" />
+  </Icon>
+);
+
 export const SearchIcon = (props: IconProps) => (
   <Icon {...props}>
     <circle cx="11" cy="11" r="6.5" />

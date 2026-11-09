@@ -20,23 +20,12 @@ fn main() {
         let streaming = flag != "--selftest";
         let resample = flag == "--selftest-resample";
         let Some(path) = args.get(position + 1) else {
-            eprintln!("usage: ray --selftest <16kHz-mono.wav> [--mode clean|structured]");
-            eprintln!("       ray --selftest-stream <16kHz-mono.wav> [--mode clean|structured]");
-            eprintln!(
-                "       ray --selftest-resample <any-rate-mono.wav> [--mode clean|structured]"
-            );
-            eprintln!("       (or set RAY_CLEANUP_MODE=clean|structured)");
+            eprintln!("usage: ray --selftest <16kHz-mono.wav>");
+            eprintln!("       ray --selftest-stream <16kHz-mono.wav>");
+            eprintln!("       ray --selftest-resample <any-rate-mono.wav>");
+            eprintln!("       Auth: sign in once, or set RAY_DEVICE_TOKEN; origin: RAY_API_BASE");
             std::process::exit(2);
         };
-        // `--mode structured` is sugar for the env var the selftest reads, so
-        // both entry points share one implementation. See selftest.rs.
-        if let Some(mode) = cleanup_mode_arg(&args) {
-            if !mode.eq_ignore_ascii_case("clean") && !mode.eq_ignore_ascii_case("structured") {
-                eprintln!("--mode must be clean or structured, got {mode:?}");
-                std::process::exit(2);
-            }
-            std::env::set_var("RAY_CLEANUP_MODE", mode);
-        }
         let path = path.clone();
         // The HTTP/TLS futures are large in debug builds; give them room.
         let result = std::thread::Builder::new()
@@ -56,20 +45,4 @@ fn main() {
         std::process::exit(result.unwrap_or(2));
     }
     ray_lib::run();
-}
-
-/// Accept both `--mode structured` and `--mode=structured`.
-fn cleanup_mode_arg(args: &[String]) -> Option<String> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--mode" {
-            return args.get(index + 1).cloned();
-        }
-        if let Some(value) = arg.strip_prefix("--mode=") {
-            return Some(value.to_string());
-        }
-        index += 1;
-    }
-    None
 }

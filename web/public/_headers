@@ -1,0 +1,38 @@
+# Security headers for the static site.
+#
+# Cloudflare Workers Static Assets applies this file from the build output;
+# Vite copies `web/public/_headers` to `dist/_headers`.
+#
+# Clerk runs its own Frontend API (FAPI). Development instances use
+# https://<slug>.clerk.accounts.dev; a production instance normally uses a
+# custom host such as https://clerk.helionhq.com. `helionhq.com` is a
+# PLACEHOLDER: when the real domain and Clerk FAPI host are chosen, update the
+# FAPI hosts in script-src and connect-src below together with SITE_URL (see
+# "Changing the domain" in web/README.md). If the Clerk dashboard shows a
+# different Frontend API URL, use that host instead.
+#
+# CSP source notes:
+#   'self'                      site assets, self-hosted Geist fonts, same-origin API
+#   *.clerk.accounts.dev        Clerk development instances
+#   clerk.helionhq.com          expected Clerk production Frontend API host
+#   *.helionhq.com              covers whichever Clerk host is configured under our domain
+#   challenges.cloudflare.com   Clerk bot protection / Turnstile
+#   *.protect.clerk.com         Clerk's fraud-protection endpoints (connect uses any port)
+#   img.clerk.com               Clerk profile images/avatars
+#   *.googleusercontent.com     Google profile images, when Clerk doesn't proxy them
+#   accounts.google.com         Google OAuth's top-level redirect/form target
+#   clerk-telemetry.com         Clerk client telemetry
+#   blob:                       Clerk/worker bundles created at runtime
+#
+# style-src requires 'unsafe-inline' because Clerk styles its components with
+# runtime CSS-in-JS. script-src also allows 'unsafe-inline' because Clerk may
+# bootstrap with an inline script and this static site has no user-generated
+# HTML; a nonce-based policy would need a per-request Worker and is not needed
+# for a marketing site.
+/*
+  Content-Security-Policy: default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' https://*.clerk.accounts.dev https://clerk.helionhq.com https://*.helionhq.com https://challenges.cloudflare.com https://*.protect.clerk.com; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob: https://img.clerk.com https://*.clerk.accounts.dev https://*.googleusercontent.com; connect-src 'self' https://*.clerk.accounts.dev https://clerk.helionhq.com https://*.helionhq.com https://*.protect.clerk.com:* https://img.clerk.com https://clerk-telemetry.com; worker-src 'self' blob:; frame-src 'self' https://challenges.cloudflare.com https://*.protect.clerk.com; form-action 'self' https://accounts.google.com; frame-ancestors 'none'
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+  Permissions-Policy: camera=(), microphone=(), geolocation=()

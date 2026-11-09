@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::CleanupMode;
+use crate::hotkey::Hotkey;
 
 const FILE_NAME: &str = "ray.json";
 const MAX_HISTORY: usize = 1_000;
@@ -26,14 +26,14 @@ pub struct Settings {
     pub launch_at_login: bool,
     pub input_device: Option<String>,
     pub cleanup_enabled: bool,
-    /// "clean" (default) or "structured". Old documents without this field
-    /// load as `clean` because the struct is `#[serde(default)]`.
-    pub cleanup_mode: String,
-    pub streaming_enabled: bool,
     pub keep_raw: bool,
     /// "system", "light", or "dark". Old documents without this field load
     /// with the default because the struct is `#[serde(default)]`.
     pub theme: String,
+    /// The dictation shortcut. Old documents without this field load as
+    /// Right Alt (the historical hard-wired shortcut).
+    #[serde(default)]
+    pub hotkey: Hotkey,
 }
 
 impl Default for Settings {
@@ -42,10 +42,9 @@ impl Default for Settings {
             launch_at_login: false,
             input_device: None,
             cleanup_enabled: true,
-            cleanup_mode: CleanupMode::Clean.id().into(),
-            streaming_enabled: true,
             keep_raw: true,
             theme: "system".into(),
+            hotkey: Hotkey::default(),
         }
     }
 }
@@ -57,12 +56,6 @@ fn normalize_theme(theme: &str) -> String {
         "dark" => "dark".into(),
         _ => "system".into(),
     }
-}
-
-/// Unknown or malformed values fall back to Clean, which stays the default for
-/// new and existing users.
-fn normalize_cleanup_mode(mode: &str) -> String {
-    CleanupMode::from_id(mode).unwrap_or_default().id().into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,7 +184,7 @@ impl Store {
         });
         data.dictionary.truncate(MAX_DICTIONARY);
         data.settings.theme = normalize_theme(&data.settings.theme);
-        data.settings.cleanup_mode = normalize_cleanup_mode(&data.settings.cleanup_mode);
+        data.settings.hotkey = data.settings.hotkey.normalized();
     }
 
     fn persist(&self, data: &StoreData) -> Result<(), String> {
@@ -245,11 +238,28 @@ impl Store {
                 .map(|name| name.trim().to_string())
                 .filter(|name| !name.is_empty()),
             cleanup_enabled: settings.cleanup_enabled,
-            cleanup_mode: normalize_cleanup_mode(&settings.cleanup_mode),
-            streaming_enabled: settings.streaming_enabled,
             keep_raw: settings.keep_raw,
             theme: normalize_theme(&settings.theme),
+            hotkey: settings.hotkey.normalized(),
         };
+        self.persist(&candidate)?;
+        *data = candidate;
+        Ok(data.settings.clone())
+    }
+
+    /// Change only the dictation shortcut, leaving every other setting as it
+    /// is on disk. Used by the Shortcut settings section so a stale copy of
+    /// the rest of Settings can never clobber it.
+    pub fn update_hotkey(&self, hotkey: Hotkey) -> Result<Settings, String> {
+        // Read, mutate, and write under one lock so a concurrent settings
+        // change can never be clobbered by a stale copy of the rest of
+        // Settings. Only `hotkey` is touched.
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        candidate.settings.hotkey = hotkey.normalized();
         self.persist(&candidate)?;
         *data = candidate;
         Ok(data.settings.clone())
@@ -406,47 +416,40 @@ mod tests {
 
     #[test]
     fn old_settings_documents_default_the_theme_to_system() {
-        let settings: Settings =
-            serde_json::from_str(r#"{"keep_raw":false,"streaming_enabled":false}"#).unwrap();
+        // Fields from the previous release (the streaming toggle and the
+        // cleanup mode selector) must not stop an old document from loading.
+        let settings: Settings = serde_json::from_str(
+            r#"{"keep_raw":false,"streaming_enabled":false,"cleanup_mode":"structured"}"#,
+        )
+        .unwrap();
         assert_eq!(settings.theme, "system");
-        // A document written before Structured existed keeps Clean as default.
-        assert_eq!(settings.cleanup_mode, "clean");
         assert!(!settings.keep_raw);
-        assert!(!settings.streaming_enabled);
+        assert!(settings.cleanup_enabled);
     }
 
     #[test]
-    fn cleanup_mode_is_normalized_when_saved() {
-        let store = temp_store();
-        let saved = store
-            .update_settings(Settings {
-                cleanup_mode: " Structured ".into(),
-                ..Settings::default()
-            })
-            .unwrap();
-        assert_eq!(saved.cleanup_mode, "structured");
-        assert_eq!(store.settings().cleanup_mode, "structured");
-
-        let saved = store
-            .update_settings(Settings {
-                cleanup_mode: "poetic".into(),
-                ..Settings::default()
-            })
-            .unwrap();
-        assert_eq!(saved.cleanup_mode, "clean");
-    }
-
-    #[test]
-    fn a_hand_edited_unknown_cleanup_mode_loads_as_clean() {
+    fn an_old_settings_file_loads_and_is_rewritten_without_retired_fields() {
         let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(FILE_NAME),
-            r#"{"settings":{"cleanup_mode":"poetic"}}"#,
+            r#"{"settings":{"cleanup_mode":"structured","streaming_enabled":false,
+                "keep_raw":false,"theme":"dark","input_device":"mic-1"}}"#,
         )
         .unwrap();
         let store = Store::load(&dir);
-        assert_eq!(store.settings().cleanup_mode, "clean");
+        let settings = store.settings();
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.input_device.as_deref(), Some("mic-1"));
+        assert!(!settings.keep_raw);
+        assert!(settings.cleanup_enabled);
+
+        // Saving persists the new shape; the retired keys are gone.
+        store.update_settings(settings).unwrap();
+        let text = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
+        assert!(!text.contains("cleanup_mode"));
+        assert!(!text.contains("streaming_enabled"));
+        assert!(text.contains("\"keep_raw\": false"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -478,6 +481,94 @@ mod tests {
             })
             .unwrap();
         assert_eq!(saved.theme, "system");
+    }
+
+    #[test]
+    fn old_settings_documents_default_the_hotkey_to_right_alt() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"keep_raw":false,"streaming_enabled":false}"#).unwrap();
+        assert_eq!(settings.hotkey, Hotkey::default());
+    }
+
+    #[test]
+    fn hotkey_updates_survive_a_reload() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::load(&dir);
+        store
+            .update_hotkey(Hotkey::parse("ctrl+shift+space").unwrap())
+            .unwrap();
+
+        let reloaded = Store::load(&dir);
+        assert_eq!(
+            reloaded.settings().hotkey,
+            Hotkey::parse("ctrl+shift+space").unwrap()
+        );
+        // The targeted update must not disturb other settings.
+        assert!(reloaded.settings().keep_raw);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_hand_edited_unknown_hotkey_loads_as_right_alt() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), r#"{"settings":{"hotkey":"banana"}}"#).unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.settings().hotkey, Hotkey::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_string_hotkey_values_load_as_right_alt_without_losing_state() {
+        for value in ["null", "5"] {
+            let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(FILE_NAME),
+                format!(
+                    r#"{{"history":[{{"id":"a","created_at":1,"text":"hi","raw":null,
+                        "app":null,"duration_ms":10}}],
+                        "dictionary":["Helion"],
+                        "settings":{{"hotkey":{value}}}}}"#
+                ),
+            )
+            .unwrap();
+            let store = Store::load(&dir);
+            assert!(
+                store.load_error().is_none(),
+                "{value}: {:?}",
+                store.load_error()
+            );
+            assert!(
+                store.load_warning().is_none(),
+                "{value}: {:?}",
+                store.load_warning()
+            );
+            assert_eq!(store.settings().hotkey, Hotkey::default());
+            // A single bad field must not cost the user their state.
+            assert_eq!(store.snapshot().history.len(), 1);
+            assert_eq!(store.dictionary(), vec!["Helion".to_string()]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
+    fn update_hotkey_only_touches_the_hotkey() {
+        let store = temp_store();
+        // Stand in for another writer that changed settings in memory. The
+        // old split read-modify-write funnelled this through update_settings,
+        // which rewrote (and normalized) every field from a stale snapshot.
+        store.data.lock().unwrap().settings.input_device = Some("  mic  ".into());
+        store.update_hotkey(Hotkey::parse("f9").unwrap()).unwrap();
+
+        assert_eq!(store.settings().hotkey, Hotkey::parse("f9").unwrap());
+        assert_eq!(store.settings().input_device.as_deref(), Some("  mic  "));
+
+        let saved: StoreData =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved.settings.input_device.as_deref(), Some("  mic  "));
+        std::fs::remove_dir_all(store.path.parent().unwrap()).ok();
     }
 
     #[test]
@@ -542,7 +633,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Truncated JSON: the read succeeds but parsing does not.
-        let original = r#"{"history":[{"id":"keep-me","created_at":1,"text":"old","dictionary":["Helion"#;
+        let original =
+            r#"{"history":[{"id":"keep-me","created_at":1,"text":"old","dictionary":["Helion"#;
         std::fs::write(dir.join(FILE_NAME), original).unwrap();
 
         let store = Store::load(&dir);

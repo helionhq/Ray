@@ -1,0 +1,70 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ray-web-test",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-15",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ray-test",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Same limiter wiring as production so tests exercise the real bindings.
+  "ratelimits": [
+    {
+      "name": "RATE_LIMIT_AUTHORIZE",
+      "namespace_id": "4201",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_BILLING",
+      "namespace_id": "4202",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_REVOKE_ALL",
+      "namespace_id": "4203",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_DESKTOP_TOKEN",
+      "namespace_id": "4204",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_TRIAL",
+      "namespace_id": "4207",
+      "simple": { "limit": 3, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_WEBHOOKS",
+      "namespace_id": "4205",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_STT",
+      "namespace_id": "4206",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ],
+  // Test-only dummy values. Never use real keys here.
+  "vars": {
+    "SITE_URL": "https://ray.test",
+    "CLERK_PUBLISHABLE_KEY": "pk_test_placeholder",
+    "CLERK_SECRET_KEY": "sk_test_placeholder",
+    "ASSEMBLYAI_API_KEY": "test_assemblyai_key",
+    "CREEM_API_KEY": "creem_test_placeholder",
+    "CREEM_WEBHOOK_SECRET": "whsec_test_placeholder",
+    "CLERK_WEBHOOK_SECRET": "whsec_c2VjcmV0X2Zvcl90ZXN0cw==",
+    "CREEM_API_BASE": "https://test-api.creem.io",
+    "CREEM_PRODUCT_PRO_MONTHLY": "prod_test_monthly",
+    "CREEM_PRODUCT_PRO_ANNUAL": "prod_test_annual",
+    "STARTER_WEEKLY_WORDS": "1000",
+    "STARTER_WEEKLY_AUDIO_SECONDS": "3600",
+    "FAIR_USE_WEEKLY_AUDIO_SECONDS": "25200",
+    "TRIAL_WEEKLY_AUDIO_SECONDS": "10800",
+    "CLEANUP_MODELS": "gemma-4-31b"
+  }
+}

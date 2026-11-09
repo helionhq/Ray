@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::api::{ApiError, ApiErrorKind};
 use crate::audio::{self, Capture};
+use crate::auth::{self, Auth};
 use crate::cleanup;
-use crate::config::{prompt_for, CleanupMode, RuntimeConfig};
+use crate::config::RuntimeConfig;
 use crate::hotkey;
 use crate::paste;
-use crate::secrets;
 use crate::store::{self, HistoryEntry, Store};
 use crate::stt::{self, LiveSession};
 use crate::windows_util;
@@ -25,13 +26,13 @@ use crate::windows_util;
 struct Session {
     capture: Capture,
     stream: Option<LiveSession>,
+    /// The device token this session's live request was started with. A 401
+    /// must only clear this token, never a newer one from a later sign-in.
+    token: String,
     started: Instant,
     target: Option<windows_util::Foreground>,
     keyterms: Vec<String>,
     cleanup_enabled: bool,
-    /// Captured when the recording starts, so changing the setting mid-flight
-    /// cannot change the dictation already being processed.
-    cleanup_mode: CleanupMode,
     level_task: tokio::task::JoinHandle<()>,
     limit_task: tokio::task::JoinHandle<()>,
 }
@@ -39,6 +40,7 @@ struct Session {
 pub struct Dictation {
     app: AppHandle,
     store: Arc<Store>,
+    auth: Arc<Auth>,
     config: RwLock<RuntimeConfig>,
     http: reqwest::Client,
     session: tokio::sync::Mutex<Option<Session>>,
@@ -60,18 +62,24 @@ pub struct Dictation {
 }
 
 impl Dictation {
-    pub fn new(app: AppHandle, store: Arc<Store>, config: RuntimeConfig) -> Arc<Self> {
+    pub fn new(
+        app: AppHandle,
+        store: Arc<Store>,
+        auth: Arc<Auth>,
+        config: RuntimeConfig,
+    ) -> Arc<Self> {
         let http = reqwest::Client::builder()
             .user_agent("Ray/0.1 (Windows)")
             .connect_timeout(Duration::from_secs(10))
-            // Keep the pre-warmed gateway connection alive through long
-            // recordings and between dictations (reqwest defaults to 90 s).
+            // Keep the pre-warmed connection alive through long recordings
+            // and between dictations (reqwest defaults to 90 s).
             .pool_idle_timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Arc::new(Self {
             app,
             store,
+            auth,
             config: RwLock::new(config),
             http,
             session: tokio::sync::Mutex::new(None),
@@ -154,18 +162,22 @@ impl Dictation {
         &self.http
     }
 
-    pub fn cleanup_provider(&self, secret_name: &str) -> Option<crate::config::CleanupProvider> {
-        let config = self
-            .config
+    /// The effective Ray API origin, including the `RAY_API_BASE` override.
+    pub fn api_base(&self) -> String {
+        self.config
             .read()
-            .unwrap_or_else(|error| error.into_inner());
-        config
+            .unwrap_or_else(|error| error.into_inner())
             .pipeline
-            .cleanup
-            .providers
-            .iter()
-            .find(|provider| provider.api_key_secret == secret_name)
-            .cloned()
+            .api_base()
+    }
+
+    /// The public site origin used for the browser sign-in hand-off.
+    pub fn site_url(&self) -> String {
+        self.config
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .pipeline
+            .site_url()
     }
 
     pub fn reload_config(&self, app_data: &Path) {
@@ -191,9 +203,12 @@ impl Dictation {
         }
         // A genuinely new session: presses from here on are no longer stale.
         self.reset_processing_window();
-        let Some(api_key) = secrets::get(secrets::ASSEMBLYAI) else {
-            self.open_settings("Add your AssemblyAI key in Settings to start dictating.");
-            self.fail("Add your AssemblyAI key in Settings").await;
+        if let Some(reason) = self.block_reason_fresh().await {
+            self.block_dictation(reason).await;
+            return;
+        }
+        let Some(token) = self.auth.token() else {
+            self.block_dictation("Sign in to Ray to dictate").await;
             return;
         };
 
@@ -205,6 +220,7 @@ impl Dictation {
                 .unwrap_or_else(|error| error.into_inner());
             config.pipeline.clone()
         };
+        let api_base = pipeline.api_base();
         // The user's dictionary comes first, then the built-in product and
         // teammate names, deduplicated and capped.
         let mut keyterms = self.store.keyterms(pipeline.stt.keyterms_limit);
@@ -217,7 +233,6 @@ impl Dictation {
             }
         }
         let target = windows_util::foreground();
-        let cleanup_mode = CleanupMode::from_id(&settings.cleanup_mode).unwrap_or_default();
 
         // Show the bar before the microphone opens; it should feel instant.
         self.emit_bar(json!({ "phase": "recording" }));
@@ -225,23 +240,23 @@ impl Dictation {
         self.recording.store(true, Ordering::SeqCst);
         hotkey::set_capturing(true);
 
-        let stream = if settings.streaming_enabled && pipeline.stt.streaming {
-            Some(stt::spawn_live(
-                api_key,
-                pipeline.stt.clone(),
-                keyterms.clone(),
-                self.http.clone(),
-            ))
-        } else {
-            None
-        };
-        // Warm the LLM gateway while the user speaks, so the first dictation
-        // does not pay a cold TLS handshake after the hotkey is released.
+        // Streaming is always on: Sync live transcribes while the user speaks
+        // and leaves only the tail for the stop request.
+        let stream = Some(stt::spawn_live(
+            &api_base,
+            &token,
+            pipeline.stt.clone(),
+            keyterms.clone(),
+            self.http.clone(),
+        ));
+        // Warm the API connection while the user speaks, so the first
+        // dictation does not pay a cold TLS handshake after the hotkey is
+        // released.
         if settings.cleanup_enabled && pipeline.cleanup.enabled {
             let http = self.http.clone();
-            let cleanup_config = pipeline.cleanup.for_mode(cleanup_mode);
+            let api_base = api_base.clone();
             tokio::spawn(async move {
-                cleanup::warm_connection(&http, &cleanup_config).await;
+                cleanup::warm_connection(&http, &api_base).await;
             });
         }
         let (dummy_tx, dummy_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -315,11 +330,11 @@ impl Dictation {
         *self.session.lock().await = Some(Session {
             capture,
             stream,
+            token,
             started,
             target,
             keyterms,
             cleanup_enabled: settings.cleanup_enabled,
-            cleanup_mode,
             level_task,
             limit_task,
         });
@@ -345,11 +360,11 @@ impl Dictation {
         let Session {
             capture,
             stream,
+            token: session_token,
             started,
             target,
             keyterms,
             cleanup_enabled,
-            cleanup_mode,
             level_task,
             limit_task,
         } = session;
@@ -397,71 +412,162 @@ impl Dictation {
             ));
         }
 
-        let (pipeline, cleanup_prompt, structured_prompt) = {
+        let (pipeline, cleanup_prompt) = {
             let config = self
                 .config
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            (
-                config.pipeline.clone(),
-                config.prompt.clone(),
-                config.structured_prompt.clone(),
-            )
+            (config.pipeline.clone(), config.prompt.clone())
         };
-        let wav = stt::wav_from_pcm16(&samples, audio::TARGET_RATE);
+        let api_base = pipeline.api_base();
         let mut raw: Option<String> = None;
         let mut from_stream = false;
-        let mut stt_error: Option<String> = None;
+        let mut stt_error: Option<ApiError> = None;
+        // Text from live segments that completed before a failure. It is the
+        // last-resort transcript if both batch fallbacks also fail, and the
+        // required result when a later rollover segment hits the limit.
+        let mut partial: Option<String> = None;
+        // PCM already transcribed (and counted) by completed live segments.
+        // The batch fallback starts after it so the same audio is not counted
+        // against the weekly quota twice.
+        let mut live_covered_bytes = 0usize;
+        // Read progress through a handle: `finish` consumes the session.
+        let live_progress = stream.as_ref().map(LiveSession::progress_handle);
+        // Shown after the transcript is pasted: the dictation is never lost
+        // because of a quota, auth, or cleanup failure.
+        let mut quota_notice: Option<String> = None;
+        let mut auth_notice = false;
 
         if let Some(stream) = stream {
-            let timeout = if pipeline.stt.mode.eq_ignore_ascii_case("sync_live") {
-                Duration::from_millis(pipeline.stt.force_endpoint_timeout_ms + 5_000)
-            } else {
-                Duration::from_millis(
-                    pipeline.stt.force_endpoint_timeout_ms
-                        + pipeline.stt.terminate_timeout_ms
-                        + 3_000,
-                )
-            };
+            let timeout = Duration::from_millis(pipeline.stt.force_endpoint_timeout_ms + 5_000);
             match stream.finish(timeout).await {
                 Ok(text) if !text.trim().is_empty() => {
                     raw = Some(text.trim().to_string());
                     from_stream = true;
                 }
                 Ok(_) => eprintln!("[ray] streaming returned no text; trying batch"),
-                Err(error) => {
-                    eprintln!("[ray] streaming failed; trying batch: {error}");
-                    stt_error = Some(error);
+                Err(failure) => {
+                    partial = failure.partial.clone();
+                    if failure.is_fatal() {
+                        if partial
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            // Decision 5: a later rollover segment hit quota (or
+                            // the session expired). Keep and paste what was
+                            // already transcribed, then show the reason.
+                            raw = partial.take();
+                            from_stream = true;
+                            match failure.error.kind {
+                                ApiErrorKind::Unauthorized => {
+                                    if self.auth.sign_out_if_token(&session_token) {
+                                        let _ = self.app.emit("account-changed", self.auth.state());
+                                    }
+                                    auth_notice = true;
+                                }
+                                ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+                                    quota_notice = Some(failure.error.to_string());
+                                }
+                                ApiErrorKind::DeviceLimit => {
+                                    quota_notice =
+                                        Some("Free limit reached on this account".to_string());
+                                }
+                                ApiErrorKind::Other => {}
+                            }
+                        } else {
+                            // Nothing was transcribed yet, so there is no
+                            // transcript to lose.
+                            self.finish_with_error(failure.error, &session_token).await;
+                            return;
+                        }
+                    } else {
+                        eprintln!("[ray] streaming failed; trying batch: {}", failure.error);
+                        if let Some(progress) = &live_progress {
+                            live_covered_bytes = progress.covered_bytes();
+                        }
+                        stt_error = Some(failure.error);
+                    }
                 }
             }
         }
 
         if raw.is_none() {
-            if let Some(api_key) = secrets::get(secrets::ASSEMBLYAI) {
+            if let Some(token) = self.auth.token() {
                 let http = self.http.clone();
                 let stt_config = pipeline.stt.clone();
                 let terms = keyterms.clone();
-                // Let Sync batch and the v2 upload/poll fallback each reach their
-                // own deadline; the margin only guards against a hung task.
-                let timeout = stt::batch_time_budget(&pipeline.stt)
-                    .saturating_add(Duration::from_secs(15));
-                match tokio::time::timeout(
-                    timeout,
-                    stt::transcribe_wav(&http, &api_key, &terms, wav, &stt_config),
-                )
-                .await
-                {
-                    Ok(Ok(text)) if !text.trim().is_empty() => raw = Some(text.trim().to_string()),
+                // Only the audio live never covered is sent to batch: its
+                // words were already added to the weekly and fair-use counts.
+                let batch_start = batch_sample_offset(live_covered_bytes, samples.len());
+                let batch_samples = &samples[batch_start..];
+                // Sync batch and the Worker's v2 proxy run sequentially; the
+                // budget covers both worst cases plus a margin. A header-only
+                // WAV (live covered everything) would only return no speech.
+                let timeout = stt::batch_time_budget(&pipeline.stt);
+                let batch = async {
+                    if batch_samples.len() < 1_600 {
+                        return Ok(String::new());
+                    }
+                    let wav = stt::wav_from_pcm16(batch_samples, audio::TARGET_RATE);
+                    stt::transcribe_wav(&http, &api_base, &token, &terms, wav, &stt_config).await
+                };
+                match tokio::time::timeout(timeout, batch).await {
+                    Ok(Ok(text)) if !text.trim().is_empty() => {
+                        let text = text.trim();
+                        raw = Some(match partial.as_deref() {
+                            Some(previous) => stt::join_batch_transcripts(previous, text),
+                            None => text.to_string(),
+                        });
+                    }
                     Ok(Ok(_)) => {}
+                    Ok(Err(error)) if error.is_fatal() => {
+                        if partial
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty())
+                        {
+                            // The fallback hit quota mid-dictation: never drop
+                            // the live segments that already exist.
+                            raw = partial.take();
+                            from_stream = true;
+                            match error.kind {
+                                ApiErrorKind::Unauthorized => {
+                                    if self.auth.sign_out_if_token(&token) {
+                                        let _ = self.app.emit("account-changed", self.auth.state());
+                                    }
+                                    auth_notice = true;
+                                }
+                                ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+                                    quota_notice = Some(error.to_string());
+                                }
+                                ApiErrorKind::DeviceLimit => {
+                                    quota_notice =
+                                        Some("Free limit reached on this account".to_string());
+                                }
+                                ApiErrorKind::Other => {}
+                            }
+                        } else {
+                            self.finish_with_error(error, &token).await;
+                            return;
+                        }
+                    }
                     Ok(Err(error)) => {
                         eprintln!("[ray] batch transcription failed: {error}");
                         stt_error = Some(error);
                     }
                     Err(_) => {
                         eprintln!("[ray] batch transcription timed out");
-                        stt_error = Some("timed out".into());
+                        stt_error = Some(ApiError::other("timed out"));
                     }
                 }
+            }
+        }
+
+        // Both fallbacks failed, but live segments did produce text: paste
+        // that instead of reporting a failed dictation.
+        if raw.is_none() {
+            if let Some(partial) = partial.take() {
+                raw = Some(partial);
+                from_stream = true;
             }
         }
 
@@ -480,22 +586,20 @@ impl Dictation {
             .filter(|text| !text.is_empty());
         let Some(raw_text) = raw_text else {
             // Silence and noise-only clips are not a connection problem.
-            let no_speech = had_raw || is_no_speech_error(stt_error.as_deref());
+            let no_speech = had_raw || is_no_speech_error(stt_error.as_ref());
             if no_speech {
                 self.fail("Didn't catch that. Try again.").await;
             } else {
-                self.fail(stt_failure_message(stt_error.as_deref())).await;
+                self.fail(stt_failure_message(stt_error.as_ref())).await;
             }
             return;
         };
 
         let settings = self.store.settings();
-        // Resolve the session's mode once: Clean returns an exact clone of the
-        // base config, Structured applies its pipeline.json overrides.
-        let cleanup_config = pipeline.cleanup.for_mode(cleanup_mode);
-        let cleanup_prompt = prompt_for(&cleanup_prompt, &structured_prompt, cleanup_mode);
+        let cleanup_config = &pipeline.cleanup;
         let mut text = raw_text.clone();
         let mut note: Option<String> = None;
+        let mut cleaned = false;
         if cleanup_enabled && pipeline.cleanup.enabled {
             let dictionary = self.store.dictionary();
             let app_name = target
@@ -507,22 +611,47 @@ impl Dictation {
                 timeout,
                 cleanup::cleanup(
                     &self.http,
-                    &cleanup_config,
-                    cleanup::CleanupPrompt {
-                        mode: cleanup_mode,
-                        template: cleanup_prompt,
+                    &api_base,
+                    &session_token,
+                    cleanup_config,
+                    cleanup::CleanupInput {
+                        template: &cleanup_prompt,
+                        transcript: &raw_text,
+                        dictionary: &dictionary,
+                        known_names: &pipeline.known_names,
+                        app_name: &app_name,
                     },
-                    &raw_text,
-                    &dictionary,
-                    &pipeline.known_names,
-                    &app_name,
                 ),
             )
             .await
             {
                 Ok(result) => {
-                    text = result.text;
-                    note = result.note;
+                    if let Some(error) = result.fatal {
+                        // Any cleanup failure keeps the raw transcript. A 402/
+                        // 429/403 already arrives here as a normal failure;
+                        // only a Ray session error is left, and it must still
+                        // paste what the user said before signing out.
+                        match error.kind {
+                            ApiErrorKind::Unauthorized => {
+                                if self.auth.sign_out_if_token(&session_token) {
+                                    let _ = self.app.emit("account-changed", self.auth.state());
+                                }
+                                auth_notice = true;
+                            }
+                            ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse => {
+                                quota_notice = Some(error.to_string());
+                            }
+                            ApiErrorKind::DeviceLimit => {
+                                quota_notice =
+                                    Some("Free limit reached on this account".to_string());
+                            }
+                            ApiErrorKind::Other => {}
+                        }
+                    } else {
+                        cleaned = result.provider.is_some();
+                        text = result.text;
+                        note = result.note;
+                    }
                 }
                 Err(_) => {
                     note = Some("Cleanup timed out; pasted the raw transcript".into());
@@ -539,8 +668,10 @@ impl Dictation {
             raw: raw_for_history,
             app: target.as_ref().and_then(|target| target.app.clone()),
             duration_ms,
-            mode: (cleanup_enabled && pipeline.cleanup.enabled)
-                .then(|| cleanup_mode.id().to_string()),
+            // Structured is the only cleanup mode, but the field stays for
+            // older History entries and for the CRLF clipboard convention.
+            // A raw transcript (cleanup failed or was disabled) is mode null.
+            mode: cleaned.then(|| "structured".to_string()),
         };
         let history_saved = match self.store.add_history(entry) {
             Ok(()) => true,
@@ -560,14 +691,12 @@ impl Dictation {
         if let Some(note) = note {
             eprintln!("[ray] {note}");
         }
+        // Keep the plan/usage badge current after every dictation.
+        auth::refresh_shared(&self.app, &self.auth, &self.http, &api_base);
 
         // Structured output is multi-line (paragraphs and list markers). The
-        // Windows clipboard convention for CF_UNICODETEXT is CRLF; Clean keeps
-        // its existing bytes because its guard and formatting are untouched.
-        let line_endings = if cleanup_mode == CleanupMode::Structured
-            && cleanup_enabled
-            && pipeline.cleanup.enabled
-        {
+        // Windows clipboard convention for CF_UNICODETEXT is CRLF.
+        let line_endings = if cleaned {
             paste::LineEndings::CrLf
         } else {
             paste::LineEndings::Preserve
@@ -626,6 +755,17 @@ impl Dictation {
                 )),
             },
         }
+        // The transcript is pasted and saved by now. Only then explain the
+        // limit or the expired session, so the post-paste bar message never
+        // replaces the user's words.
+        if auth_notice {
+            notes.push("Sign in to Ray to dictate".into());
+            self.show_main();
+        }
+        if let Some(message) = quota_notice {
+            notes.push(message);
+            self.open_main_on("account");
+        }
         let warned = !notes.is_empty();
         let warning = notes.join(" ");
         for note in notes {
@@ -683,14 +823,124 @@ impl Dictation {
         self.recording.store(false, Ordering::SeqCst);
     }
 
-    fn open_settings(&self, message: &str) {
-        self.notify_main(message.to_string());
+    /// Show why recording did not start, and bring up the main window so the
+    /// user can sign in or see the limit.
+    async fn block_dictation(&self, reason: &str) {
+        if reason == "Weekly limit reached" {
+            self.open_main_on("account");
+        } else {
+            self.show_main();
+        }
+        self.fail(reason).await;
+    }
+
+    /// The cached quota gate. Decision 15: cached usage whose `resets_at` has
+    /// passed is stale, so ask `/api/me` once (short timeout) before refusing
+    /// to record. If that refresh fails, allow the recording and let the
+    /// server decide.
+    async fn block_reason_fresh(&self) -> Option<&'static str> {
+        // A hotkey press can beat the background credential read on launch.
+        self.auth.wait_loaded(Duration::from_millis(500)).await;
+        if !self.auth.is_signed_in() {
+            return Some("Sign in to Ray to dictate");
+        }
+        let account = self.auth.account();
+        let over_limit = account
+            .as_ref()
+            .is_some_and(|account| account.starter_is_over_limit());
+        if !over_limit {
+            return None;
+        }
+        if !account
+            .as_ref()
+            .is_some_and(|account| account.usage_is_stale())
+        {
+            return Some("Weekly limit reached");
+        }
+        let api_base = self.api_base();
+        let http = self.http.clone();
+        match tokio::time::timeout(
+            Duration::from_secs(4),
+            auth::refresh(&self.auth, &http, &api_base),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            // A 401 already cleared the token; treat it as signed out.
+            Ok(Err(error)) if error.kind == ApiErrorKind::Unauthorized => {}
+            // Unreachable or failed refresh: do not lock the user out of a
+            // week that has already rolled over.
+            Ok(Err(_)) | Err(_) => return None,
+        }
+        if !self.auth.is_signed_in() {
+            return Some("Sign in to Ray to dictate");
+        }
+        if self
+            .auth
+            .account()
+            .is_some_and(|account| account.starter_is_over_limit())
+        {
+            return Some("Weekly limit reached");
+        }
+        None
+    }
+
+    /// A fatal STT error with no transcript to paste: stop the session with
+    /// the right message. `token` is the token the failed request used, so a
+    /// stale 401 can never clear a newer session.
+    async fn finish_with_error(&self, error: ApiError, token: &str) {
+        let kind = error.kind;
+        let mut signed_out = false;
+        let message = match kind {
+            ApiErrorKind::Unauthorized => {
+                signed_out = self.auth.sign_out_if_token(token);
+                if signed_out {
+                    let _ = self.app.emit("account-changed", self.auth.state());
+                    "Sign in to Ray to dictate".to_string()
+                } else {
+                    // The current session is newer than this request; do not
+                    // tell the user to sign in again.
+                    error.to_string()
+                }
+            }
+            ApiErrorKind::QuotaExceeded => error
+                .message
+                .clone()
+                .unwrap_or_else(|| "Weekly limit reached".into()),
+            ApiErrorKind::FairUse => error
+                .message
+                .clone()
+                .unwrap_or_else(|| "Fair-use limit reached, resets Monday".into()),
+            ApiErrorKind::DeviceLimit => "Free limit reached on this account".to_string(),
+            ApiErrorKind::Other => error.to_string(),
+        };
+        match kind {
+            ApiErrorKind::Unauthorized => {
+                if signed_out {
+                    self.show_main();
+                }
+            }
+            ApiErrorKind::QuotaExceeded | ApiErrorKind::FairUse | ApiErrorKind::DeviceLimit => {
+                self.open_main_on("account");
+                // The proxy's count is authoritative; refresh the meter.
+                auth::refresh_shared(&self.app, &self.auth, &self.http, &self.api_base());
+            }
+            ApiErrorKind::Other => {}
+        }
+        self.fail(&message).await;
+    }
+
+    fn open_main_on(&self, page: &str) {
+        self.show_main();
+        let _ = self.app.emit_to("main", "navigate", page);
+    }
+
+    fn show_main(&self) {
         if let Some(window) = self.app.get_webview_window("main") {
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
         }
-        let _ = self.app.emit_to("main", "navigate", "settings");
     }
 
     fn notify_main(&self, message: String) {
@@ -790,6 +1040,13 @@ impl Dictation {
 /// Older notices are dropped beyond this; the newest explain the current state.
 const MAX_BUFFERED_NOTICES: usize = 4;
 
+/// Sample index where the batch fallback must start. Live segments send their
+/// audio as PCM16 bytes (two per sample), and their covered end is already
+/// counted by the Worker, so re-sending it would overcharge the quota.
+fn batch_sample_offset(covered_bytes: usize, sample_count: usize) -> usize {
+    (covered_bytes / 2).min(sample_count)
+}
+
 /// True when the main window is on screen rather than hidden in the tray or
 /// minimized. A toast shown while minimized also expires before the user can
 /// see it, so both count as "not visible".
@@ -811,20 +1068,13 @@ impl Drop for ProcessingGuard<'_> {
     }
 }
 
-/// Turns an STT error into something the user can act on.
-fn stt_failure_message(error: Option<&str>) -> &'static str {
+/// Turns an STT error into something the user can act on. Quota/auth errors
+/// are handled earlier by `finish_with_error` and never reach this.
+fn stt_failure_message(error: Option<&ApiError>) -> &'static str {
     let Some(error) = error else {
-        return "Transcription failed. Check your connection and AssemblyAI key.";
+        return "Transcription failed. Check your connection and try again.";
     };
-    let error = error.to_lowercase();
-    if error.contains("401")
-        || error.contains("403")
-        || error.contains("unauthorized")
-        || error.contains("invalid api key")
-        || error.contains("authentication")
-    {
-        return "AssemblyAI rejected your key. Check it in Settings.";
-    }
+    let error = error.to_string().to_lowercase();
     if error.contains("error sending request")
         || error.contains("dns")
         || error.contains("connect")
@@ -834,16 +1084,16 @@ fn stt_failure_message(error: Option<&str>) -> &'static str {
         || error.contains("tls")
         || error.contains("proxy")
     {
-        return "Couldn't reach AssemblyAI. Check your connection and try again.";
+        return "Couldn't reach Ray. Check your connection and try again.";
     }
-    "Transcription failed. Check your connection and AssemblyAI key."
+    "Transcription failed. Check your connection and try again."
 }
 
-/// Distinguishes "the user said nothing" from a real network/key failure so the
+/// Distinguishes "the user said nothing" from a real network failure so the
 /// bar does not tell them to check their connection after a silent clip.
-fn is_no_speech_error(error: Option<&str>) -> bool {
+fn is_no_speech_error(error: Option<&ApiError>) -> bool {
     error.is_some_and(|error| {
-        let error = error.to_lowercase();
+        let error = error.to_string().to_lowercase();
         error.contains("no speech")
             || error.contains("empty transcript")
             || error.contains("without a transcript")
@@ -852,34 +1102,48 @@ fn is_no_speech_error(error: Option<&str>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_no_speech_error, stt_failure_message};
+    use super::{batch_sample_offset, is_no_speech_error, stt_failure_message};
+    use crate::api::ApiError;
 
     #[test]
-    fn explains_bad_keys_and_network_failures_differently() {
-        assert!(
-            stt_failure_message(Some("AssemblyAI Sync live 401 Unauthorized"))
-                .contains("rejected your key")
+    fn batch_fallback_skips_audio_live_already_counted() {
+        // PCM16: two bytes per sample, clamped to the captured buffer.
+        assert_eq!(batch_sample_offset(0, 16_000), 0);
+        assert_eq!(batch_sample_offset(32_000, 16_000), 16_000);
+        assert_eq!(batch_sample_offset(3_200, 16_000), 1_600);
+        assert_eq!(batch_sample_offset(usize::MAX, 16_000), 16_000);
+    }
+
+    #[test]
+    fn explains_network_failures_without_blaming_a_key() {
+        assert_eq!(
+            stt_failure_message(None),
+            "Transcription failed. Check your connection and try again."
         );
-        assert!(stt_failure_message(Some("error sending request for url"))
-            .contains("Couldn't reach AssemblyAI"));
-        assert!(stt_failure_message(Some("timed out")).contains("Couldn't reach AssemblyAI"));
-        assert!(stt_failure_message(Some("AssemblyAI Sync live 500: boom"))
-            .contains("Transcription failed"));
-        assert!(stt_failure_message(None).contains("Transcription failed"));
+        assert!(
+            stt_failure_message(Some(&ApiError::other("error sending request for url")))
+                .contains("Couldn't reach Ray")
+        );
+        assert!(
+            stt_failure_message(Some(&ApiError::other("timed out"))).contains("Couldn't reach Ray")
+        );
+        assert!(
+            stt_failure_message(Some(&ApiError::other("Ray Sync live 500: boom")))
+                .contains("Transcription failed")
+        );
     }
 
     #[test]
     fn recognises_silence_instead_of_reporting_a_connection_error() {
-        assert!(is_no_speech_error(Some("No speech was detected")));
-        assert!(is_no_speech_error(Some(
-            "AssemblyAI returned an empty transcript"
-        )));
-        assert!(is_no_speech_error(Some(
-            "AssemblyAI closed the stream without a transcript"
-        )));
-        assert!(!is_no_speech_error(Some(
-            "AssemblyAI Sync live 401 Unauthorized"
-        )));
+        assert!(is_no_speech_error(Some(&ApiError::other(
+            "No speech was detected"
+        ))));
+        assert!(is_no_speech_error(Some(&ApiError::other(
+            "Ray returned an empty transcript"
+        ))));
+        assert!(!is_no_speech_error(Some(&ApiError::other(
+            "Ray Sync live 500: boom"
+        ))));
         assert!(!is_no_speech_error(None));
     }
 }

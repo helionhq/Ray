@@ -8,7 +8,8 @@ export interface HistoryEntry {
   raw: string | null;
   app: string | null;
   duration_ms: number;
-  mode: CleanupMode | null;
+  /** "structured" when cleanup ran; null for raw/legacy entries. */
+  mode: string | null;
 }
 
 export interface InputDevice {
@@ -18,35 +19,85 @@ export interface InputDevice {
 }
 
 export type Theme = "system" | "light" | "dark";
-export type CleanupMode = "clean" | "structured";
+
+/**
+ * A shortcut in its canonical string form (`right_alt`, `f9`,
+ * `ctrl+shift+space`). Rust validates it; the UI only round-trips the value.
+ */
+export type Hotkey = string;
+
+/** The current shortcut plus the label Rust renders for it. */
+export interface HotkeyView {
+  hotkey: Hotkey;
+  label: string;
+}
+
+export interface HotkeyCaptureError {
+  message: string;
+}
 
 export interface Settings {
   launch_at_login: boolean;
   input_device: string | null;
   cleanup_enabled: boolean;
-  cleanup_mode: CleanupMode;
-  streaming_enabled: boolean;
   keep_raw: boolean;
   theme: Theme;
+  hotkey: Hotkey;
 }
 
-export interface KeyStatus {
-  assemblyai: boolean;
-  vercel: boolean;
+export interface AccountUser {
+  id: string;
+  /** null when the server has no email for the account. */
+  email: string | null;
+  name: string | null;
+}
+
+export interface Usage {
+  words_used: number;
+  /** null for Pro: the fair-use cap is never exposed. */
+  words_limit: number | null;
+  week_start: string | null;
+  resets_at: string | null;
+}
+
+export interface Trial {
+  /** ISO timestamp when the no-card Pro trial ends. */
+  ends_at: string | null;
+}
+
+export interface Account {
+  user: AccountUser;
+  plan: "starter" | "pro" | string;
+  interval: string | null;
+  status: string | null;
+  cancel_at_period_end: boolean;
+  current_period_end: string | null;
+  /** A subscription that needs a payment-method fix. */
+  billing_issue: "past_due" | "unpaid" | "paused" | string | null;
+  /** The active no-card Pro trial; null for paid subscriptions and Starter. */
+  trial: Trial | null;
+  /** This account is over the per-PC free-account limit and has no paid plan. */
+  free_blocked: boolean;
+  usage: Usage;
+}
+
+export interface AuthState {
+  signed_in: boolean;
+  /** False until the stored session has been read from Credential Manager. */
+  loaded: boolean;
+  account: Account | null;
 }
 
 export interface Snapshot {
   history: HistoryEntry[];
   dictionary: string[];
   settings: Settings;
-  keys: KeyStatus;
+  auth: AuthState;
   devices: InputDevice[];
   launch_at_login: boolean;
   hotkey_error: string | null;
   version: string;
 }
-
-export type Provider = "assemblyai" | "vercel";
 
 /** True only inside a Tauri webview; plain-browser previews have no IPC. */
 export function hasTauri(): boolean {
@@ -65,17 +116,13 @@ function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
 
 export const api = {
   snapshot: () => call<Snapshot>("get_snapshot"),
-  saveSecret: (provider: Provider, value: string) =>
-    call<void>("save_secret", { provider, value }),
-  clearSecret: (provider: Provider) => call<void>("clear_secret", { provider }),
-  testSecret: (provider: Provider) => call<string>("test_secret", { provider }),
   saveSettings: (settings: Settings) =>
     call<Settings>("save_settings", { settings }),
   addDictionary: (term: string) => call<string[]>("add_dictionary", { term }),
   removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
   deleteHistory: (id: string) => call<void>("delete_history", { id }),
   clearHistory: () => call<void>("clear_history"),
-  copyText: (text: string, mode: CleanupMode | null) =>
+  copyText: (text: string, mode: string | null) =>
     call<void>("copy_text", { text, mode }),
   startDictation: () => call<void>("start_dictation"),
   stopDictation: () => call<void>("stop_dictation"),
@@ -83,7 +130,20 @@ export const api = {
   openMain: () => call<void>("open_main"),
   reloadConfig: () => call<void>("reload_config"),
   retryHotkey: () => call<string | null>("retry_hotkey"),
+  getHotkey: () => call<HotkeyView>("get_hotkey"),
+  startHotkeyCapture: () => call<void>("start_hotkey_capture"),
+  cancelHotkeyCapture: () => call<void>("cancel_hotkey_capture"),
+  setHotkey: (hotkey: Hotkey) => call<HotkeyView>("set_hotkey", { hotkey }),
+  resetHotkey: () => call<HotkeyView>("reset_hotkey"),
   quit: () => call<void>("quit"),
+  authState: () => call<AuthState>("auth_state"),
+  signIn: () => call<void>("sign_in"),
+  cancelSignIn: () => call<void>("cancel_sign_in"),
+  signOut: () => call<AuthState>("sign_out"),
+  refreshAccount: () => call<AuthState>("refresh_account"),
+  openCheckout: (interval: "monthly" | "annual") =>
+    call<void>("open_checkout", { interval }),
+  openBillingPortal: () => call<void>("open_billing_portal"),
 };
 
 export function onEvent<T>(

@@ -1,5 +1,7 @@
 .env
 .env.*
+# Example files are documentation and must stay tracked.
+!.env.example
 node_modules/
 target/
 dist/
@@ -12,3 +14,10 @@ src-tauri/gen/
 .vite/
 *.pdb
 *.tsbuildinfo
+
+# web worker
+web/.dev.vars
+web/.wrangler/
+
+# Claude Code worktrees (local scratch checkouts, never part of a commit)
+.claude/worktrees/

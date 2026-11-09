@@ -1,0 +1,82 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ray-web",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-10-15",
+  // Static site (Vite build output). The Worker only runs first for API routes.
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/v1/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ray",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // Workers Rate Limiting bindings. Counts are per Cloudflare location and
+  // eventually consistent; they are an abuse brake, not a hard quota.
+  // namespace_id values must be unique positive integers per binding.
+  "ratelimits": [
+    {
+      "name": "RATE_LIMIT_AUTHORIZE",
+      "namespace_id": "4101",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_BILLING",
+      "namespace_id": "4102",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_REVOKE_ALL",
+      "namespace_id": "4103",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_DESKTOP_TOKEN",
+      "namespace_id": "4104",
+      "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      // Trial-farming brake keyed by IP, applied only when a trial would
+      // start. The binding's window is 10 or 60 seconds, so this caps fresh
+      // trial grants at three per minute per Cloudflare location. Over the
+      // limit, sign-in still succeeds but no trial is granted.
+      "name": "RATE_LIMIT_TRIAL",
+      "namespace_id": "4107",
+      "simple": { "limit": 3, "period": 60 }
+    },
+    {
+      "name": "RATE_LIMIT_WEBHOOKS",
+      "namespace_id": "4105",
+      "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      // Per-user STT flood brake. One desktop dictation sends at most a live
+      // segment every ~118 s plus its batch fallback, far below this.
+      "name": "RATE_LIMIT_STT",
+      "namespace_id": "4106",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ],
+  // Public configuration. Replace the placeholders before deploying.
+  "vars": {
+    "SITE_URL": "https://ray.helionhq.com",
+    "CLERK_PUBLISHABLE_KEY": "pk_test_REPLACE_ME",
+    "CREEM_API_BASE": "https://test-api.creem.io",
+    "CREEM_PRODUCT_PRO_MONTHLY": "prod_REPLACE_MONTHLY",
+    "CREEM_PRODUCT_PRO_ANNUAL": "prod_REPLACE_ANNUAL",
+    "STARTER_WEEKLY_WORDS": "1000",
+    "STARTER_WEEKLY_AUDIO_SECONDS": "3600",
+    "FAIR_USE_WEEKLY_AUDIO_SECONDS": "25200",
+    "TRIAL_WEEKLY_AUDIO_SECONDS": "10800",
+    "CLEANUP_MODELS": "gemma-4-31b"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

@@ -1,47 +1,21 @@
-//! Pipeline configuration and the cleanup prompts.
+//! Pipeline configuration and the cleanup prompt.
 //!
 //! Both are embedded in the binary but can be overridden at runtime by files in
-//! the app-data directory (`pipeline.json`, `cleanup.md`, `structured.md`). This
-//! is the one place where models, endpoints, and STT options live. The defaults
-//! are the result of `research/final/`: AssemblyAI Sync live STT + a Gemma
-//! cleanup pass on the AssemblyAI LLM Gateway.
+//! the app-data directory (`pipeline.json`, `structured.md`). This is the one
+//! place where models, endpoints, and STT options live. Every network endpoint
+//! derives from `api.base_url`, the Ray API origin; the device token is added
+//! by the request code.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 pub const EMBEDDED_PIPELINE: &str = include_str!("../config/pipeline.json");
-pub const EMBEDDED_PROMPT: &str = include_str!("../prompts/cleanup.md");
-pub const EMBEDDED_STRUCTURED_PROMPT: &str = include_str!("../prompts/structured.md");
+pub const EMBEDDED_PROMPT: &str = include_str!("../prompts/structured.md");
 
-/// The cleanup pass the user selected. `Clean` is a strict editor; `Structured`
-/// may reorder and rephrase so the result reads as finished prose or a list.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CleanupMode {
-    #[default]
-    Clean,
-    Structured,
-}
-
-impl CleanupMode {
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Clean => "clean",
-            Self::Structured => "structured",
-        }
-    }
-
-    /// Unknown or malformed values fall back to `None`; callers use the
-    /// default mode so an old or hand-edited settings file never breaks.
-    pub fn from_id(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "clean" => Some(Self::Clean),
-            "structured" => Some(Self::Structured),
-            _ => None,
-        }
-    }
-}
+/// The default Ray API origin. Kept here as well as in the checked-in JSON so
+/// an old override without an `api` object still resolves somewhere sensible.
+pub const DEFAULT_API_BASE: &str = "https://ray.helionhq.com";
 
 pub fn default_known_names() -> Vec<String> {
     [
@@ -93,18 +67,88 @@ pub fn default_stt_prompt() -> String {
         .into()
 }
 
+/// The Ray API origin. `RAY_API_BASE` wins over the checked-in or overridden
+/// value; it is not a secret, so dev and release builds both honor it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    pub base_url: String,
+    /// The public site origin used for the browser sign-in hand-off. Defaults
+    /// to the effective API origin, so `RAY_API_BASE` development points the
+    /// sign-in page at the same local Worker.
+    pub site_url: Option<String>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_API_BASE.into(),
+            site_url: None,
+        }
+    }
+}
+
+/// Resolve the origin from config + the environment. Split out so the rule is
+/// testable without mutating process-wide environment variables.
+pub fn resolve_api_base(configured: &str, env: Option<&str>) -> String {
+    let env = env.map(str::trim).filter(|value| !value.is_empty());
+    let value = env
+        .or_else(|| {
+            let configured = configured.trim();
+            (!configured.is_empty()).then_some(configured)
+        })
+        .unwrap_or(DEFAULT_API_BASE);
+    value.trim_end_matches('/').to_string()
+}
+
+/// Resolve the public site origin: `RAY_SITE_URL` wins, then `api.site_url`,
+/// then the effective API origin.
+pub fn resolve_site_url(configured: Option<&str>, env: Option<&str>, api_base: &str) -> String {
+    let value = env
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| configured.map(str::trim).filter(|value| !value.is_empty()))
+        .unwrap_or(api_base);
+    value.trim_end_matches('/').to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PipelineConfig {
+    #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
     pub stt: SttConfig,
+    #[serde(default)]
     pub cleanup: CleanupConfig,
     #[serde(default = "default_known_names")]
     pub known_names: Vec<String>,
 }
 
+impl PipelineConfig {
+    /// The effective API origin, with `RAY_API_BASE` taking precedence.
+    pub fn api_base(&self) -> String {
+        resolve_api_base(
+            &self.api.base_url,
+            std::env::var("RAY_API_BASE").ok().as_deref(),
+        )
+    }
+
+    /// The public site origin for `/desktop/sign-in`, with `RAY_SITE_URL`
+    /// taking precedence.
+    pub fn site_url(&self) -> String {
+        resolve_site_url(
+            self.api.site_url.as_deref(),
+            std::env::var("RAY_SITE_URL").ok().as_deref(),
+            &self.api_base(),
+        )
+    }
+}
+
 impl Default for PipelineConfig {
     fn default() -> Self {
-        // One source of truth: the checked-in JSON. PipelineConfig itself does
-        // not derive `serde(default)` (which would recurse through this).
+        // One source of truth: the checked-in JSON. Each field in the struct
+        // has its own serde default, so an old override can omit `api` (added
+        // after the first release) without losing the rest of its settings.
         serde_json::from_str(EMBEDDED_PIPELINE).expect("embedded pipeline.json is valid")
     }
 }
@@ -112,23 +156,11 @@ impl Default for PipelineConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SttConfig {
-    pub provider: String,
-    pub streaming: bool,
-    /// `sync_live` (recommended) or `websocket`.
-    pub mode: String,
-    /// WebSocket streaming model (used only in `websocket` mode).
-    pub speech_model: String,
     /// Context passed to the recognizer.
     pub prompt: String,
     pub language_codes: Vec<String>,
     pub sample_rate: u32,
-    pub encoding: String,
-    pub format_turns: bool,
-    pub max_turn_silence: u32,
-    pub end_of_turn_confidence_threshold: f32,
     pub force_endpoint_timeout_ms: u64,
-    pub terminate_timeout_ms: u64,
-    pub connect_timeout_ms: u64,
     pub keyterms_limit: usize,
     pub sync_live: SyncLiveConfig,
     pub batch: BatchConfig,
@@ -137,20 +169,10 @@ pub struct SttConfig {
 impl Default for SttConfig {
     fn default() -> Self {
         Self {
-            provider: "assemblyai".into(),
-            streaming: true,
-            mode: "sync_live".into(),
-            speech_model: "universal-3-6-pro".into(),
             prompt: default_stt_prompt(),
             language_codes: vec!["en".into()],
             sample_rate: 16_000,
-            encoding: "pcm_s16le".into(),
-            format_turns: true,
-            max_turn_silence: 700,
-            end_of_turn_confidence_threshold: 0.4,
             force_endpoint_timeout_ms: 2_500,
-            terminate_timeout_ms: 1_800,
-            connect_timeout_ms: 8_000,
             keyterms_limit: 100,
             sync_live: SyncLiveConfig::default(),
             batch: BatchConfig::default(),
@@ -158,10 +180,11 @@ impl Default for SttConfig {
     }
 }
 
+/// Sync live is the only streaming protocol: Ray's API proxies it to
+/// AssemblyAI with the server-side key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncLiveConfig {
-    pub endpoint: String,
     pub model: String,
     pub max_audio_seconds: u64,
     pub request_timeout_ms: u64,
@@ -170,7 +193,6 @@ pub struct SyncLiveConfig {
 impl Default for SyncLiveConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://sync.assemblyai.com/v1/transcribe/live".into(),
             model: "universal-3-5-pro".into(),
             max_audio_seconds: 120,
             request_timeout_ms: 300_000,
@@ -178,27 +200,20 @@ impl Default for SyncLiveConfig {
     }
 }
 
+/// The batch fallbacks: Sync batch first, then Ray's server-side v2 proxy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BatchConfig {
-    /// AssemblyAI Sync batch endpoint (fast path when live fails).
-    pub endpoint: String,
     pub model: String,
-    /// Keep the older asynchronous v2 upload/poll API as a second fallback.
-    pub v2_fallback: bool,
     pub speech_models: Vec<String>,
-    pub poll_interval_ms: u64,
     pub timeout_ms: u64,
 }
 
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
-            endpoint: "https://sync.assemblyai.com/v1/transcribe".into(),
             model: "universal-3-5-pro".into(),
-            v2_fallback: true,
             speech_models: vec!["universal-3-5-pro".into(), "universal-2".into()],
-            poll_interval_ms: 700,
             timeout_ms: 45_000,
         }
     }
@@ -220,69 +235,17 @@ pub struct CleanupConfig {
     pub hedge_after_ms: u64,
     pub retries: u32,
     pub backoff_ms: Vec<u64>,
+    /// Models to try, in order. All of them go to the same Ray cleanup proxy;
+    /// a second entry keeps the existing hedge/fallback behavior.
     pub providers: Vec<CleanupProvider>,
-    /// Per-mode overrides. Unset fields inherit the base cleanup config above.
-    #[serde(default)]
-    pub modes: CleanupModes,
-}
-
-/// Optional overrides for the Structured cleanup mode. The manager/research
-/// agent can tune Structured without touching Clean's settings.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CleanupModes {
-    pub structured: CleanupModeOverride,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CleanupModeOverride {
-    /// Model id passed through verbatim to the first provider (the primary).
-    pub model: Option<String>,
-    pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
-    pub timeout_ms: Option<u64>,
-    pub hedge_after_ms: Option<u64>,
-}
-
-impl CleanupConfig {
-    /// The effective config for `mode`. Clean returns an exact clone, so its
-    /// request body, limits and timing are byte-for-byte unchanged.
-    pub fn for_mode(&self, mode: CleanupMode) -> Self {
-        let mut config = self.clone();
-        if mode != CleanupMode::Structured {
-            return config;
-        }
-        let overrides = &self.modes.structured;
-        if let Some(model) = &overrides.model {
-            if let Some(primary) = config.providers.first_mut() {
-                // Pass the id through as-is: the AssemblyAI LLM Gateway accepts
-                // non-Gemma ids (Claude/GPT/Gemini) on the same endpoint.
-                primary.model = model.clone();
-            }
-        }
-        if let Some(temperature) = overrides.temperature {
-            config.temperature = temperature;
-        }
-        if let Some(max_tokens) = overrides.max_tokens {
-            config.max_tokens = max_tokens;
-        }
-        if let Some(timeout_ms) = overrides.timeout_ms {
-            config.timeout_ms = timeout_ms;
-        }
-        if let Some(hedge_after_ms) = overrides.hedge_after_ms {
-            config.hedge_after_ms = hedge_after_ms;
-        }
-        config
-    }
 }
 
 pub fn default_cleanup_timeout_ms() -> u64 {
-    6_000
+    8_000
 }
 
 pub fn default_hedge_after_ms() -> u64 {
-    2_500
+    4_000
 }
 
 impl Default for CleanupConfig {
@@ -296,129 +259,40 @@ impl Default for CleanupConfig {
             retries: 2,
             backoff_ms: vec![300, 900],
             providers: vec![CleanupProvider {
-                id: "assemblyai".into(),
-                base_url: "https://llm-gateway.assemblyai.com/v1".into(),
+                id: "ray".into(),
                 model: "gemma-4-31b".into(),
-                api_key_secret: "assemblyai".into(),
-                extra_body: None,
             }],
-            modes: CleanupModes::default(),
         }
     }
 }
 
+/// One cleanup model. The endpoint and auth are fixed by the Ray API and only
+/// the model id (passed through verbatim) can differ. The proxy is a strict
+/// whitelist (`model`, `messages`, `temperature`, `max_tokens`, `stream`), so
+/// extra request-body fields are not supported; an old override that still
+/// carries `extra_body` loads but the field is ignored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CleanupProvider {
     pub id: String,
-    pub base_url: String,
     pub model: String,
-    pub api_key_secret: String,
-    #[serde(default)]
-    pub extra_body: Option<serde_json::Value>,
 }
 
-/// The prompt template that belongs to `mode`. Clean keeps using `cleanup.md`;
-/// Structured uses `structured.md`.
-pub fn prompt_for<'a>(clean: &'a str, structured: &'a str, mode: CleanupMode) -> &'a str {
-    match mode {
-        CleanupMode::Clean => clean,
-        CleanupMode::Structured => structured,
-    }
-}
-
-/// Files a user (or the research agent) can drop into the app-data directory to
-/// override the embedded pipeline without a rebuild.
+/// Files a user can drop into the app-data directory to override the embedded
+/// pipeline without a rebuild.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub pipeline: PipelineConfig,
     pub prompt: String,
-    pub structured_prompt: String,
-}
-
-/// Whether a raw `pipeline.json` document explicitly contains `cleanup.modes`.
-/// This distinguishes an older override that predates the key (which must get
-/// the embedded Structured defaults) from an explicit, possibly partial object
-/// (which must keep inheriting the override's base cleanup values).
-fn has_cleanup_modes(text: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
-    };
-    value
-        .get("cleanup")
-        .and_then(|cleanup| cleanup.get("modes"))
-        .is_some()
-}
-
-/// Whether `provider` belongs to a backend Ray has retired. Startup deletes
-/// retired credentials, so a legacy override that still lists one would have
-/// every cleanup request fail and the user would get the raw transcript.
-fn is_retired_provider(provider: &CleanupProvider) -> bool {
-    let is_retired_name = |value: &str| {
-        crate::secrets::RETIRED
-            .iter()
-            .any(|retired| value.eq_ignore_ascii_case(retired))
-    };
-    // The endpoint is the third signal: older overrides may use a custom id or
-    // secret name but still point at the retired provider's API host.
-    let uses_retired_host = url::Url::parse(&provider.base_url).is_ok_and(|url| {
-        url.host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case("api.groq.com"))
-    });
-    is_retired_name(&provider.id) || is_retired_name(&provider.api_key_secret) || uses_retired_host
-}
-
-/// Remove retired providers from a parsed override, keeping the order of the
-/// remaining supported providers. When none remain, fall back to the embedded
-/// default so cleanup still runs.
-fn remove_retired_providers(pipeline: &mut PipelineConfig) {
-    let before = pipeline.cleanup.providers.len();
-    pipeline
-        .cleanup
-        .providers
-        .retain(|provider| !is_retired_provider(provider));
-    let removed = before - pipeline.cleanup.providers.len();
-    if removed == 0 {
-        return;
-    }
-    eprintln!("[ray] removed {removed} retired cleanup provider(s) from pipeline.json override");
-    if pipeline.cleanup.providers.is_empty() {
-        pipeline.cleanup.providers = PipelineConfig::default().cleanup.providers;
-        eprintln!("[ray] no supported cleanup providers remain; using the embedded default");
-    }
 }
 
 impl RuntimeConfig {
     pub fn load(app_data: &Path) -> Self {
         let pipeline_override = app_data.join("pipeline.json");
-        let prompt_override = app_data.join("cleanup.md");
-        let structured_override = app_data.join("structured.md");
+        let prompt_override = app_data.join("structured.md");
 
-        let pipeline = match std::fs::read_to_string(&pipeline_override) {
+        let mut pipeline = match std::fs::read_to_string(&pipeline_override) {
             Ok(text) => match serde_json::from_str::<PipelineConfig>(&text) {
-                Ok(mut config) => {
-                    // Overrides written before Structured existed have no
-                    // `cleanup.modes`, so without this they would lose the
-                    // embedded 8000 ms timeout / 4000 ms hedge defaults. Keep
-                    // `model: None` so Structured inherits the user's own base
-                    // primary model instead of the embedded one.
-                    if !has_cleanup_modes(&text) {
-                        let defaults = PipelineConfig::default().cleanup.modes;
-                        config.cleanup.modes = CleanupModes {
-                            structured: CleanupModeOverride {
-                                model: None,
-                                ..defaults.structured
-                            },
-                        };
-                    }
-                    // Any override may still list a provider whose credentials
-                    // startup deletes; drop it so cleanup keeps working and
-                    // falls back to the embedded default only when nothing
-                    // supported is left. This runs even when `cleanup.modes`
-                    // is explicit, because those overrides still need a usable
-                    // provider.
-                    remove_retired_providers(&mut config);
-                    config
-                }
+                Ok(config) => config,
                 Err(error) => {
                     eprintln!("[ray] ignoring invalid pipeline.json override: {error}");
                     PipelineConfig::default()
@@ -426,22 +300,56 @@ impl RuntimeConfig {
             },
             Err(_) => PipelineConfig::default(),
         };
+        // A pre-launch override can name cleanup models that the Worker's
+        // allowlist no longer accepts. Passing them through would fail every
+        // cleanup forever with no UI to fix it, so keep only the shipped
+        // models and fall back to the built-in provider when none survive.
+        let defaults = PipelineConfig::default();
+        let allowed: Vec<String> = defaults
+            .cleanup
+            .providers
+            .iter()
+            .map(|provider| provider.model.to_lowercase())
+            .collect();
+        let ignored: Vec<String> = pipeline
+            .cleanup
+            .providers
+            .iter()
+            .filter(|provider| !allowed.contains(&provider.model.to_lowercase()))
+            .map(|provider| provider.model.clone())
+            .collect();
+        if !ignored.is_empty() {
+            eprintln!(
+                "[ray] ignoring cleanup model(s) that are not built in: {}; using the shipped model",
+                ignored.join(", ")
+            );
+        }
+        pipeline
+            .cleanup
+            .providers
+            .retain(|provider| allowed.contains(&provider.model.to_lowercase()));
+        // Use the built-in spelling so a differently-cased override cannot be
+        // rejected by the Worker's exact allowlist.
+        for provider in &mut pipeline.cleanup.providers {
+            if let Some(canonical) = defaults
+                .cleanup
+                .providers
+                .iter()
+                .find(|builtin| builtin.model.eq_ignore_ascii_case(&provider.model))
+            {
+                provider.model = canonical.model.clone();
+            }
+        }
+        if pipeline.cleanup.providers.is_empty() {
+            pipeline.cleanup.providers = defaults.cleanup.providers;
+        }
 
         let prompt = match std::fs::read_to_string(&prompt_override) {
             Ok(text) if !text.trim().is_empty() => text,
             _ => EMBEDDED_PROMPT.to_string(),
         };
 
-        let structured_prompt = match std::fs::read_to_string(&structured_override) {
-            Ok(text) if !text.trim().is_empty() => text,
-            _ => EMBEDDED_STRUCTURED_PROMPT.to_string(),
-        };
-
-        Self {
-            pipeline,
-            prompt,
-            structured_prompt,
-        }
+        Self { pipeline, prompt }
     }
 }
 
@@ -451,10 +359,8 @@ mod tests {
 
     /// A per-test directory so parallel tests never share override files.
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ray-config-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ray-config-test-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -462,328 +368,114 @@ mod tests {
     #[test]
     fn embedded_pipeline_parses_and_matches_the_recommendation() {
         let config = PipelineConfig::default();
-        assert_eq!(config.stt.mode, "sync_live");
+        assert_eq!(config.api.base_url, DEFAULT_API_BASE);
+        assert_eq!(config.api.site_url.as_deref(), Some(DEFAULT_API_BASE));
         assert_eq!(config.stt.sync_live.model, "universal-3-5-pro");
+        assert_eq!(config.stt.batch.model, "universal-3-5-pro");
+        assert_eq!(config.cleanup.providers[0].id, "ray");
         assert_eq!(config.cleanup.providers[0].model, "gemma-4-31b");
         assert_eq!(config.cleanup.providers.len(), 1);
-        assert!(config.cleanup.providers.iter().all(|p| p.id != "vercel"));
         assert!(config.known_names.iter().any(|name| name == "Helion"));
         assert!(config.known_names.iter().any(|name| name == "GPT-5"));
         assert_eq!(config.cleanup.max_tokens, 3_000);
-        assert_eq!(config.cleanup.timeout_ms, 6_000);
-        assert_eq!(config.cleanup.hedge_after_ms, 2_500);
-        // Structured's researched overrides are in the embedded config, while
-        // Clean's effective config stays exactly the base values.
-        let structured = config.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.providers[0].model, "gemma-4-31b");
-        assert_eq!(structured.temperature, 0.0);
-        assert_eq!(structured.max_tokens, 3_000);
-        assert_eq!(structured.timeout_ms, 8_000);
-        assert_eq!(structured.hedge_after_ms, 4_000);
-        let clean = config.cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
-        assert!(config.known_names.iter().any(|name| name == "gpt-oss"));
+        assert_eq!(config.cleanup.timeout_ms, 8_000);
+        assert_eq!(config.cleanup.hedge_after_ms, 4_000);
         assert!(!EMBEDDED_PROMPT.trim().is_empty());
-        assert!(!EMBEDDED_STRUCTURED_PROMPT.trim().is_empty());
+        assert!(!config.stt.prompt.trim().is_empty());
     }
 
     #[test]
-    fn cleanup_mode_defaults_to_clean_and_parses_known_ids() {
-        assert_eq!(CleanupMode::default(), CleanupMode::Clean);
-        assert_eq!(CleanupMode::from_id(" Clean "), Some(CleanupMode::Clean));
+    fn api_base_comes_from_config_and_the_environment_wins() {
         assert_eq!(
-            CleanupMode::from_id("STRUCTURED"),
-            Some(CleanupMode::Structured)
-        );
-        assert_eq!(CleanupMode::from_id("rewrite"), None);
-        assert_eq!(CleanupMode::Clean.id(), "clean");
-        assert_eq!(CleanupMode::Structured.id(), "structured");
-    }
-
-    #[test]
-    fn structured_overrides_inherit_unset_fields() {
-        let cleanup: CleanupConfig = serde_json::from_str(
-            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"timeout_ms":6000,
-                "hedge_after_ms":2500,"retries":2,"backoff_ms":[300,900],
-                "providers":[{"id":"assemblyai",
-                    "base_url":"https://llm-gateway.assemblyai.com/v1",
-                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
-                "modes":{"structured":{"max_tokens":4200}}}"#,
-        )
-        .unwrap();
-
-        // Clean is an exact clone: no override may leak into it.
-        let clean = cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.temperature, 0.0);
-        assert_eq!(clean.max_tokens, 3_000);
-        assert_eq!(clean.providers[0].model, "gemma-4-31b");
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
-
-        // Only the field the override names changes; everything else inherits.
-        let structured = cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.temperature, 0.0);
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.providers[0].model, "gemma-4-31b");
-        assert_eq!(structured.timeout_ms, 6_000);
-        assert_eq!(structured.hedge_after_ms, 2_500);
-    }
-
-    #[test]
-    fn structured_model_override_is_passed_through_verbatim() {
-        let cleanup: CleanupConfig = serde_json::from_str(
-            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"retries":2,
-                "backoff_ms":[300,900],
-                "providers":[{"id":"assemblyai",
-                    "base_url":"https://llm-gateway.assemblyai.com/v1",
-                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
-                "modes":{"structured":{"model":"claude-sonnet-4-5",
-                    "temperature":0.2,"timeout_ms":9000,"hedge_after_ms":3000}}}"#,
-        )
-        .unwrap();
-        let structured = cleanup.for_mode(CleanupMode::Structured);
-        // Non-Gemma gateway ids are not rewritten or rejected.
-        assert_eq!(structured.providers[0].model, "claude-sonnet-4-5");
-        assert_eq!(structured.temperature, 0.2);
-        assert_eq!(structured.timeout_ms, 9_000);
-        assert_eq!(structured.hedge_after_ms, 3_000);
-        assert_eq!(structured.max_tokens, 3_000);
-    }
-
-    #[test]
-    fn clean_selects_the_clean_prompt_and_structured_the_other() {
-        // Clean's prompt source must be exactly the old one.
-        assert_eq!(
-            prompt_for("clean prompt", "structured prompt", CleanupMode::Clean),
-            "clean prompt"
+            resolve_api_base("https://ray.helionhq.com", None),
+            "https://ray.helionhq.com"
         );
         assert_eq!(
-            prompt_for(
-                EMBEDDED_PROMPT,
-                EMBEDDED_STRUCTURED_PROMPT,
-                CleanupMode::Clean
+            resolve_api_base("https://ray.helionhq.com/", None),
+            "https://ray.helionhq.com"
+        );
+        assert_eq!(
+            resolve_api_base("https://ray.helionhq.com", Some("http://127.0.0.1:8787/")),
+            "http://127.0.0.1:8787"
+        );
+        // Blank values fall through instead of producing an unusable origin.
+        assert_eq!(
+            resolve_api_base("  https://example.test  ", Some("   ")),
+            "https://example.test"
+        );
+        assert_eq!(resolve_api_base("", None), DEFAULT_API_BASE);
+    }
+
+    #[test]
+    fn site_url_env_and_config_fall_back_to_the_api_origin() {
+        assert_eq!(
+            resolve_site_url(None, None, "https://ray.helionhq.com"),
+            "https://ray.helionhq.com"
+        );
+        assert_eq!(
+            resolve_site_url(Some("https://ray.example/"), None, "https://api.example"),
+            "https://ray.example"
+        );
+        assert_eq!(
+            resolve_site_url(
+                Some("https://ray.example"),
+                Some("http://127.0.0.1:8787/"),
+                "https://api.example"
             ),
-            EMBEDDED_PROMPT
+            "http://127.0.0.1:8787"
         );
+        // Blank values fall through to the API origin.
         assert_eq!(
-            prompt_for(
-                EMBEDDED_PROMPT,
-                EMBEDDED_STRUCTURED_PROMPT,
-                CleanupMode::Structured
-            ),
-            EMBEDDED_STRUCTURED_PROMPT
+            resolve_site_url(Some("   "), Some(""), "https://api.example"),
+            "https://api.example"
         );
     }
 
     #[test]
-    fn runtime_overrides_load_each_prompt_independently() {
-        let dir = std::env::temp_dir().join(format!("ray-config-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cleanup.md"), "# Clean\n\nCLEAN PROMPT").unwrap();
-        std::fs::write(
-            dir.join("structured.md"),
-            "# Structured\n\nSTRUCTURED PROMPT",
-        )
-        .unwrap();
-        let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(runtime.prompt, "# Clean\n\nCLEAN PROMPT");
-        assert_eq!(
-            runtime.structured_prompt,
-            "# Structured\n\nSTRUCTURED PROMPT"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-
-        // With no overrides both fall back to the embedded prompts.
-        let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
-        assert_eq!(runtime.structured_prompt, EMBEDDED_STRUCTURED_PROMPT);
-    }
-
-    #[test]
-    fn older_cleanup_overrides_get_the_hedge_defaults() {
-        // A user's app-data pipeline.json written before hedging existed must
-        // still load, with sensible timeout defaults rather than zero.
-        let cleanup: CleanupConfig = serde_json::from_str(
-            r#"{"enabled":true,"temperature":0,"max_tokens":1500,"retries":2,
-                "backoff_ms":[300,900],"providers":[]}"#,
-        )
-        .unwrap();
-        assert_eq!(cleanup.timeout_ms, 6_000);
-        assert_eq!(cleanup.hedge_after_ms, 2_500);
-        // A document written before modes existed still loads.
-        assert_eq!(cleanup.modes.structured.model, None);
-    }
-
-    #[test]
-    fn override_without_modes_gets_embedded_structured_defaults() {
-        let dir = std::env::temp_dir().join(format!(
-            "ray-config-test-legacy-modes-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // A pipeline.json written before Structured existed has no modes key.
-        // It uses a custom primary model, which Structured must inherit.
+    fn runtime_override_can_set_the_site_origin() {
+        let dir = temp_dir("site-url");
         std::fs::write(
             dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[{"id":"assemblyai",
-                    "base_url":"https://llm-gateway.assemblyai.com/v1",
-                    "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}]}}"#,
+            r#"{"api":{"base_url":"http://127.0.0.1:8787","site_url":"https://ray.example"}}"#,
         )
         .unwrap();
-
         let runtime = RuntimeConfig::load(&dir);
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.providers[0].model, "claude-sonnet-4-5");
-        assert_eq!(structured.temperature, 0.0);
-        assert_eq!(structured.max_tokens, 3_000);
-        assert_eq!(structured.timeout_ms, 8_000);
-        assert_eq!(structured.hedge_after_ms, 4_000);
-
-        // Clean still inherits the override's own base values, untouched.
-        let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.providers[0].model, "claude-sonnet-4-5");
-        assert_eq!(clean.max_tokens, 1_500);
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
+        assert_eq!(runtime.pipeline.api.base_url, "http://127.0.0.1:8787");
+        assert_eq!(
+            runtime.pipeline.api.site_url.as_deref(),
+            Some("https://ray.example")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn explicit_partial_modes_keep_base_cleanup_inheritance() {
-        let dir = std::env::temp_dir().join(format!(
-            "ray-config-test-partial-modes-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn runtime_override_can_set_the_api_origin() {
+        let dir = temp_dir("api-base");
         std::fs::write(
             dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[],
-                "modes":{"structured":{"max_tokens":4200}}}}"#,
+            r#"{"api":{"base_url":"http://127.0.0.1:8787"}}"#,
         )
         .unwrap();
-
         let runtime = RuntimeConfig::load(&dir);
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        // The explicit field wins; the rest inherit the base cleanup config,
-        // not the embedded Structured defaults.
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.timeout_ms, 6_000);
-        assert_eq!(structured.hedge_after_ms, 2_500);
-
-        let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.max_tokens, 1_500);
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn legacy_override_with_only_groq_falls_back_to_embedded_defaults() {
-        let dir = temp_dir("legacy-groq-only");
-        // Each provider is identified as retired by a different signal: the
-        // id, the secret name, or the API host.
-        std::fs::write(
-            dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[
-                    {"id":"Groq","base_url":"https://example.com/v1",
-                        "model":"llama-3.3-70b","api_key_secret":"custom"},
-                    {"id":"custom","base_url":"https://example.com/v1",
-                        "model":"llama-3.3-70b","api_key_secret":"GROQ"},
-                    {"id":"custom","base_url":"https://api.groq.com/openai/v1",
-                        "model":"llama-3.3-70b","api_key_secret":"custom"}
-                ]}}"#,
-        )
-        .unwrap();
-
-        let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(
-            serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
-            serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
-        );
-        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
-        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
+        assert_eq!(runtime.pipeline.api.base_url, "http://127.0.0.1:8787");
+        // Everything omitted from the override keeps its embedded default.
+        assert_eq!(runtime.pipeline.stt.sync_live.model, "universal-3-5-pro");
         assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn legacy_override_drops_groq_and_keeps_supported_providers_in_order() {
-        let dir = temp_dir("legacy-groq-primary");
+    fn old_pipeline_overrides_still_load() {
+        let dir = temp_dir("legacy-override");
+        // Written before the commercial launch: it has the removed STT mode
+        // fields, old provider keys, and cleanup modes. Unknown fields are
+        // ignored; the parts that still exist are kept.
         std::fs::write(
             dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[
-                    {"id":"groq","base_url":"https://api.groq.com/openai/v1",
-                        "model":"llama-3.3-70b","api_key_secret":"groq"},
-                    {"id":"assemblyai",
-                        "base_url":"https://llm-gateway.assemblyai.com/v1",
-                        "model":"gemma-4-31b","api_key_secret":"assemblyai"},
-                    {"id":"vercel","base_url":"https://ai-gateway.vercel.sh/v1",
-                        "model":"openai/gpt-5","api_key_secret":"vercel"}
-                ]}}"#,
-        )
-        .unwrap();
-
-        let runtime = RuntimeConfig::load(&dir);
-        let providers = &runtime.pipeline.cleanup.providers;
-        assert_eq!(
-            providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            ["assemblyai", "vercel"]
-        );
-        assert_eq!(providers[0].model, "gemma-4-31b");
-        assert_eq!(providers[0].api_key_secret, "assemblyai");
-        assert_eq!(providers[1].base_url, "https://ai-gateway.vercel.sh/v1");
-        assert_eq!(providers[1].model, "openai/gpt-5");
-        assert_eq!(providers[1].api_key_secret, "vercel");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn legacy_override_without_retired_providers_is_unchanged() {
-        let dir = temp_dir("legacy-supported-only");
-        std::fs::write(
-            dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[
-                    {"id":"assemblyai",
-                        "base_url":"https://llm-gateway.assemblyai.com/v1",
-                        "model":"claude-sonnet-4-5","api_key_secret":"assemblyai",
-                        "extra_body":{"reasoning":{"effort":"low"}}}
-                ]}}"#,
-        )
-        .unwrap();
-
-        let runtime = RuntimeConfig::load(&dir);
-        // Every field, including the custom model and extra body, survives.
-        assert_eq!(
-            serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
-            serde_json::json!([{
-                "id": "assemblyai",
-                "base_url": "https://llm-gateway.assemblyai.com/v1",
-                "model": "claude-sonnet-4-5",
-                "api_key_secret": "assemblyai",
-                "extra_body": {"reasoning": {"effort": "low"}}
-            }])
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn explicit_cleanup_modes_skip_migration_but_still_filter_retired_providers() {
-        let dir = temp_dir("explicit-modes");
-        std::fs::write(
-            dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
+            r#"{"stt":{"streaming":false,"mode":"websocket","speech_model":"universal-3-6-pro"},
+                "cleanup":{"enabled":true,"temperature":0,"max_tokens":1500,
+                "timeout_ms":6000,"hedge_after_ms":2500,"retries":2,
+                "backoff_ms":[300,900],
                 "providers":[{"id":"assemblyai",
                     "base_url":"https://llm-gateway.assemblyai.com/v1",
                     "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}],
@@ -792,90 +484,78 @@ mod tests {
         .unwrap();
 
         let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.pipeline.cleanup.max_tokens, 1_500);
+        // The legacy model is not in the built-in allowlist, so it is ignored
+        // instead of failing every cleanup forever.
         assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
-        assert_eq!(
-            runtime.pipeline.cleanup.providers[0].model,
-            "claude-sonnet-4-5"
-        );
-        // Explicit modes are never replaced with the embedded Structured
-        // defaults: the declared field wins and the rest inherit the base
-        // cleanup values (6000 ms / 2500 ms), not 8000 ms / 4000 ms.
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.timeout_ms, 6_000);
-        assert_eq!(structured.hedge_after_ms, 2_500);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "ray");
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
+        // A missing `api` object gets the default origin.
+        assert_eq!(runtime.pipeline.api.base_url, DEFAULT_API_BASE);
+        // Removed STT fields are simply absent; the surviving defaults apply.
+        assert_eq!(runtime.pipeline.stt.sample_rate, 16_000);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
-        // Explicit modes do not exempt an override from retired-provider
-        // filtering: the supported provider survives and is retried first.
+    #[test]
+    fn legacy_cleanup_models_are_filtered_against_the_built_in_list() {
+        let dir = temp_dir("legacy-models");
+        // One old model plus one shipped model: keep the shipped one only.
         std::fs::write(
             dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[
-                    {"id":"groq","base_url":"https://api.groq.com/openai/v1",
-                        "model":"llama-3.3-70b","api_key_secret":"groq"},
-                    {"id":"assemblyai",
-                        "base_url":"https://llm-gateway.assemblyai.com/v1",
-                        "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}
-                ],
-                "modes":{"structured":{"max_tokens":4200}}}}"#,
+            r#"{"cleanup":{"providers":[
+                {"id":"old","model":"claude-sonnet-4-5"},
+                {"id":"ray","model":"GEMMA-4-31B"}
+            ]}}"#,
         )
         .unwrap();
-
         let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(
-            runtime
-                .pipeline
-                .cleanup
-                .providers
-                .iter()
-                .map(|provider| provider.id.as_str())
-                .collect::<Vec<_>>(),
-            ["assemblyai"]
-        );
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.timeout_ms, 6_000);
+        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "ray");
+        // Matched case-insensitively and rewritten to the built-in spelling.
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
+        std::fs::remove_dir_all(&dir).ok();
 
-        // When explicit modes leave no supported provider, filtering falls back
-        // to the embedded default so cleanup still has somewhere to run.
+        // No allowlisted model at all: the shipped provider is restored.
+        let dir = temp_dir("legacy-models-none");
         std::fs::write(
             dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[{"id":"groq",
-                    "base_url":"https://api.groq.com/openai/v1",
-                    "model":"llama-3.3-70b","api_key_secret":"groq"}],
-                "modes":{"structured":{}}}}"#,
+            r#"{"cleanup":{"providers":[{"id":"a","model":"gpt-oss-120b"}]}}"#,
         )
         .unwrap();
-
         let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(
-            serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
-            serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
-        );
         assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
-        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
-        // The provider fallback does not migrate the explicit modes.
-        assert_eq!(
-            runtime
-                .pipeline
-                .cleanup
-                .for_mode(CleanupMode::Structured)
-                .timeout_ms,
-            6_000
-        );
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
-        // The embedded default never contains a retired provider.
+    #[test]
+    fn prompt_override_is_structured_md() {
+        let dir = temp_dir("prompt");
+        std::fs::write(dir.join("structured.md"), "# Structured\n\nNEW PROMPT").unwrap();
+        // The retired Clean prompt file is ignored even if an old install left
+        // one behind.
+        std::fs::write(dir.join("cleanup.md"), "OLD CLEAN PROMPT").unwrap();
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.prompt, "# Structured\n\nNEW PROMPT");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // With no overrides the embedded prompt is used.
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
+    }
+
+    #[test]
+    fn an_invalid_override_falls_back_to_the_embedded_config() {
+        let dir = temp_dir("invalid");
+        std::fs::write(dir.join("pipeline.json"), "not json").unwrap();
+        let runtime = RuntimeConfig::load(&dir);
         let defaults = PipelineConfig::default();
-        assert_eq!(defaults.cleanup.providers.len(), 1);
-        assert_eq!(defaults.cleanup.providers[0].id, "assemblyai");
-        assert!(defaults
-            .cleanup
-            .providers
-            .iter()
-            .all(|provider| !is_retired_provider(provider)));
+        assert_eq!(runtime.pipeline.api.base_url, defaults.api.base_url);
+        assert_eq!(
+            runtime.pipeline.cleanup.timeout_ms,
+            defaults.cleanup.timeout_ms
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

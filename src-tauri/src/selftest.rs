@@ -1,19 +1,17 @@
 //! `ray --selftest <file.wav>` / `ray --selftest-stream <file.wav>`
 //!
-//! Headless verification of the real pipeline against the real APIs. Reads a
-//! 16 kHz mono PCM16 WAV, transcribes it through the shipping code path, runs
-//! cleanup, and prints both results. Keys come from Windows Credential Manager
-//! or the environment; nothing is compiled in.
+//! Headless verification of the real pipeline against the Ray API and the real
+//! Workers running locally or remotely. Reads a 16 kHz mono PCM16 WAV,
+//! transcribes it through the shipping code path, runs cleanup, and prints both
+//! results. Auth comes from the stored device token or, for headless runs,
+//! `RAY_DEVICE_TOKEN`; the origin comes from `pipeline.json` / `RAY_API_BASE`.
 //!
-//! Cleanup mode: pass `--mode clean|structured` (handled in `main.rs`, which
-//! sets `RAY_CLEANUP_MODE`) or set `RAY_CLEANUP_MODE` directly. The default is
-//! `clean`, matching the app. The output header stays `--- CLEAN (...) ---`
-//! for both modes so the research corpus parser keeps working; the
-//! `[selftest] cleanup_mode=...` line states which one ran.
+//! Cleanup is Structured-only. The output header stays `--- CLEAN (...) ---`
+//! so the research corpus parser keeps working.
 
 use std::time::{Duration, Instant};
 
-use crate::config::{self, CleanupMode, PipelineConfig};
+use crate::config::{self, PipelineConfig};
 use crate::{audio, cleanup, secrets, stt};
 
 pub fn run_selftest(path: &str, streaming: bool) -> i32 {
@@ -55,32 +53,16 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
     } else if resample {
         println!("[selftest] input was already 16 kHz; the resampler is a no-op");
     }
-    let key = secrets::get(secrets::ASSEMBLYAI);
-    let Some(api_key) = key else {
-        eprintln!("[selftest] ASSEMBLYAI_API_KEY is not set (environment or Credential Manager)");
+    let Some(token) = secrets::selftest_device_token() else {
+        eprintln!(
+            "[selftest] No Ray session. Sign in once, or set RAY_DEVICE_TOKEN for a headless run."
+        );
         return 2;
     };
-    let mut config = PipelineConfig::default();
-    if let Ok(mode) = std::env::var("RAY_STT_MODE") {
-        if !mode.trim().is_empty() {
-            config.stt.mode = mode.trim().to_string();
-        }
-    }
-    if std::env::var("RAY_TEST_FORCE_FALLBACK").is_ok() {
-        if let Some(provider) = config.cleanup.providers.get_mut(0) {
-            provider.base_url = "https://127.0.0.1:9/v1".into();
-        }
-    }
-    let cleanup_mode = std::env::var("RAY_CLEANUP_MODE")
-        .ok()
-        .and_then(|value| CleanupMode::from_id(&value))
-        .unwrap_or_default();
-    let cleanup_config = config.cleanup.for_mode(cleanup_mode);
-    let cleanup_prompt = config::prompt_for(
-        config::EMBEDDED_PROMPT,
-        config::EMBEDDED_STRUCTURED_PROMPT,
-        cleanup_mode,
-    );
+    let config = PipelineConfig::default();
+    let api_base = config.api_base();
+    let cleanup_config = config.cleanup.clone();
+    let cleanup_prompt = config::EMBEDDED_PROMPT;
     let dictionary: Vec<String> = std::env::var("RAY_TEST_DICTIONARY")
         .ok()
         .map(|value| {
@@ -124,10 +106,10 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         };
 
         if std::env::var("RAY_TEST_WARM").is_ok() {
-            // Simulates the app opening the cleanup connection while the user
-            // is speaking: the request finishes long before the hotkey is up.
+            // Simulates the app opening the API connection while the user is
+            // speaking: the request finishes long before the hotkey is up.
             let warm_started = Instant::now();
-            cleanup::warm_connection(&http, &cleanup_config).await;
+            cleanup::warm_connection(&http, &api_base).await;
             println!(
                 "[selftest] timing prewarm_ms={}",
                 warm_started.elapsed().as_millis()
@@ -135,8 +117,8 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         }
 
         println!(
-            "[selftest] cleanup_mode={} model={}",
-            cleanup_mode.id(),
+            "[selftest] api={} cleanup_model={}",
+            api_base,
             cleanup_config
                 .providers
                 .first()
@@ -153,12 +135,13 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             } else {
                 &config.stt.batch.model
             },
-            if streaming { &config.stt.mode } else { "batch" }
+            if streaming { "sync_live" } else { "batch" }
         );
 
         let raw = if streaming {
             let session = stt::spawn_live(
-                api_key.clone(),
+                &api_base,
+                &token,
                 config.stt.clone(),
                 keyterms.clone(),
                 http.clone(),
@@ -187,24 +170,48 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                     );
                     text
                 }
+                Err(error) if error.is_fatal() => {
+                    eprintln!("[selftest] live request failed: {error}");
+                    return 1;
+                }
                 Err(error) => {
                     // Mirror the app: a failed live request falls back to the
                     // batch endpoint rather than losing the dictation.
                     eprintln!("[selftest] streaming failed: {error}; falling back to batch");
+                    let partial = error.partial.clone();
                     let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
                     let fallback_started = Instant::now();
-                    let text = match stt::transcribe_wav(
-                        &http,
-                        &api_key,
-                        &keyterms,
-                        wav_bytes,
-                        &config.stt,
+                    let mut used_partial = false;
+                    // Both sequential fallbacks share the shipping budget.
+                    let text = match tokio::time::timeout(
+                        stt::batch_time_budget(&config.stt),
+                        stt::transcribe_wav(
+                            &http,
+                            &api_base,
+                            &token,
+                            &keyterms,
+                            wav_bytes,
+                            &config.stt,
+                        ),
                     )
                     .await
                     {
-                        Ok(text) => text,
-                        Err(error) => {
-                            eprintln!("[selftest] batch transcription failed: {error}");
+                        Ok(Ok(text)) => text,
+                        Ok(Err(batch_error)) => {
+                            if let Some(partial) = partial {
+                                used_partial = true;
+                                eprintln!(
+                                    "[selftest] note: live failed ({error}); batch failed \
+                                     ({batch_error}); keeping the transcribed segments"
+                                );
+                                partial
+                            } else {
+                                eprintln!("[selftest] batch transcription failed: {batch_error}");
+                                return 1;
+                            }
+                        }
+                        Err(_) => {
+                            eprintln!("[selftest] batch transcription timed out");
                             return 1;
                         }
                     };
@@ -212,23 +219,34 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                         "[selftest] timing stop_to_transcript_ms={} fallback=batch",
                         fallback_started.elapsed().as_millis()
                     );
-                    eprintln!("[selftest] note: live failed ({error}); batch succeeded");
+                    if !used_partial {
+                        eprintln!("[selftest] note: live failed ({error}); batch succeeded");
+                    }
                     text
                 }
             }
         } else {
             let wav_bytes = stt::wav_from_pcm16(&wav.samples, 16_000);
             let stopped = Instant::now();
-            match stt::transcribe_wav(&http, &api_key, &keyterms, wav_bytes, &config.stt).await {
-                Ok(text) => {
+            match tokio::time::timeout(
+                stt::batch_time_budget(&config.stt),
+                stt::transcribe_wav(&http, &api_base, &token, &keyterms, wav_bytes, &config.stt),
+            )
+            .await
+            {
+                Ok(Ok(text)) => {
                     println!(
                         "[selftest] timing stop_to_transcript_ms={}",
                         stopped.elapsed().as_millis()
                     );
                     text
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     eprintln!("[selftest] batch transcription failed: {error}");
+                    return 1;
+                }
+                Err(_) => {
+                    eprintln!("[selftest] batch transcription timed out");
                     return 1;
                 }
             }
@@ -241,17 +259,22 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         let cleanup_started = Instant::now();
         let result = cleanup::cleanup(
             &http,
+            &api_base,
+            &token,
             &cleanup_config,
-            cleanup::CleanupPrompt {
-                mode: cleanup_mode,
+            cleanup::CleanupInput {
                 template: cleanup_prompt,
+                transcript: &raw,
+                dictionary: &dictionary,
+                known_names: &config.known_names,
+                app_name: &app_name,
             },
-            &raw,
-            &dictionary,
-            &config.known_names,
-            &app_name,
         )
         .await;
+        if let Some(error) = result.fatal {
+            eprintln!("[selftest] cleanup failed: {error}");
+            return 1;
+        }
         let cleanup_ms = cleanup_started.elapsed().as_millis();
         println!(
             "\n--- CLEAN ({}) ---\n{}",
@@ -271,17 +294,22 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             let warm_started = Instant::now();
             let warm = cleanup::cleanup(
                 &http,
+                &api_base,
+                &token,
                 &cleanup_config,
-                cleanup::CleanupPrompt {
-                    mode: cleanup_mode,
+                cleanup::CleanupInput {
                     template: cleanup_prompt,
+                    transcript: &raw,
+                    dictionary: &dictionary,
+                    known_names: &config.known_names,
+                    app_name: &app_name,
                 },
-                &raw,
-                &dictionary,
-                &config.known_names,
-                &app_name,
             )
             .await;
+            if let Some(error) = warm.fatal {
+                eprintln!("[selftest] cleanup failed: {error}");
+                return 1;
+            }
             println!(
                 "[selftest] timing cleanup_warm_ms={} provider={}",
                 warm_started.elapsed().as_millis(),
@@ -296,17 +324,22 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                     let started = Instant::now();
                     let repeated = cleanup::cleanup(
                         &http,
+                        &api_base,
+                        &token,
                         &cleanup_config,
-                        cleanup::CleanupPrompt {
-                            mode: cleanup_mode,
+                        cleanup::CleanupInput {
                             template: cleanup_prompt,
+                            transcript: &raw,
+                            dictionary: &dictionary,
+                            known_names: &config.known_names,
+                            app_name: &app_name,
                         },
-                        &raw,
-                        &dictionary,
-                        &config.known_names,
-                        &app_name,
                     )
                     .await;
+                    if let Some(error) = repeated.fatal {
+                        eprintln!("[selftest] cleanup failed: {error}");
+                        return 1;
+                    }
                     println!(
                         "[selftest] timing cleanup_repeat_{index}_ms={} provider={}",
                         started.elapsed().as_millis(),

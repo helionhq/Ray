@@ -59,7 +59,3 @@ export function wordCount(text: string): number {
   const words = text.trim().split(/\s+/).filter(Boolean);
   return words.length;
 }
-
-export function hotkeyLabel(): string {
-  return "Right Alt";
-}

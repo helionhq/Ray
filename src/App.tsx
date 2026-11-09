@@ -1,8 +1,16 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { api, onEvent, type Snapshot } from "./lib/bridge";
 import { applyTheme } from "./lib/theme";
+import { AccountPage } from "./pages/Account";
 import { DictionaryPage } from "./pages/Dictionary";
 import { HistoryPage } from "./pages/History";
+import { SignInScreen } from "./pages/SignIn";
 import { SettingsPage } from "./pages/Settings";
 import { Toast, type Notice } from "./components/Toast";
 import { UpdateCard } from "./components/UpdateCard";
@@ -10,17 +18,19 @@ import { useUpdater } from "./lib/updater";
 import { RayLogo } from "./components/RayLogo";
 import { TitleBar, startDrag, toggleOnDoubleClick } from "./components/TitleBar";
 import {
+  AccountIcon,
   AlertIcon,
   DictionaryIcon,
   HistoryIcon,
   SettingsIcon,
 } from "./components/Icons";
 
-type Page = "history" | "dictionary" | "settings";
+type Page = "history" | "dictionary" | "account" | "settings";
 
 const pages: { id: Page; label: string; icon: typeof HistoryIcon }[] = [
   { id: "history", label: "History", icon: HistoryIcon },
   { id: "dictionary", label: "Dictionary", icon: DictionaryIcon },
+  { id: "account", label: "Account", icon: AccountIcon },
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
@@ -29,7 +39,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [page, setPage] = useState<Page>("history");
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [activatingPro, setActivatingPro] = useState(false);
   const updater = useUpdater();
+  const refreshedAccount = useRef(false);
 
   const notify = useCallback((text: string) => {
     setNotice({ id: Date.now(), text });
@@ -60,18 +72,75 @@ export default function App() {
       onEvent("state-changed", () => void refresh()),
       onEvent<string>("notice", (message) => notify(message)),
       onEvent<string>("navigate", (target) => {
-        if (target === "settings" || target === "history" || target === "dictionary") {
+        if (
+          target === "settings" ||
+          target === "history" ||
+          target === "dictionary" ||
+          target === "account"
+        ) {
           setPage(target);
         }
       }),
+      // Sign-in, sign-out, billing, and pipeline quota refreshes all land here.
+      onEvent("account-changed", () => void refresh()),
+      // Decision 16: billing completion polls in the background; show the
+      // state until the plan flips to Pro (or the poll gives up).
+      onEvent<boolean>("billing-activating", (active) => setActivatingPro(active)),
     ];
-    const onFocus = () => void refresh();
+    // Refresh the account on window focus, as the contract expects, so a
+    // browsing round-trip (or a checkout in another window) is reflected as
+    // soon as the user comes back.
+    const onFocus = () => {
+      void (async () => {
+        try {
+          await api.refreshAccount();
+        } catch {
+          // Signed out, offline, or a transient server error: the cached
+          // snapshot stays on screen until the next refresh succeeds.
+        }
+        await refresh();
+      })();
+    };
     window.addEventListener("focus", onFocus);
     return () => {
       window.removeEventListener("focus", onFocus);
       for (const unlisten of unlisteners) void unlisten.then((fn) => fn());
     };
   }, [refresh, notify]);
+
+  // The snapshot carries the cached account; fetch it once on a signed-in
+  // start so the Account page and quota gate have data immediately.
+  useEffect(() => {
+    if (!snapshot?.auth.signed_in || snapshot.auth.account || refreshedAccount.current) {
+      return;
+    }
+    refreshedAccount.current = true;
+    void api.refreshAccount().catch(() => {});
+  }, [snapshot?.auth.signed_in, snapshot?.auth.account]);
+
+  // Decision 15: refresh /api/me at the weekly reset boundary while the app
+  // runs, so cached usage from last week never blocks the first dictation of
+  // the new week. Re-armed whenever the reported reset time changes.
+  useEffect(() => {
+    const resetsAt = snapshot?.auth.account?.usage.resets_at;
+    if (!resetsAt) return;
+    const reset = new Date(resetsAt).getTime();
+    if (!Number.isFinite(reset)) return;
+    // A week is well inside setTimeout's 32-bit range; the extra second makes
+    // sure the server has crossed the boundary too.
+    const delay = Math.min(Math.max(0, reset - Date.now()) + 1_000, 7 * 24 * 60 * 60 * 1_000);
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          await api.refreshAccount();
+        } catch {
+          // Offline: the server remains authoritative at the next attempt.
+        }
+        await refresh();
+      })();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [snapshot?.auth.account?.usage.resets_at, refresh]);
 
   // Apply the store's theme before the snapshot paints, so a chosen theme
   // never flickers on a state refresh.
@@ -103,7 +172,10 @@ export default function App() {
     );
   }
 
-  if (!snapshot) {
+  // `auth.loaded` is false until the stored session has been read off the
+  // startup thread. Staying on the loading screen prevents a signed-in user
+  // from seeing the sign-in screen flash.
+  if (!snapshot || !snapshot.auth.loaded) {
     return (
       <div className="boot-screen">
         <TitleBar />
@@ -119,9 +191,11 @@ export default function App() {
     );
   }
 
-  const missingKey = !snapshot.keys.assemblyai;
+  if (!snapshot.auth.signed_in) {
+    return <SignInScreen />;
+  }
+
   const hotkeyIssue = Boolean(snapshot.hotkey_error);
-  const showBanner = missingKey || hotkeyIssue;
 
   return (
     <div className="app">
@@ -159,13 +233,11 @@ export default function App() {
       </aside>
 
       <main className="content">
-        {showBanner && (
+        {hotkeyIssue && (
           <div className="banner" role="status">
             <AlertIcon size={14} className="banner-icon" />
             <span className="banner-text">
-              {missingKey && "Add an AssemblyAI key to start dictating."}
-              {missingKey && hotkeyIssue && <span className="banner-sep" />}
-              {hotkeyIssue && "The Right Alt shortcut is unavailable."}
+              Your dictation shortcut is unavailable.
             </span>
             <button
               type="button"
@@ -183,6 +255,14 @@ export default function App() {
           )}
           {page === "dictionary" && (
             <DictionaryPage snapshot={snapshot} refresh={refresh} notify={notify} />
+          )}
+          {page === "account" && (
+            <AccountPage
+              snapshot={snapshot}
+              refresh={refresh}
+              notify={notify}
+              activatingPro={activatingPro}
+            />
           )}
           {page === "settings" && (
             <SettingsPage
