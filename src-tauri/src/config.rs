@@ -1,10 +1,10 @@
 //! Pipeline configuration and the cleanup prompts.
 //!
 //! Both are embedded in the binary but can be overridden at runtime by files in
-//! the app-data directory (`pipeline.json`, `cleanup.md`, `structured.md`). This
-//! is the one place where models, endpoints, and STT options live. The defaults
-//! are the result of `research/final/`: AssemblyAI Sync live STT + a Gemma
-//! cleanup pass on the AssemblyAI LLM Gateway.
+//! the app-data directory (`pipeline.json`, `cleanup.md`). This is the one
+//! place where models, endpoints, and STT options live. The defaults are
+//! AssemblyAI Sync live STT + a Gemma cleanup pass on the AssemblyAI LLM
+//! Gateway.
 
 use std::path::Path;
 
@@ -12,70 +12,42 @@ use serde::{Deserialize, Serialize};
 
 pub const EMBEDDED_PIPELINE: &str = include_str!("../config/pipeline.json");
 pub const EMBEDDED_PROMPT: &str = include_str!("../prompts/cleanup.md");
-pub const EMBEDDED_STRUCTURED_PROMPT: &str = include_str!("../prompts/structured.md");
-
-/// The cleanup pass the user selected. `Clean` is a strict editor; `Structured`
-/// may reorder and rephrase so the result reads as finished prose or a list.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CleanupMode {
-    #[default]
-    Clean,
-    Structured,
-}
-
-impl CleanupMode {
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Clean => "clean",
-            Self::Structured => "structured",
-        }
-    }
-
-    /// Unknown or malformed values fall back to `None`; callers use the
-    /// default mode so an old or hand-edited settings file never breaks.
-    pub fn from_id(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "clean" => Some(Self::Clean),
-            "structured" => Some(Self::Structured),
-            _ => None,
-        }
-    }
-}
-
 pub fn default_known_names() -> Vec<String> {
     [
-        "Arham",
-        "Helion",
-        "Ray",
-        "Claude",
         "ChatGPT",
-        "GPT-5",
-        "Gemma",
-        "gpt-oss",
-        "Grok",
-        "Groq",
-        "Gemini",
-        "Anthropic",
+        "Claude",
+        "Claude Code",
         "OpenAI",
-        "Vercel",
-        "Tauri",
-        "Supabase",
-        "Linear",
-        "Notion",
-        "Kubernetes",
-        "PostgreSQL",
-        "Next.js",
-        "shadcn",
-        "Tailwind",
-        "TypeScript",
+        "Anthropic",
+        "Gemini",
+        "Gemma",
+        "Qwen",
+        "Kimi",
+        "DeepSeek",
+        "Llama",
+        "Mistral",
+        "Codex",
+        "Ollama",
+        "Hugging Face",
+        "OpenRouter",
         "GitHub",
+        "Vercel",
+        "Supabase",
+        "Cloudflare",
+        "PostgreSQL",
+        "TypeScript",
+        "JavaScript",
+        "Next.js",
+        "Tailwind",
+        "Notion",
         "Slack",
-        "Deepgram",
-        "AssemblyAI",
-        "Typeless",
-        "Rust",
-        "pnpm",
+        "Linear",
+        "Figma",
+        "WhatsApp",
+        "LinkedIn",
+        "YouTube",
+        "iPhone",
+        "macOS",
     ]
     .into_iter()
     .map(str::to_string)
@@ -83,13 +55,9 @@ pub fn default_known_names() -> Vec<String> {
 }
 
 pub fn default_stt_prompt() -> String {
-    "A work dictation from a software founder, PM or engineer: messages, emails, meeting \
-     notes, technical instructions and casual replies. Vocabulary includes AI and developer \
-     tools (Claude, ChatGPT, Gemma, gpt-oss, Grok, Groq, Anthropic, OpenAI, Vercel, \
-     Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company \
-     Helion, teammates' names, \
-     and the product Ray. Speech may contain filler words, false starts and self-corrections; \
-     transcribe faithfully."
+    "Dictation of messages, emails, notes, documents and instructions for AI assistants, \
+     often with names, products and technical terms. Speech may contain filler words, \
+     false starts and self-corrections; transcribe faithfully."
         .into()
 }
 
@@ -210,69 +178,39 @@ pub struct CleanupConfig {
     pub enabled: bool,
     pub temperature: f32,
     pub max_tokens: u32,
-    /// Hard limit for one provider request (including reading the body).
+    /// Hard limit for one provider request (including reading the body), for
+    /// an empty transcript. `timeout_ms_per_word` is added per spoken word.
     #[serde(default = "default_cleanup_timeout_ms")]
     pub timeout_ms: u64,
-    /// Fire the fallback in parallel when the primary has not answered by then.
-    /// Chosen from the measured p95 primary latency; a warm call is usually 5x
-    /// faster, so this only touches the tail.
+    #[serde(default = "default_timeout_ms_per_word")]
+    pub timeout_ms_per_word: u64,
+    /// Fire the fallback in parallel when the primary has not answered by then
+    /// (plus `hedge_after_ms_per_word` per spoken word). The gateway stalls on
+    /// roughly 1% of requests regardless of length, so the hedge sits just
+    /// above the normal latency for that length and only touches the tail.
     #[serde(default = "default_hedge_after_ms")]
     pub hedge_after_ms: u64,
+    #[serde(default = "default_hedge_after_ms_per_word")]
+    pub hedge_after_ms_per_word: u64,
     pub retries: u32,
     pub backoff_ms: Vec<u64>,
     pub providers: Vec<CleanupProvider>,
-    /// Per-mode overrides. Unset fields inherit the base cleanup config above.
-    #[serde(default)]
-    pub modes: CleanupModes,
-}
-
-/// Optional overrides for the Structured cleanup mode. The manager/research
-/// agent can tune Structured without touching Clean's settings.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CleanupModes {
-    pub structured: CleanupModeOverride,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CleanupModeOverride {
-    /// Model id passed through verbatim to the first provider (the primary).
-    pub model: Option<String>,
-    pub temperature: Option<f32>,
-    pub max_tokens: Option<u32>,
-    pub timeout_ms: Option<u64>,
-    pub hedge_after_ms: Option<u64>,
 }
 
 impl CleanupConfig {
-    /// The effective config for `mode`. Clean returns an exact clone, so its
-    /// request body, limits and timing are byte-for-byte unchanged.
-    pub fn for_mode(&self, mode: CleanupMode) -> Self {
+    /// The config with timeout and hedge scaled to the transcript length: a
+    /// 600-word dictation legitimately takes several times longer to rewrite
+    /// than a one-liner, and a fixed limit either cuts long ones off or waits
+    /// far too long on a stalled short one.
+    pub fn scaled_for(&self, transcript: &str) -> Self {
+        let words = transcript.split_whitespace().count() as u64;
         let mut config = self.clone();
-        if mode != CleanupMode::Structured {
-            return config;
-        }
-        let overrides = &self.modes.structured;
-        if let Some(model) = &overrides.model {
-            if let Some(primary) = config.providers.first_mut() {
-                // Pass the id through as-is: the AssemblyAI LLM Gateway accepts
-                // non-Gemma ids (Claude/GPT/Gemini) on the same endpoint.
-                primary.model = model.clone();
-            }
-        }
-        if let Some(temperature) = overrides.temperature {
-            config.temperature = temperature;
-        }
-        if let Some(max_tokens) = overrides.max_tokens {
-            config.max_tokens = max_tokens;
-        }
-        if let Some(timeout_ms) = overrides.timeout_ms {
-            config.timeout_ms = timeout_ms;
-        }
-        if let Some(hedge_after_ms) = overrides.hedge_after_ms {
-            config.hedge_after_ms = hedge_after_ms;
-        }
+        config.timeout_ms = self
+            .timeout_ms
+            .saturating_add(words.saturating_mul(self.timeout_ms_per_word));
+        config.hedge_after_ms = self
+            .hedge_after_ms
+            .saturating_add(words.saturating_mul(self.hedge_after_ms_per_word));
         config
     }
 }
@@ -281,8 +219,16 @@ pub fn default_cleanup_timeout_ms() -> u64 {
     6_000
 }
 
+pub fn default_timeout_ms_per_word() -> u64 {
+    0
+}
+
 pub fn default_hedge_after_ms() -> u64 {
     2_500
+}
+
+pub fn default_hedge_after_ms_per_word() -> u64 {
+    0
 }
 
 impl Default for CleanupConfig {
@@ -292,7 +238,9 @@ impl Default for CleanupConfig {
             temperature: 0.0,
             max_tokens: 3_000,
             timeout_ms: default_cleanup_timeout_ms(),
+            timeout_ms_per_word: default_timeout_ms_per_word(),
             hedge_after_ms: default_hedge_after_ms(),
+            hedge_after_ms_per_word: default_hedge_after_ms_per_word(),
             retries: 2,
             backoff_ms: vec![300, 900],
             providers: vec![CleanupProvider {
@@ -302,7 +250,6 @@ impl Default for CleanupConfig {
                 api_key_secret: "assemblyai".into(),
                 extra_body: None,
             }],
-            modes: CleanupModes::default(),
         }
     }
 }
@@ -317,36 +264,12 @@ pub struct CleanupProvider {
     pub extra_body: Option<serde_json::Value>,
 }
 
-/// The prompt template that belongs to `mode`. Clean keeps using `cleanup.md`;
-/// Structured uses `structured.md`.
-pub fn prompt_for<'a>(clean: &'a str, structured: &'a str, mode: CleanupMode) -> &'a str {
-    match mode {
-        CleanupMode::Clean => clean,
-        CleanupMode::Structured => structured,
-    }
-}
-
 /// Files a user (or the research agent) can drop into the app-data directory to
 /// override the embedded pipeline without a rebuild.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub pipeline: PipelineConfig,
     pub prompt: String,
-    pub structured_prompt: String,
-}
-
-/// Whether a raw `pipeline.json` document explicitly contains `cleanup.modes`.
-/// This distinguishes an older override that predates the key (which must get
-/// the embedded Structured defaults) from an explicit, possibly partial object
-/// (which must keep inheriting the override's base cleanup values).
-fn has_cleanup_modes(text: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
-    };
-    value
-        .get("cleanup")
-        .and_then(|cleanup| cleanup.get("modes"))
-        .is_some()
 }
 
 /// Whether `provider` belongs to a backend Ray has retired. Startup deletes
@@ -390,32 +313,16 @@ fn remove_retired_providers(pipeline: &mut PipelineConfig) {
 impl RuntimeConfig {
     pub fn load(app_data: &Path) -> Self {
         let pipeline_override = app_data.join("pipeline.json");
-        let prompt_override = app_data.join("cleanup.md");
-        let structured_override = app_data.join("structured.md");
 
+        // Overrides written while Ray had two cleanup modes may still contain
+        // `cleanup.modes`; serde ignores the unknown key, so they still load.
         let pipeline = match std::fs::read_to_string(&pipeline_override) {
             Ok(text) => match serde_json::from_str::<PipelineConfig>(&text) {
                 Ok(mut config) => {
-                    // Overrides written before Structured existed have no
-                    // `cleanup.modes`, so without this they would lose the
-                    // embedded 8000 ms timeout / 4000 ms hedge defaults. Keep
-                    // `model: None` so Structured inherits the user's own base
-                    // primary model instead of the embedded one.
-                    if !has_cleanup_modes(&text) {
-                        let defaults = PipelineConfig::default().cleanup.modes;
-                        config.cleanup.modes = CleanupModes {
-                            structured: CleanupModeOverride {
-                                model: None,
-                                ..defaults.structured
-                            },
-                        };
-                    }
                     // Any override may still list a provider whose credentials
                     // startup deletes; drop it so cleanup keeps working and
                     // falls back to the embedded default only when nothing
-                    // supported is left. This runs even when `cleanup.modes`
-                    // is explicit, because those overrides still need a usable
-                    // provider.
+                    // supported is left.
                     remove_retired_providers(&mut config);
                     config
                 }
@@ -427,20 +334,15 @@ impl RuntimeConfig {
             Err(_) => PipelineConfig::default(),
         };
 
-        let prompt = match std::fs::read_to_string(&prompt_override) {
-            Ok(text) if !text.trim().is_empty() => text,
-            _ => EMBEDDED_PROMPT.to_string(),
-        };
-
-        let structured_prompt = match std::fs::read_to_string(&structured_override) {
-            Ok(text) if !text.trim().is_empty() => text,
-            _ => EMBEDDED_STRUCTURED_PROMPT.to_string(),
-        };
+        let read_prompt =
+            |name: &str, embedded: &str| match std::fs::read_to_string(app_data.join(name)) {
+                Ok(text) if !text.trim().is_empty() => text,
+                _ => embedded.to_string(),
+            };
 
         Self {
             pipeline,
-            prompt,
-            structured_prompt,
+            prompt: read_prompt("cleanup.md", EMBEDDED_PROMPT),
         }
     }
 }
@@ -451,10 +353,8 @@ mod tests {
 
     /// A per-test directory so parallel tests never share override files.
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ray-config-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ray-config-test-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -465,143 +365,35 @@ mod tests {
         assert_eq!(config.stt.mode, "sync_live");
         assert_eq!(config.stt.sync_live.model, "universal-3-5-pro");
         assert_eq!(config.cleanup.providers[0].model, "gemma-4-31b");
-        assert_eq!(config.cleanup.providers.len(), 1);
-        assert!(config.cleanup.providers.iter().all(|p| p.id != "vercel"));
-        assert!(config.known_names.iter().any(|name| name == "Helion"));
-        assert!(config.known_names.iter().any(|name| name == "GPT-5"));
+        assert!(config.cleanup.providers.iter().all(|p| p.id != "groq"));
         assert_eq!(config.cleanup.max_tokens, 3_000);
-        assert_eq!(config.cleanup.timeout_ms, 6_000);
-        assert_eq!(config.cleanup.hedge_after_ms, 2_500);
-        // Structured's researched overrides are in the embedded config, while
-        // Clean's effective config stays exactly the base values.
-        let structured = config.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.providers[0].model, "gemma-4-31b");
-        assert_eq!(structured.temperature, 0.0);
-        assert_eq!(structured.max_tokens, 3_000);
-        assert_eq!(structured.timeout_ms, 8_000);
-        assert_eq!(structured.hedge_after_ms, 4_000);
-        let clean = config.cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
-        assert!(config.known_names.iter().any(|name| name == "gpt-oss"));
         assert!(!EMBEDDED_PROMPT.trim().is_empty());
-        assert!(!EMBEDDED_STRUCTURED_PROMPT.trim().is_empty());
+        // The built-in lists are general: nothing personal to one user.
+        for personal in ["Arham", "Helion", "Ray"] {
+            assert!(!config.known_names.iter().any(|name| name == personal));
+            assert!(!config.stt.prompt.contains(personal));
+        }
     }
 
     #[test]
-    fn cleanup_mode_defaults_to_clean_and_parses_known_ids() {
-        assert_eq!(CleanupMode::default(), CleanupMode::Clean);
-        assert_eq!(CleanupMode::from_id(" Clean "), Some(CleanupMode::Clean));
-        assert_eq!(
-            CleanupMode::from_id("STRUCTURED"),
-            Some(CleanupMode::Structured)
-        );
-        assert_eq!(CleanupMode::from_id("rewrite"), None);
-        assert_eq!(CleanupMode::Clean.id(), "clean");
-        assert_eq!(CleanupMode::Structured.id(), "structured");
-    }
-
-    #[test]
-    fn structured_overrides_inherit_unset_fields() {
+    fn timeout_and_hedge_scale_with_transcript_length() {
         let cleanup: CleanupConfig = serde_json::from_str(
-            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"timeout_ms":6000,
-                "hedge_after_ms":2500,"retries":2,"backoff_ms":[300,900],
-                "providers":[{"id":"assemblyai",
-                    "base_url":"https://llm-gateway.assemblyai.com/v1",
-                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
-                "modes":{"structured":{"max_tokens":4200}}}"#,
+            r#"{"timeout_ms":6000,"timeout_ms_per_word":20,
+                "hedge_after_ms":3000,"hedge_after_ms_per_word":10}"#,
         )
         .unwrap();
-
-        // Clean is an exact clone: no override may leak into it.
-        let clean = cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.temperature, 0.0);
-        assert_eq!(clean.max_tokens, 3_000);
-        assert_eq!(clean.providers[0].model, "gemma-4-31b");
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
-
-        // Only the field the override names changes; everything else inherits.
-        let structured = cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.temperature, 0.0);
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.providers[0].model, "gemma-4-31b");
-        assert_eq!(structured.timeout_ms, 6_000);
-        assert_eq!(structured.hedge_after_ms, 2_500);
+        let short = cleanup.scaled_for("send it");
+        assert_eq!(short.timeout_ms, 6_040);
+        assert_eq!(short.hedge_after_ms, 3_020);
+        let long = cleanup.scaled_for(&"word ".repeat(500));
+        assert_eq!(long.timeout_ms, 16_000);
+        assert_eq!(long.hedge_after_ms, 8_000);
+        // The unscaled config is untouched.
+        assert_eq!(cleanup.timeout_ms, 6_000);
     }
 
     #[test]
-    fn structured_model_override_is_passed_through_verbatim() {
-        let cleanup: CleanupConfig = serde_json::from_str(
-            r#"{"enabled":true,"temperature":0,"max_tokens":3000,"retries":2,
-                "backoff_ms":[300,900],
-                "providers":[{"id":"assemblyai",
-                    "base_url":"https://llm-gateway.assemblyai.com/v1",
-                    "model":"gemma-4-31b","api_key_secret":"assemblyai"}],
-                "modes":{"structured":{"model":"claude-sonnet-4-5",
-                    "temperature":0.2,"timeout_ms":9000,"hedge_after_ms":3000}}}"#,
-        )
-        .unwrap();
-        let structured = cleanup.for_mode(CleanupMode::Structured);
-        // Non-Gemma gateway ids are not rewritten or rejected.
-        assert_eq!(structured.providers[0].model, "claude-sonnet-4-5");
-        assert_eq!(structured.temperature, 0.2);
-        assert_eq!(structured.timeout_ms, 9_000);
-        assert_eq!(structured.hedge_after_ms, 3_000);
-        assert_eq!(structured.max_tokens, 3_000);
-    }
-
-    #[test]
-    fn clean_selects_the_clean_prompt_and_structured_the_other() {
-        // Clean's prompt source must be exactly the old one.
-        assert_eq!(
-            prompt_for("clean prompt", "structured prompt", CleanupMode::Clean),
-            "clean prompt"
-        );
-        assert_eq!(
-            prompt_for(
-                EMBEDDED_PROMPT,
-                EMBEDDED_STRUCTURED_PROMPT,
-                CleanupMode::Clean
-            ),
-            EMBEDDED_PROMPT
-        );
-        assert_eq!(
-            prompt_for(
-                EMBEDDED_PROMPT,
-                EMBEDDED_STRUCTURED_PROMPT,
-                CleanupMode::Structured
-            ),
-            EMBEDDED_STRUCTURED_PROMPT
-        );
-    }
-
-    #[test]
-    fn runtime_overrides_load_each_prompt_independently() {
-        let dir = std::env::temp_dir().join(format!("ray-config-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cleanup.md"), "# Clean\n\nCLEAN PROMPT").unwrap();
-        std::fs::write(
-            dir.join("structured.md"),
-            "# Structured\n\nSTRUCTURED PROMPT",
-        )
-        .unwrap();
-        let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(runtime.prompt, "# Clean\n\nCLEAN PROMPT");
-        assert_eq!(
-            runtime.structured_prompt,
-            "# Structured\n\nSTRUCTURED PROMPT"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-
-        // With no overrides both fall back to the embedded prompts.
-        let runtime = RuntimeConfig::load(&dir);
-        assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
-        assert_eq!(runtime.structured_prompt, EMBEDDED_STRUCTURED_PROMPT);
-    }
-
-    #[test]
-    fn older_cleanup_overrides_get_the_hedge_defaults() {
+    fn older_cleanup_overrides_get_the_timing_defaults() {
         // A user's app-data pipeline.json written before hedging existed must
         // still load, with sensible timeout defaults rather than zero.
         let cleanup: CleanupConfig = serde_json::from_str(
@@ -611,75 +403,42 @@ mod tests {
         .unwrap();
         assert_eq!(cleanup.timeout_ms, 6_000);
         assert_eq!(cleanup.hedge_after_ms, 2_500);
-        // A document written before modes existed still loads.
-        assert_eq!(cleanup.modes.structured.model, None);
+        assert_eq!(cleanup.scaled_for("a b c").timeout_ms, 6_000);
     }
 
     #[test]
-    fn override_without_modes_gets_embedded_structured_defaults() {
-        let dir = std::env::temp_dir().join(format!(
-            "ray-config-test-legacy-modes-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // A pipeline.json written before Structured existed has no modes key.
-        // It uses a custom primary model, which Structured must inherit.
+    fn overrides_from_the_two_mode_era_still_load() {
+        let dir = temp_dir("legacy-modes");
         std::fs::write(
             dir.join("pipeline.json"),
             r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
                 "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
                 "providers":[{"id":"assemblyai",
                     "base_url":"https://llm-gateway.assemblyai.com/v1",
-                    "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}]}}"#,
+                    "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}],
+                "modes":{"structured":{"max_tokens":4200}}}}"#,
         )
         .unwrap();
-
+        std::fs::write(dir.join("structured.md"), "IGNORED").unwrap();
         let runtime = RuntimeConfig::load(&dir);
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.providers[0].model, "claude-sonnet-4-5");
-        assert_eq!(structured.temperature, 0.0);
-        assert_eq!(structured.max_tokens, 3_000);
-        assert_eq!(structured.timeout_ms, 8_000);
-        assert_eq!(structured.hedge_after_ms, 4_000);
-
-        // Clean still inherits the override's own base values, untouched.
-        let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.providers[0].model, "claude-sonnet-4-5");
-        assert_eq!(clean.max_tokens, 1_500);
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
+        assert_eq!(
+            runtime.pipeline.cleanup.providers[0].model,
+            "claude-sonnet-4-5"
+        );
+        assert_eq!(runtime.pipeline.cleanup.max_tokens, 1_500);
+        assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn explicit_partial_modes_keep_base_cleanup_inheritance() {
-        let dir = std::env::temp_dir().join(format!(
-            "ray-config-test-partial-modes-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("pipeline.json"),
-            r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
-                "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
-                "providers":[],
-                "modes":{"structured":{"max_tokens":4200}}}}"#,
-        )
-        .unwrap();
-
+    fn runtime_prompt_override_is_used() {
+        let dir = temp_dir("prompt-override");
+        std::fs::write(dir.join("cleanup.md"), "# Cleanup\n\nCUSTOM PROMPT").unwrap();
         let runtime = RuntimeConfig::load(&dir);
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        // The explicit field wins; the rest inherit the base cleanup config,
-        // not the embedded Structured defaults.
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.timeout_ms, 6_000);
-        assert_eq!(structured.hedge_after_ms, 2_500);
-
-        let clean = runtime.pipeline.cleanup.for_mode(CleanupMode::Clean);
-        assert_eq!(clean.max_tokens, 1_500);
-        assert_eq!(clean.timeout_ms, 6_000);
-        assert_eq!(clean.hedge_after_ms, 2_500);
+        assert_eq!(runtime.prompt, "# Cleanup\n\nCUSTOM PROMPT");
         std::fs::remove_dir_all(&dir).ok();
+        let runtime = RuntimeConfig::load(&dir);
+        assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
     }
 
     #[test]
@@ -707,7 +466,6 @@ mod tests {
             serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
             serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
         );
-        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
         assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
         assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
         std::fs::remove_dir_all(&dir).ok();
@@ -778,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cleanup_modes_skip_migration_but_still_filter_retired_providers() {
+    fn legacy_modes_key_does_not_exempt_retired_provider_filtering() {
         let dir = temp_dir("explicit-modes");
         std::fs::write(
             dir.join("pipeline.json"),
@@ -797,15 +555,9 @@ mod tests {
             runtime.pipeline.cleanup.providers[0].model,
             "claude-sonnet-4-5"
         );
-        // Explicit modes are never replaced with the embedded Structured
-        // defaults: the declared field wins and the rest inherit the base
-        // cleanup values (6000 ms / 2500 ms), not 8000 ms / 4000 ms.
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.timeout_ms, 6_000);
-        assert_eq!(structured.hedge_after_ms, 2_500);
+        assert_eq!(runtime.pipeline.cleanup.max_tokens, 1_500);
 
-        // Explicit modes do not exempt an override from retired-provider
+        // A leftover modes key does not exempt an override from retired-provider
         // filtering: the supported provider survives and is retried first.
         std::fs::write(
             dir.join("pipeline.json"),
@@ -833,11 +585,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["assemblyai"]
         );
-        let structured = runtime.pipeline.cleanup.for_mode(CleanupMode::Structured);
-        assert_eq!(structured.max_tokens, 4_200);
-        assert_eq!(structured.timeout_ms, 6_000);
 
-        // When explicit modes leave no supported provider, filtering falls back
+        // When an override leaves no supported provider, filtering falls back
         // to the embedded default so cleanup still has somewhere to run.
         std::fs::write(
             dir.join("pipeline.json"),
@@ -855,21 +604,10 @@ mod tests {
             serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
             serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
         );
-        assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
         assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
-        // The provider fallback does not migrate the explicit modes.
-        assert_eq!(
-            runtime
-                .pipeline
-                .cleanup
-                .for_mode(CleanupMode::Structured)
-                .timeout_ms,
-            6_000
-        );
 
         // The embedded default never contains a retired provider.
         let defaults = PipelineConfig::default();
-        assert_eq!(defaults.cleanup.providers.len(), 1);
         assert_eq!(defaults.cleanup.providers[0].id, "assemblyai");
         assert!(defaults
             .cleanup

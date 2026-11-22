@@ -1,44 +1,49 @@
 {
   "known_names": [
-    "Arham",
-    "Helion",
-    "Ray",
-    "Claude",
     "ChatGPT",
-    "GPT-5",
-    "Gemma",
-    "gpt-oss",
-    "Grok",
-    "Groq",
-    "Gemini",
-    "Anthropic",
+    "Claude",
+    "Claude Code",
     "OpenAI",
-    "Vercel",
-    "Tauri",
-    "Supabase",
-    "Linear",
-    "Notion",
-    "Kubernetes",
-    "PostgreSQL",
-    "Next.js",
-    "shadcn",
-    "Tailwind",
-    "TypeScript",
+    "Anthropic",
+    "Gemini",
+    "Gemma",
+    "Qwen",
+    "Kimi",
+    "DeepSeek",
+    "Llama",
+    "Mistral",
+    "Codex",
+    "Ollama",
+    "Hugging Face",
+    "OpenRouter",
     "GitHub",
+    "Vercel",
+    "Supabase",
+    "Cloudflare",
+    "PostgreSQL",
+    "TypeScript",
+    "JavaScript",
+    "Next.js",
+    "Tailwind",
+    "Notion",
     "Slack",
-    "Deepgram",
-    "AssemblyAI",
-    "Typeless",
-    "Rust",
-    "pnpm"
+    "Linear",
+    "Figma",
+    "WhatsApp",
+    "LinkedIn",
+    "YouTube",
+    "iPhone",
+    "macOS"
   ],
   "stt": {
     "provider": "assemblyai",
     "streaming": true,
     "mode": "sync_live",
     "speech_model": "universal-3-6-pro",
-    "prompt": "A work dictation from a software founder, PM or engineer: messages, emails, meeting notes, technical instructions and casual replies. Vocabulary includes AI and developer tools (Claude, ChatGPT, Gemma, gpt-oss, Grok, Groq, Anthropic, OpenAI, Vercel, Tauri, Supabase, Linear, Notion, Kubernetes, PostgreSQL, Next.js, shadcn), the company Helion, teammates' names, and the product Ray. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
-    "language_codes": ["en"],
+    "prompt": "Dictation of messages, emails, notes, documents and instructions for AI assistants, often with names, products and technical terms. Speech may contain filler words, false starts and self-corrections; transcribe faithfully.",
+    "language_codes": [
+      "en"
+    ],
     "sample_rate": 16000,
     "encoding": "pcm_s16le",
     "format_turns": true,
@@ -70,8 +75,10 @@
     "enabled": true,
     "temperature": 0.0,
     "max_tokens": 3000,
-    "timeout_ms": 6000,
-    "hedge_after_ms": 2500,
+    "timeout_ms": 10000,
+    "timeout_ms_per_word": 20,
+    "hedge_after_ms": 3000,
+    "hedge_after_ms_per_word": 8,
     "retries": 2,
     "backoff_ms": [
       300,
@@ -83,16 +90,13 @@
         "base_url": "https://llm-gateway.assemblyai.com/v1",
         "model": "gemma-4-31b",
         "api_key_secret": "assemblyai"
-      }
-    ],
-    "modes": {
-      "structured": {
+      },
+      {
+        "id": "assemblyai-hedge",
+        "base_url": "https://llm-gateway.assemblyai.com/v1",
         "model": "gemma-4-31b",
-        "temperature": 0.0,
-        "max_tokens": 3000,
-        "timeout_ms": 8000,
-        "hedge_after_ms": 4000
+        "api_key_secret": "assemblyai"
       }
-    }
+    ]
   }
 }

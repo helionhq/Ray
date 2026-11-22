@@ -7,7 +7,6 @@ import {
   type ReactNode,
 } from "react";
 import type {
-  CleanupMode,
   Provider,
   Settings,
   Snapshot,
@@ -49,11 +48,6 @@ const unflagged: ProviderFlags = {
   vercel: false,
 };
 const untested: Record<Provider, KeyTest> = { assemblyai: null, vercel: null };
-
-const cleanupModeHelp: Record<CleanupMode, string> = {
-  clean: "Fixes fillers and grammar, keeping your wording.",
-  structured: "Rewrites for flow, with paragraphs and lists.",
-};
 
 export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   const [drafts, setDrafts] = useState<Drafts>(emptyDrafts);
@@ -633,28 +627,6 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
             }
           />
         </div>
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">Mode</div>
-            <div className="help">
-              Clean fixes fillers and grammar. Structured rewrites for flow.
-            </div>
-          </div>
-          <div className="segmented" role="group" aria-label="Cleanup mode">
-            {(["clean", "structured"] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                aria-pressed={snapshot.settings.cleanup_mode === mode}
-                disabled={busy !== null || !snapshot.settings.cleanup_enabled}
-                title={cleanupModeHelp[mode]}
-                onClick={() => void update({ cleanup_mode: mode }, "mode")}
-              >
-                {mode === "clean" ? "Clean" : "Structured"}
-              </button>
-            ))}
-          </div>
-        </div>
       </div>
 
       <div className="group-label">General</div>
@@ -813,7 +785,7 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
           <button
             type="button"
             className="btn btn-ghost"
-            title="Reload pipeline.json, cleanup.md and structured.md overrides"
+            title="Reload pipeline.json and cleanup.md overrides"
             onClick={async () => {
               try {
                 await api.reloadConfig();

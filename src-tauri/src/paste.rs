@@ -35,7 +35,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_V,
 };
 
-use crate::config::CleanupMode;
 use crate::windows_util;
 
 const CF_UNICODETEXT: u32 = 13;
@@ -400,21 +399,12 @@ pub fn copy_text_with(text: &str, line_endings: LineEndings) -> Result<(), Strin
 }
 
 /// How line breaks are written to CF_UNICODETEXT. Windows text controls expect
-/// CRLF; `Preserve` keeps the bytes exactly as they were (Clean's existing
-/// behaviour) while `CrLf` normalises Structured's paragraphs and lists.
+/// CRLF, so dictations (which may contain paragraphs and lists) use `CrLf`;
+/// `Preserve` keeps the bytes exactly as they were.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEndings {
     Preserve,
     CrLf,
-}
-
-/// Structured output is pasted as CRLF, matching the direct-paste path. Clean,
-/// legacy (no mode) and unknown entries keep their bytes exactly.
-pub fn line_endings_for_mode(mode: Option<CleanupMode>) -> LineEndings {
-    match mode {
-        Some(CleanupMode::Structured) => LineEndings::CrLf,
-        None | Some(CleanupMode::Clean) => LineEndings::Preserve,
-    }
 }
 
 fn prepare_clipboard_text(text: &str, line_endings: LineEndings) -> std::borrow::Cow<'_, str> {
@@ -703,38 +693,12 @@ mod tests {
     }
 
     #[test]
-    fn line_endings_follow_the_cleanup_mode() {
-        assert_eq!(line_endings_for_mode(None), LineEndings::Preserve);
-        assert_eq!(
-            line_endings_for_mode(Some(CleanupMode::Clean)),
-            LineEndings::Preserve
-        );
-        assert_eq!(
-            line_endings_for_mode(Some(CleanupMode::Structured)),
-            LineEndings::CrLf
-        );
-
-        assert_eq!(
-            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Structured))),
-            "a\r\nb"
-        );
-        assert_eq!(
-            prepare_clipboard_text("a\nb", line_endings_for_mode(None)),
-            "a\nb"
-        );
-        assert_eq!(
-            prepare_clipboard_text("a\nb", line_endings_for_mode(Some(CleanupMode::Clean))),
-            "a\nb"
-        );
-    }
-
-    #[test]
-    fn structured_line_endings_become_crlf_for_the_clipboard() {
+    fn line_endings_become_crlf_for_the_clipboard() {
         assert_eq!(with_crlf("a\nb"), "a\r\nb");
         assert_eq!(with_crlf("a\r\nb"), "a\r\nb");
         assert_eq!(with_crlf("a\rb"), "a\r\nb");
         assert_eq!(with_crlf("a\n\n- one\n- two"), "a\r\n\r\n- one\r\n- two");
-        // Preserve is a no-op, so Clean's clipboard bytes are unchanged.
+        // Preserve is a no-op.
         assert_eq!(
             prepare_clipboard_text("a\nb", LineEndings::Preserve),
             "a\nb"

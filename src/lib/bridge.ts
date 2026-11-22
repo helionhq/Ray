@@ -8,7 +8,7 @@ export interface HistoryEntry {
   raw: string | null;
   app: string | null;
   duration_ms: number;
-  mode: CleanupMode | null;
+  mode: string | null;
 }
 
 export interface InputDevice {
@@ -18,13 +18,11 @@ export interface InputDevice {
 }
 
 export type Theme = "system" | "light" | "dark";
-export type CleanupMode = "clean" | "structured";
 
 export interface Settings {
   launch_at_login: boolean;
   input_device: string | null;
   cleanup_enabled: boolean;
-  cleanup_mode: CleanupMode;
   streaming_enabled: boolean;
   keep_raw: boolean;
   theme: Theme;
@@ -75,8 +73,7 @@ export const api = {
   removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
   deleteHistory: (id: string) => call<void>("delete_history", { id }),
   clearHistory: () => call<void>("clear_history"),
-  copyText: (text: string, mode: CleanupMode | null) =>
-    call<void>("copy_text", { text, mode }),
+  copyText: (text: string) => call<void>("copy_text", { text }),
   startDictation: () => call<void>("start_dictation"),
   stopDictation: () => call<void>("stop_dictation"),
   cancelDictation: () => call<void>("cancel_dictation"),

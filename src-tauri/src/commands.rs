@@ -8,7 +8,6 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::audio::{self, InputDevice};
-use crate::config::CleanupMode;
 use crate::hotkey;
 use crate::pipeline::Dictation;
 use crate::secrets;
@@ -238,11 +237,8 @@ pub fn clear_history(store: State<'_, Arc<Store>>, app: AppHandle) -> Result<(),
 }
 
 #[tauri::command]
-pub fn copy_text(text: String, mode: Option<String>) -> Result<(), String> {
-    let line_endings = crate::paste::line_endings_for_mode(
-        mode.as_deref().and_then(CleanupMode::from_id),
-    );
-    crate::paste::copy_text_with(&text, line_endings)
+pub fn copy_text(text: String) -> Result<(), String> {
+    crate::paste::copy_text_with(&text, crate::paste::LineEndings::CrLf)
 }
 
 /// The most recent transcript whose History save failed. It is kept in memory
@@ -324,10 +320,7 @@ pub fn copy_history_entry(id: String, store: State<'_, Arc<Store>>) -> Result<()
         .iter()
         .find(|entry| entry.id == id)
         .ok_or_else(|| "That entry no longer exists".to_string())?;
-    let line_endings = crate::paste::line_endings_for_mode(
-        entry.mode.as_deref().and_then(CleanupMode::from_id),
-    );
-    crate::paste::copy_text_with(&entry.text, line_endings)
+    crate::paste::copy_text_with(&entry.text, crate::paste::LineEndings::CrLf)
 }
 
 #[allow(dead_code)]

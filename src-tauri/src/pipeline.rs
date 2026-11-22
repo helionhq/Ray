@@ -14,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio::{self, Capture};
 use crate::cleanup;
-use crate::config::{prompt_for, CleanupMode, RuntimeConfig};
+use crate::config::RuntimeConfig;
 use crate::hotkey;
 use crate::paste;
 use crate::secrets;
@@ -29,9 +29,6 @@ struct Session {
     target: Option<windows_util::Foreground>,
     keyterms: Vec<String>,
     cleanup_enabled: bool,
-    /// Captured when the recording starts, so changing the setting mid-flight
-    /// cannot change the dictation already being processed.
-    cleanup_mode: CleanupMode,
     level_task: tokio::task::JoinHandle<()>,
     limit_task: tokio::task::JoinHandle<()>,
 }
@@ -217,7 +214,6 @@ impl Dictation {
             }
         }
         let target = windows_util::foreground();
-        let cleanup_mode = CleanupMode::from_id(&settings.cleanup_mode).unwrap_or_default();
 
         // Show the bar before the microphone opens; it should feel instant.
         self.emit_bar(json!({ "phase": "recording" }));
@@ -239,7 +235,7 @@ impl Dictation {
         // does not pay a cold TLS handshake after the hotkey is released.
         if settings.cleanup_enabled && pipeline.cleanup.enabled {
             let http = self.http.clone();
-            let cleanup_config = pipeline.cleanup.for_mode(cleanup_mode);
+            let cleanup_config = pipeline.cleanup.clone();
             tokio::spawn(async move {
                 cleanup::warm_connection(&http, &cleanup_config).await;
             });
@@ -319,7 +315,6 @@ impl Dictation {
             target,
             keyterms,
             cleanup_enabled: settings.cleanup_enabled,
-            cleanup_mode,
             level_task,
             limit_task,
         });
@@ -349,7 +344,6 @@ impl Dictation {
             target,
             keyterms,
             cleanup_enabled,
-            cleanup_mode,
             level_task,
             limit_task,
         } = session;
@@ -397,16 +391,12 @@ impl Dictation {
             ));
         }
 
-        let (pipeline, cleanup_prompt, structured_prompt) = {
+        let (pipeline, cleanup_prompt) = {
             let config = self
                 .config
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            (
-                config.pipeline.clone(),
-                config.prompt.clone(),
-                config.structured_prompt.clone(),
-            )
+            (config.pipeline.clone(), config.prompt.clone())
         };
         let wav = stt::wav_from_pcm16(&samples, audio::TARGET_RATE);
         let mut raw: Option<String> = None;
@@ -443,8 +433,8 @@ impl Dictation {
                 let terms = keyterms.clone();
                 // Let Sync batch and the v2 upload/poll fallback each reach their
                 // own deadline; the margin only guards against a hung task.
-                let timeout = stt::batch_time_budget(&pipeline.stt)
-                    .saturating_add(Duration::from_secs(15));
+                let timeout =
+                    stt::batch_time_budget(&pipeline.stt).saturating_add(Duration::from_secs(15));
                 match tokio::time::timeout(
                     timeout,
                     stt::transcribe_wav(&http, &api_key, &terms, wav, &stt_config),
@@ -490,10 +480,10 @@ impl Dictation {
         };
 
         let settings = self.store.settings();
-        // Resolve the session's mode once: Clean returns an exact clone of the
-        // base config, Structured applies its pipeline.json overrides.
-        let cleanup_config = pipeline.cleanup.for_mode(cleanup_mode);
-        let cleanup_prompt = prompt_for(&cleanup_prompt, &structured_prompt, cleanup_mode);
+        // Per-request timeout and hedge grow with the dictation's length;
+        // `cleanup::cleanup` applies the same scaling to the config it gets.
+        let cleanup_config = &pipeline.cleanup;
+        let cleanup_timeout_ms = cleanup_config.scaled_for(&raw_text).timeout_ms;
         let mut text = raw_text.clone();
         let mut note: Option<String> = None;
         if cleanup_enabled && pipeline.cleanup.enabled {
@@ -502,16 +492,13 @@ impl Dictation {
                 .as_ref()
                 .and_then(|target| target.app.clone())
                 .unwrap_or_else(|| "Unknown app".into());
-            let timeout = Duration::from_millis(cleanup_config.timeout_ms + 6_000);
+            let timeout = Duration::from_millis(cleanup_timeout_ms + 6_000);
             match tokio::time::timeout(
                 timeout,
                 cleanup::cleanup(
                     &self.http,
-                    &cleanup_config,
-                    cleanup::CleanupPrompt {
-                        mode: cleanup_mode,
-                        template: cleanup_prompt,
-                    },
+                    cleanup_config,
+                    &cleanup_prompt,
                     &raw_text,
                     &dictionary,
                     &pipeline.known_names,
@@ -539,8 +526,7 @@ impl Dictation {
             raw: raw_for_history,
             app: target.as_ref().and_then(|target| target.app.clone()),
             duration_ms,
-            mode: (cleanup_enabled && pipeline.cleanup.enabled)
-                .then(|| cleanup_mode.id().to_string()),
+            mode: (cleanup_enabled && pipeline.cleanup.enabled).then(|| "cleanup".to_string()),
         };
         let history_saved = match self.store.add_history(entry) {
             Ok(()) => true,
@@ -561,17 +547,9 @@ impl Dictation {
             eprintln!("[ray] {note}");
         }
 
-        // Structured output is multi-line (paragraphs and list markers). The
-        // Windows clipboard convention for CF_UNICODETEXT is CRLF; Clean keeps
-        // its existing bytes because its guard and formatting are untouched.
-        let line_endings = if cleanup_mode == CleanupMode::Structured
-            && cleanup_enabled
-            && pipeline.cleanup.enabled
-        {
-            paste::LineEndings::CrLf
-        } else {
-            paste::LineEndings::Preserve
-        };
+        // Cleaned output may be multi-line (paragraphs and list markers). The
+        // Windows clipboard convention for CF_UNICODETEXT is CRLF.
+        let line_endings = paste::LineEndings::CrLf;
         let pasted = {
             let text = text.clone();
             let target = target.as_ref().map(|target| target.hwnd);
