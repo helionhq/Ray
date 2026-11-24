@@ -7,6 +7,9 @@ const SERVICE: &str = "ray";
 
 pub const ASSEMBLYAI: &str = "assemblyai";
 pub const VERCEL: &str = "vercel";
+/// Optional bearer token for the Rayne cleanup server. The tailnet homeserver
+/// needs none; this stays for a custom endpoint that requires auth.
+pub const RAYNE: &str = "rayne";
 
 /// Providers Ray no longer supports. Their stored credentials must be removed
 /// so a retired key cannot linger in Credential Manager with no UI to clear it.
@@ -20,6 +23,7 @@ pub fn env_names(secret: &str) -> &'static [&'static str] {
             "AI_GATEWAY_API_KEY",
             "RAY_VERCEL_AI_GATEWAY_KEY",
         ],
+        RAYNE => &["RAYNE_API_KEY", "RAYNE_PROXY_TOKEN", "RAY_RAYNE_API_KEY"],
         _ => &[],
     }
 }

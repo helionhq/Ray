@@ -726,6 +726,33 @@ kbd {
   background: var(--ink-3);
 }
 
+.entry-model {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* A flagged entry keeps a subtle persistent dot; the flag action itself
+   lives in the hover-revealed row like every other action. */
+.entry.is-flagged .entry-time::after {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: var(--live);
+  vertical-align: 2px;
+}
+
+.icon-btn.flag.is-flagged {
+  color: var(--live);
+}
+
+.icon-btn.flag.is-flagged:hover {
+  background: rgba(240, 80, 90, 0.08);
+  color: var(--live);
+}
+
 .actions {
   display: flex;
   gap: 1px;
@@ -1339,6 +1366,66 @@ kbd {
   right: 9px;
   color: var(--ink-3);
   pointer-events: none;
+}
+
+/* Advanced: collapsible endpoint overrides. */
+.advanced summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 58px;
+  padding: 14px 16px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced summary .label {
+  flex: none;
+}
+
+.advanced-hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.advanced summary svg {
+  flex: none;
+  color: var(--ink-3);
+  transition: transform 160ms var(--ease-out);
+}
+
+.advanced[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.advanced[open] summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.url-editor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  max-width: 460px;
+}
+
+.url-editor .input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .segmented {

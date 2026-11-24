@@ -12,6 +12,7 @@ import {
 } from "../lib/format";
 import {
   CopyIcon,
+  FlagIcon,
   MicIcon,
   SearchIcon,
   TrashIcon,
@@ -47,6 +48,9 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [expandedText, setExpandedText] = useState<Set<string>>(new Set());
+  const [expandedThinking, setExpandedThinking] = useState<Set<string>>(
+    new Set(),
+  );
   const [armedClear, setArmedClear] = useState(false);
   const search = useRef<HTMLInputElement>(null);
 
@@ -75,7 +79,8 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
     const needle = query.trim().toLowerCase();
     if (!needle) return snapshot.history;
     return snapshot.history.filter((entry) => {
-      const haystack = `${entry.text} ${entry.raw ?? ""}`.toLowerCase();
+      const haystack =
+        `${entry.output} ${entry.raw_transcript ?? ""}`.toLowerCase();
       return haystack.includes(needle);
     });
   }, [snapshot.history, query]);
@@ -106,7 +111,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
     for (const entry of snapshot.history) {
       if (dayKey(entry.created_at) !== today) continue;
       todayCount++;
-      words += wordCount(entry.text);
+      words += wordCount(entry.output);
       spokenMs += Math.max(0, entry.duration_ms);
     }
     // ≈ max(0, words at 40 wpm − minutes actually spent speaking).
@@ -137,10 +142,28 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
     });
   }
 
+  function toggleThinking(id: string) {
+    setExpandedThinking((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   async function copy(entry: HistoryEntry) {
     try {
-      await api.copyText(entry.text);
+      await api.copyText(entry.output);
       notify("Copied to clipboard");
+    } catch (error) {
+      notify(String(error));
+    }
+  }
+
+  async function toggleFlag(entry: HistoryEntry) {
+    try {
+      await api.setFlagged(entry.id, !entry.flagged);
+      await refresh();
     } catch (error) {
       notify(String(error));
     }
@@ -255,14 +278,24 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
             <section key={group.key} className="day-group">
               <h2 className="day-label">{group.label}</h2>
               {group.items.map((entry) => {
-                const showRaw = expanded.has(entry.id) && Boolean(entry.raw);
+                const showRaw =
+                  expanded.has(entry.id) && Boolean(entry.raw_transcript);
+                const hasThinking = Boolean(entry.thinking?.trim());
+                const showThinking =
+                  expandedThinking.has(entry.id) && hasThinking;
                 const showFull = expandedText.has(entry.id);
-                const longText = entry.text.length > LONG_ENTRY_CHARS;
+                const longText = entry.output.length > LONG_ENTRY_CHARS;
+                const modelLabel =
+                  entry.model === "rayne-1" ? "Rayne 1" : entry.model;
                 return (
-                  <article key={entry.id} className="entry">
+                  <article
+                    key={entry.id}
+                    className={`entry${entry.flagged ? " is-flagged" : ""}`}
+                  >
                     <time
                       className="entry-time"
                       dateTime={isoOf(entry.created_at)}
+                      title={entry.app_name ?? undefined}
                     >
                       {timeOf(entry.created_at)}
                     </time>
@@ -272,16 +305,25 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
                           longText && !showFull ? " is-clamped" : ""
                         }${showFull ? " is-expanded" : ""}`}
                       >
-                        {entry.text}
+                        {entry.output}
                       </p>
-                      {showRaw && entry.raw && (
+                      {showRaw && entry.raw_transcript && (
                         <div className="entry-raw">
                           <span className="entry-raw-label">
                             Original transcript
                           </span>
                           <p className="entry-raw-text">
-                            <RawTranscript raw={entry.raw} cleaned={entry.text} />
+                            <RawTranscript
+                              raw={entry.raw_transcript}
+                              cleaned={entry.output}
+                            />
                           </p>
+                        </div>
+                      )}
+                      {showThinking && entry.thinking && (
+                        <div className="entry-raw">
+                          <span className="entry-raw-label">Model thinking</span>
+                          <p className="entry-raw-text">{entry.thinking}</p>
                         </div>
                       )}
                       <div className="entry-meta">
@@ -289,7 +331,13 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
                           {duration(entry.duration_ms)}
                         </span>
                         <span className="meta-sep" />
-                        <span>{wordCount(entry.text)} words</span>
+                        <span>{wordCount(entry.output)} words</span>
+                        {modelLabel && (
+                          <>
+                            <span className="meta-sep" />
+                            <span className="entry-model mono">{modelLabel}</span>
+                          </>
+                        )}
 
                         <div className="actions">
                           <button
@@ -310,7 +358,7 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
                               {showFull ? "Show less" : "Show more"}
                             </button>
                           )}
-                          {entry.raw && (
+                          {entry.raw_transcript && (
                             <button
                               type="button"
                               className="icon-btn"
@@ -322,6 +370,34 @@ export function HistoryPage({ snapshot, refresh, notify }: Props) {
                                 : "Original"}
                             </button>
                           )}
+                          {hasThinking && (
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              onClick={() => toggleThinking(entry.id)}
+                              aria-expanded={showThinking}
+                            >
+                              {showThinking ? "Hide thinking" : "Thinking"}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className={`icon-btn flag${
+                              entry.flagged ? " is-flagged" : ""
+                            }`}
+                            onClick={() => void toggleFlag(entry)}
+                            aria-pressed={entry.flagged}
+                            aria-label={
+                              entry.flagged
+                                ? "Unflag entry"
+                                : "Flag entry for Rayne v2"
+                            }
+                            title={
+                              entry.flagged ? "Unflag" : "Flag for Rayne v2"
+                            }
+                          >
+                            <FlagIcon size={13} />
+                          </button>
                           <button
                             type="button"
                             className="icon-btn danger"

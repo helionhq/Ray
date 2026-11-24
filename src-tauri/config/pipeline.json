@@ -75,10 +75,12 @@
     "enabled": true,
     "temperature": 0.0,
     "max_tokens": 3000,
-    "timeout_ms": 10000,
-    "timeout_ms_per_word": 20,
+    "timeout_ms": 15000,
+    "timeout_ms_per_word": 40,
     "hedge_after_ms": 3000,
     "hedge_after_ms_per_word": 8,
+    "cold_retry_budget_ms": 60000,
+    "cold_retry_delay_ms": 1500,
     "retries": 2,
     "backoff_ms": [
       300,
@@ -86,16 +88,10 @@
     ],
     "providers": [
       {
-        "id": "assemblyai",
-        "base_url": "https://llm-gateway.assemblyai.com/v1",
-        "model": "gemma-4-31b",
-        "api_key_secret": "assemblyai"
-      },
-      {
-        "id": "assemblyai-hedge",
-        "base_url": "https://llm-gateway.assemblyai.com/v1",
-        "model": "gemma-4-31b",
-        "api_key_secret": "assemblyai"
+        "id": "rayne-1",
+        "base_url": "http://homeserver:8000/v1",
+        "model": "rayne-1",
+        "api_key_secret": ""
       }
     ]
   }

@@ -1,12 +1,14 @@
-//! The LLM cleanup pass.
+//! The LLM cleanup pass (Rayne 1 on the homeserver, reached over the tailnet).
 //!
 //! Any OpenAI-compatible `/chat/completions` endpoint works. Providers are
 //! tried in the order in `pipeline.json`, skipping any without a stored key;
-//! the first valid answer wins. If every provider fails, the raw transcript is
-//! used so dictation never silently drops the user's words.
+//! the first valid answer wins. In the shipping config `CleanupConfig::selected`
+//! has already narrowed this to the one model chosen in Settings. If every
+//! provider fails, the raw transcript is used so dictation never silently
+//! drops the user's words.
 
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -17,8 +19,18 @@ use crate::secrets;
 #[derive(Debug, Clone)]
 pub struct CleanupResult {
     pub text: String,
+    /// The model's thinking trace, kept out of the pasted text and logged to
+    /// History for the Rayne v2 dataset. `None` when cleanup did not run.
+    pub thinking: Option<String>,
     pub provider: Option<String>,
     pub note: Option<String>,
+}
+
+/// A validated provider answer: the cleaned text plus its thinking trace.
+#[derive(Debug, Clone)]
+struct Answer {
+    text: String,
+    thinking: String,
 }
 
 #[derive(Deserialize)]
@@ -41,23 +53,16 @@ struct ChatMessage {
     content: Option<String>,
 }
 
-pub fn build_system_prompt(
-    template: &str,
-    dictionary: &[String],
-    known_names: &[String],
-    app_name: &str,
-) -> String {
-    // Reference data is attacker-influenced (the app name comes from the
-    // foreground window), so it is embedded as JSON data and can never break
-    // out of its literal.
-    let dictionary = serde_json::to_string(dictionary).unwrap_or_else(|_| "[]".to_string());
-    let known_names = serde_json::to_string(known_names).unwrap_or_else(|_| "[]".to_string());
-    let app_name = serde_json::to_string(app_name).unwrap_or_else(|_| "\"\"".to_string());
-    strip_markdown_title(template)
-        .replace("{{DICTIONARY}}", &dictionary)
-        .replace("{{KNOWN_NAMES}}", &known_names)
-        .replace("{{APP_NAME}}", &app_name)
-        .replace("{{TRANSCRIPT}}", "(the transcript)")
+/// The production Rayne system prompt plus the user's dictionary on a single
+/// appended line, omitted when empty. This is exactly the format the models
+/// were trained on (`rayne/dataset/build.py`); do not reword it.
+pub fn build_system_prompt(template: &str, dictionary: &[String]) -> String {
+    let base = strip_markdown_title(template).trim_end();
+    if dictionary.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\nDictionary: {}", dictionary.join(", "))
+    }
 }
 
 /// The checked-in prompt file starts with a Markdown title written for people
@@ -75,26 +80,41 @@ fn strip_markdown_title(template: &str) -> &str {
     }
 }
 
-/// Open DNS/TCP/TLS to the cleanup gateway while the user is still speaking.
-/// The first dictation otherwise pays the cold-connection handshake after the
-/// hotkey is released. The response is irrelevant; any completed request leaves
-/// the connection in the pool.
-pub async fn warm_connection(http: &reqwest::Client, config: &CleanupConfig) {
+/// Ping the Rayne server's `/warmup` while the user is still speaking. The
+/// homeserver model is always loaded, so this is just a reachability check;
+/// fire-and-forget, the response is irrelevant.
+pub async fn warmup(http: &reqwest::Client, config: &CleanupConfig) {
     for provider in &config.providers {
-        let Some(key) = secrets::get(&provider.api_key_secret) else {
-            continue;
+        let key = if provider.api_key_secret.is_empty() {
+            String::new()
+        } else {
+            match secrets::get(&provider.api_key_secret) {
+                Some(key) => key,
+                None => continue,
+            }
         };
-        let url = format!("{}/models", provider.base_url.trim_end_matches('/'));
-        if let Ok(response) = http
+        // base_url is the OpenAI root (`<host>/v1`); /warmup sits at the host
+        // root, outside the OpenAI path prefix.
+        let root = provider.base_url.trim_end_matches('/');
+        let root = root.strip_suffix("/v1").unwrap_or(root);
+        let url = format!("{root}/warmup");
+        match http
             .get(&url)
             .header("authorization", format!("Bearer {key}"))
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(120))
             .send()
             .await
         {
-            // Drain the body so the connection returns to the pool; dropping
-            // an unread response makes hyper close it instead.
-            let _ = response.bytes().await;
+            Ok(response) => {
+                let status = response.status();
+                // Drain the body so the connection returns to the pool; dropping
+                // an unread response makes hyper close it instead.
+                let _ = response.bytes().await;
+                if !status.is_success() {
+                    eprintln!("[ray] warmup ping returned HTTP {status}");
+                }
+            }
+            Err(error) => eprintln!("[ray] warmup ping failed: {error}"),
         }
         return;
     }
@@ -106,34 +126,37 @@ pub async fn cleanup(
     template: &str,
     transcript: &str,
     dictionary: &[String],
-    known_names: &[String],
-    app_name: &str,
 ) -> CleanupResult {
     let transcript = transcript.trim();
     if transcript.is_empty() {
         return CleanupResult {
             text: String::new(),
+            thinking: None,
             provider: None,
             note: None,
         };
     }
     let config = &config.scaled_for(transcript);
-    let system = build_system_prompt(template, dictionary, known_names, app_name);
-    let mut providers = config
-        .providers
-        .iter()
-        .filter_map(|provider| secrets::get(&provider.api_key_secret).map(|key| (provider, key)));
+    let system = build_system_prompt(template, dictionary);
+    let mut providers = config.providers.iter().filter_map(|provider| {
+        if provider.api_key_secret.is_empty() {
+            Some((provider, String::new()))
+        } else {
+            secrets::get(&provider.api_key_secret).map(|key| (provider, key))
+        }
+    });
 
     let Some((primary, primary_key)) = providers.next() else {
         return CleanupResult {
             text: transcript.to_string(),
+            thinking: None,
             provider: None,
-            note: Some("No cleanup provider is configured; using the raw transcript".into()),
+            note: Some("No cleanup API key is configured; using the raw transcript".into()),
         };
     };
     let fallback = providers.next();
     let fallback_id = fallback.as_ref().map(|(provider, _)| provider.id.clone());
-    let accept = |text: &str| is_plausible(text, transcript);
+    let accept = |answer: &Answer| is_plausible(&answer.text, transcript);
     let hedge_after = Duration::from_millis(config.hedge_after_ms.max(1));
     let primary_call = call_provider(http, primary, &primary_key, config, &system, transcript);
 
@@ -161,13 +184,15 @@ pub async fn cleanup(
     };
 
     match outcome {
-        Ok((text, true)) => CleanupResult {
-            text,
+        Ok((answer, true)) => CleanupResult {
+            text: answer.text,
+            thinking: Some(answer.thinking),
             provider: Some(primary.id.clone()),
             note: None,
         },
-        Ok((text, false)) => CleanupResult {
-            text,
+        Ok((answer, false)) => CleanupResult {
+            text: answer.text,
+            thinking: Some(answer.thinking),
             provider: fallback_id,
             note: None,
         },
@@ -183,9 +208,10 @@ pub async fn cleanup(
             // order only after the hedged pair has failed.
             for (provider, key) in providers {
                 match call_provider(http, provider, &key, config, &system, transcript).await {
-                    Ok(text) if is_plausible(&text, transcript) => {
+                    Ok(answer) if is_plausible(&answer.text, transcript) => {
                         return CleanupResult {
-                            text,
+                            text: answer.text,
+                            thinking: Some(answer.thinking),
                             provider: Some(provider.id.clone()),
                             note: None,
                         }
@@ -196,6 +222,7 @@ pub async fn cleanup(
             }
             CleanupResult {
                 text: transcript.to_string(),
+                thinking: None,
                 provider: None,
                 note: Some(format!(
                     "Cleanup failed ({}); using the raw transcript",
@@ -213,15 +240,15 @@ pub async fn cleanup(
 /// Returns `(text, from_primary)` on success, or the two provider errors. The
 /// fallback is lazy: when the primary answers inside the hedge window it is
 /// never polled, so a fallback's rate limit cannot touch the primary path.
-async fn run_hedged<P, F>(
+async fn run_hedged<T, P, F>(
     hedge_after: Duration,
     primary: P,
     fallback: Option<F>,
-    accept: impl Fn(&str) -> bool,
-) -> Result<(String, bool), (Option<String>, Option<String>)>
+    accept: impl Fn(&T) -> bool,
+) -> Result<(T, bool), (Option<String>, Option<String>)>
 where
-    P: Future<Output = Result<String, String>>,
-    F: Future<Output = Result<String, String>>,
+    P: Future<Output = Result<T, String>>,
+    F: Future<Output = Result<T, String>>,
 {
     let mut primary = Box::pin(primary);
     let mut primary_done = false;
@@ -281,7 +308,7 @@ async fn call_provider(
     config: &CleanupConfig,
     system: &str,
     transcript: &str,
-) -> Result<String, String> {
+) -> Result<Answer, String> {
     let url = format!(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
@@ -292,10 +319,9 @@ async fn call_provider(
         "messages".into(),
         json!([
             { "role": "system", "content": system },
-            {
-                "role": "user",
-                "content": format!("<transcript>\n{transcript}\n</transcript>")
-            }
+            // Rayne was trained with the raw transcript as the user message,
+            // verbatim and unwrapped.
+            { "role": "user", "content": transcript }
         ]),
     );
     body.insert("temperature".into(), json!(config.temperature));
@@ -308,8 +334,12 @@ async fn call_provider(
     }
     let body = Value::Object(body);
     let attempts = config.retries.saturating_add(1).max(1);
+    let started = Instant::now();
+    let cold_budget = Duration::from_millis(config.cold_retry_budget_ms);
+    let cold_delay = Duration::from_millis(config.cold_retry_delay_ms.max(250));
 
-    for attempt in 0..attempts {
+    let mut attempt = 0u32;
+    loop {
         // The timeout covers sending *and* reading the body. Wrapping only
         // `send()` left a stalled stream able to outlive the timeout.
         let response =
@@ -331,26 +361,41 @@ async fn call_provider(
             Ok(Err(error)) => {
                 if attempt + 1 < attempts {
                     backoff(config, attempt).await;
+                    attempt += 1;
                     continue;
                 }
                 return Err(format!("request failed: {error}"));
             }
-            Err(_) => return Err("timed out".into()),
+            Err(_) => {
+                // A cold Modal container may hold the request while it
+                // restores from its GPU snapshot; inside the cold budget a
+                // timeout is treated like a 503 and retried, not fatal.
+                if started.elapsed() < cold_budget {
+                    tokio::time::sleep(cold_delay).await;
+                    continue;
+                }
+                return Err("timed out".into());
+            }
         };
         if !status.is_success() {
+            // 503 = the container is still restoring. Retry with a short
+            // backoff until it is ready, without spending the normal attempts.
+            if status.as_u16() == 503 && started.elapsed() < cold_budget {
+                tokio::time::sleep(cold_delay).await;
+                continue;
+            }
             let message = api_message(&text);
             let retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
             if retryable && attempt + 1 < attempts {
                 backoff(config, attempt).await;
+                attempt += 1;
                 continue;
             }
             return Err(format!("HTTP {status}: {message}"));
         }
 
-        let cleaned = extract_answer(&text)?;
-        return Ok(cleaned);
+        return extract_answer(&text);
     }
-    Err("no attempt succeeded".into())
 }
 
 /// Pull the cleaned text out of a chat-completions response. A response that
@@ -358,7 +403,7 @@ async fn call_provider(
 /// prefix of the cleanup, so pasting it would silently drop the rest of what
 /// the user said. The error falls through to the next provider and ultimately
 /// to the raw transcript.
-fn extract_answer(text: &str) -> Result<String, String> {
+fn extract_answer(text: &str) -> Result<Answer, String> {
     let parsed: ChatResponse =
         serde_json::from_str(text).map_err(|error| format!("invalid response JSON: {error}"))?;
     let choice = parsed
@@ -384,11 +429,47 @@ fn extract_answer(text: &str) -> Result<String, String> {
         .message
         .content
         .ok_or_else(|| "the model returned no text".to_string())?;
-    let cleaned = sanitize(&content);
+    let (thinking, output) = split_thinking(&content);
+    let cleaned = sanitize(&output);
     if cleaned.is_empty() {
         return Err("the model returned an empty answer".into());
     }
-    Ok(cleaned)
+    Ok(Answer {
+        text: cleaned,
+        thinking,
+    })
+}
+
+/// Separate the thinking trace from the cleaned text. The server's chat
+/// template prefills the opening think tag, so `content` normally looks like
+/// `{thinking}\n{output}` (Air) or `{thinking}\n\n{output}` (Pro): a closing
+/// think tag is present but an opening tag usually is NOT.
+///
+/// - If a closing think tag exists, everything after the **last** one is the
+///   output (leading whitespace/newlines stripped); everything before it is
+///   the thinking trace, minus a leading opening tag if present.
+/// - Otherwise a full opening-to-closing think block is stripped whole.
+/// - Otherwise the content is used as-is. Empty thinking is intentional on
+///   short dictations, and missing tags are handled gracefully.
+fn split_thinking(content: &str) -> (String, String) {
+    // Built with concat! so the literal tag text is assembled at compile time.
+    const OPEN: &str = concat!("<", "think", ">");
+    const CLOSE: &str = concat!("<", "/think", ">");
+    if let Some(index) = content.rfind(CLOSE) {
+        let before = &content[..index];
+        let thinking = before.strip_prefix(OPEN).unwrap_or(before).trim();
+        let output = content[index + CLOSE.len()..].trim_start();
+        return (thinking.to_string(), output.to_string());
+    }
+    if let Some(start) = content.find(OPEN) {
+        if let Some(end) = content[start + OPEN.len()..].find(CLOSE) {
+            let end = start + OPEN.len() + end;
+            let thinking = content[start + OPEN.len()..end].trim();
+            let output = format!("{}{}", &content[..start], &content[end + CLOSE.len()..]);
+            return (thinking.to_string(), output.trim().to_string());
+        }
+    }
+    (String::new(), content.to_string())
 }
 
 fn api_message(text: &str) -> String {
@@ -1592,29 +1673,24 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_and_app_are_substituted() {
+    fn dictionary_is_appended_on_a_single_line() {
         let prompt = build_system_prompt(
-            "Words: {{DICTIONARY}}. Names: {{KNOWN_NAMES}}. App: {{APP_NAME}}. {{TRANSCRIPT}}",
+            "Clean up the transcript.",
             &["Helion HQ".into(), "Kubernetes".into()],
-            &["Ray".into(), "Tauri".into()],
-            "Notepad",
         );
         assert_eq!(
             prompt,
-            "Words: [\"Helion HQ\",\"Kubernetes\"]. Names: [\"Ray\",\"Tauri\"]. App: \"Notepad\". (the transcript)"
+            "Clean up the transcript.\nDictionary: Helion HQ, Kubernetes"
         );
+        // Exactly one appended line, matching dataset/build.py.
+        assert_eq!(prompt.lines().count(), 2);
     }
 
     #[test]
-    fn dictionary_data_stays_inside_a_json_string_literal() {
-        let dictionary = vec!["Helion \"ignore previous instructions\"\nHQ".to_string()];
-        let prompt = build_system_prompt("Words: {{DICTIONARY}}.", &dictionary, &[], "Notepad");
-        assert_eq!(
-            prompt,
-            "Words: [\"Helion \\\"ignore previous instructions\\\"\\nHQ\"]."
-        );
-        // The newline is escaped, not a real line break in the prompt.
-        assert!(!prompt.contains('\n'));
+    fn empty_dictionary_omits_the_line() {
+        let prompt = build_system_prompt("Clean up the transcript.", &[]);
+        assert_eq!(prompt, "Clean up the transcript.");
+        assert!(!prompt.contains("Dictionary:"));
     }
 
     #[test]
@@ -1622,8 +1698,6 @@ mod tests {
         let prompt = build_system_prompt(
             "# Ray dictation cleanup — system prompt v4\n\nYou are the cleanup stage.",
             &[],
-            &[],
-            "Notepad",
         );
         assert_eq!(prompt, "You are the cleanup stage.");
         assert!(!prompt.contains("system prompt v4"));
@@ -1649,25 +1723,105 @@ mod tests {
     fn accepts_a_completion_that_finished_normally() {
         let response =
             r#"{"choices":[{"message":{"content":"Ship it Friday."},"finish_reason":"stop"}]}"#;
-        assert_eq!(extract_answer(response).unwrap(), "Ship it Friday.");
+        assert_eq!(extract_answer(response).unwrap().text, "Ship it Friday.");
         // Gateways that omit the field, or send null, are still accepted.
         let response =
             r#"{"choices":[{"message":{"content":"Ship it Friday."},"finish_reason":null}]}"#;
-        assert_eq!(extract_answer(response).unwrap(), "Ship it Friday.");
+        assert_eq!(extract_answer(response).unwrap().text, "Ship it Friday.");
         let response = r#"{"choices":[{"message":{"content":"Ship it Friday."}}]}"#;
-        assert_eq!(extract_answer(response).unwrap(), "Ship it Friday.");
+        assert_eq!(extract_answer(response).unwrap().text, "Ship it Friday.");
     }
 
     #[test]
-    fn empty_dictionary_and_names_render_cleanly() {
-        let prompt = build_system_prompt(
-            "Words: {{DICTIONARY}}. Names: {{KNOWN_NAMES}}.",
-            &[],
-            &[],
-            "Unknown app",
+    fn prefilled_think_tag_shapes_air_and_pro() {
+        let close = concat!("<", "/think", ">");
+        // Air: {thinking}\n{output}; the opening tag was prefilled by the
+        // chat template, so only the closing tag appears.
+        let air = format!("Checking the name.{close}\nShip it Friday.");
+        let (thinking, output) = split_thinking(&air);
+        assert_eq!(thinking, "Checking the name.");
+        assert_eq!(output, "Ship it Friday.");
+        // Pro: {thinking}\n\n{output}.
+        let pro = format!("Checking the name.{close}\n\nShip it Friday.");
+        let (thinking, output) = split_thinking(&pro);
+        assert_eq!(thinking, "Checking the name.");
+        assert_eq!(output, "Ship it Friday.");
+    }
+
+    #[test]
+    fn empty_thinking_is_intentional_on_short_dictations() {
+        let close = concat!("<", "/think", ">");
+        let content = format!("{close}\nShip it.");
+        let (thinking, output) = split_thinking(&content);
+        assert_eq!(thinking, "");
+        assert_eq!(output, "Ship it.");
+        // Whitespace-only thinking is also empty.
+        let content = format!("  \n{close}\n\nShip it.");
+        let (thinking, output) = split_thinking(&content);
+        assert_eq!(thinking, "");
+        assert_eq!(output, "Ship it.");
+    }
+
+    #[test]
+    fn last_closing_tag_wins_and_opening_tag_is_optional() {
+        let open = concat!("<", "think", ">");
+        let close = concat!("<", "/think", ">");
+        let content = format!("{open}first pass{close}second pass{close}\nFinal text.");
+        let (thinking, output) = split_thinking(&content);
+        assert_eq!(thinking, format!("first pass{close}second pass"));
+        assert_eq!(output, "Final text.");
+        // Without an opening tag the trace is kept as-is.
+        let content = format!("just a trace{close}\nFinal text.");
+        let (thinking, output) = split_thinking(&content);
+        assert_eq!(thinking, "just a trace");
+        assert_eq!(output, "Final text.");
+    }
+
+    #[test]
+    fn a_full_think_block_is_stripped_whole() {
+        let open = concat!("<", "think", ">");
+        let close = concat!("<", "/think", ">");
+        let content = format!("{open}the plan{close}\nShip it Friday.");
+        let (thinking, output) = split_thinking(&content);
+        assert_eq!(thinking, "the plan");
+        assert_eq!(output, "Ship it Friday.");
+    }
+
+    #[test]
+    fn no_tags_uses_the_content_as_is() {
+        let (thinking, output) = split_thinking("Just the cleaned text.");
+        assert_eq!(thinking, "");
+        assert_eq!(output, "Just the cleaned text.");
+        // An unclosed opening tag is not a think block; keep everything.
+        let open = concat!("<", "think", ">");
+        let content = format!("{open}unfinished");
+        let (thinking, output) = split_thinking(&content);
+        assert_eq!(thinking, "");
+        assert_eq!(output, content);
+    }
+
+    #[test]
+    fn extract_answer_captures_thinking_separately() {
+        let close = concat!("<", "/think", ">");
+        let response = format!(
+            r#"{{"choices":[{{"message":{{"content":"Checking the name.{close}\nLet's ship Friday."}},"finish_reason":"stop"}}]}}"#
         );
-        assert_eq!(prompt, "Words: []. Names: [].");
-        assert!(!prompt.contains('\u{2014}'));
+        let answer = extract_answer(&response).unwrap();
+        assert_eq!(answer.text, "Let's ship Friday.");
+        assert_eq!(answer.thinking, "Checking the name.");
+        // Empty thinking survives as an empty trace, not a failure.
+        let response = format!(
+            r#"{{"choices":[{{"message":{{"content":"{close}\nLet's ship Friday."}}}}]}}"#
+        );
+        let answer = extract_answer(&response).unwrap();
+        assert_eq!(answer.text, "Let's ship Friday.");
+        assert_eq!(answer.thinking, "");
+    }
+
+    #[test]
+    fn trailing_template_whitespace_is_trimmed_before_the_dictionary() {
+        let prompt = build_system_prompt("Clean up the transcript.\n\n", &["Rayne".into()]);
+        assert_eq!(prompt, "Clean up the transcript.\nDictionary: Rayne");
     }
 
     #[test]

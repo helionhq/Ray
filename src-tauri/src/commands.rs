@@ -18,6 +18,7 @@ use crate::windows_util;
 pub struct KeyStatus {
     pub assemblyai: bool,
     pub vercel: bool,
+    pub rayne: bool,
 }
 
 #[derive(Serialize)]
@@ -43,6 +44,7 @@ pub async fn get_snapshot(store: State<'_, Arc<Store>>) -> Result<Snapshot, Stri
         keys: KeyStatus {
             assemblyai: secrets::has(secrets::ASSEMBLYAI),
             vercel: secrets::has(secrets::VERCEL),
+            rayne: secrets::has(secrets::RAYNE),
         },
         devices: audio::list_input_devices().unwrap_or_default(),
         launch_at_login: windows_util::launch_at_login(),
@@ -65,7 +67,7 @@ pub fn clear_secret(provider: String) -> Result<(), String> {
 
 fn validate_provider(provider: &str) -> Result<(), String> {
     match provider {
-        secrets::ASSEMBLYAI | secrets::VERCEL => Ok(()),
+        secrets::ASSEMBLYAI | secrets::VERCEL | secrets::RAYNE => Ok(()),
         other => Err(format!("Unknown provider: {other}")),
     }
 }
@@ -76,8 +78,12 @@ pub async fn test_secret(
     dictation: State<'_, Arc<Dictation>>,
 ) -> Result<String, String> {
     validate_provider(&provider)?;
-    let key =
-        secrets::get(&provider).ok_or_else(|| "Save a key first, then test it.".to_string())?;
+    // Rayne on the homeserver needs no key; other providers require one.
+    let key = match secrets::get(&provider) {
+        Some(key) => key,
+        None if provider == secrets::RAYNE => String::new(),
+        None => return Err("Save a key first, then test it.".to_string()),
+    };
     if provider == secrets::ASSEMBLYAI {
         let response = dictation
             .http()
@@ -93,39 +99,38 @@ pub async fn test_secret(
                 response.status()
             ));
         }
-        // The same key powers the primary cleanup model on the LLM Gateway.
-        if let Some(provider) = dictation.cleanup_provider(secrets::ASSEMBLYAI) {
-            let body = json!({
-                "model": provider.model,
-                "messages": [{ "role": "user", "content": "Reply with OK." }],
-                "temperature": 0,
-                "max_tokens": 32,
-                "stream": false,
-            });
-            let llm = dictation
-                .http()
-                .post(format!(
-                    "{}/chat/completions",
-                    provider.base_url.trim_end_matches('/')
+        // Cleanup runs on Rayne now; this key only powers speech-to-text.
+        return Ok("AssemblyAI connected · speech-to-text".into());
+    }
+
+    if provider == secrets::RAYNE {
+        // GET /v1/models checks the homeserver is reachable without generating
+        // any tokens. Rayne runs on the tailnet and needs no API key.
+        let provider_config = dictation
+            .selected_cleanup_provider()
+            .ok_or_else(|| "No cleanup model is configured".to_string())?;
+        let response = dictation
+            .http()
+            .get(format!(
+                "{}/models",
+                provider_config.base_url.trim_end_matches('/')
+            ))
+            .header("authorization", format!("Bearer {key}"))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|error| format!("Could not reach Rayne on the homeserver: {error}"))?;
+        let status = response.status();
+        return match status.as_u16() {
+            200..=299 => Ok(format!("Rayne connected · {}", provider_config.model)),
+            _ => {
+                let text = response.text().await.unwrap_or_default();
+                Err(format!(
+                    "Rayne returned HTTP {status}: {}",
+                    text.chars().take(160).collect::<String>()
                 ))
-                .header("authorization", format!("Bearer {key}"))
-                .json(&body)
-                .timeout(Duration::from_secs(15))
-                .send()
-                .await;
-            return Ok(match llm {
-                Ok(response) if response.status().is_success() => format!(
-                    "AssemblyAI connected · speech + {}",
-                    provider.model
-                ),
-                Ok(response) => format!(
-                    "Speech connected; the LLM Gateway returned HTTP {} (cleanup will use the raw transcript)",
-                    response.status()
-                ),
-                Err(_) => "Speech connected; the LLM Gateway was unreachable (cleanup will use the raw transcript)".into(),
-            });
-        }
-        return Ok("AssemblyAI connected".into());
+            }
+        };
     }
 
     let provider_config = dictation
@@ -229,6 +234,19 @@ pub fn delete_history(
     Ok(())
 }
 
+/// Mark (or unmark) a dictation as a mistake for the Rayne v2 dataset.
+#[tauri::command]
+pub fn set_flagged(
+    id: String,
+    flagged: bool,
+    store: State<'_, Arc<Store>>,
+    app: AppHandle,
+) -> Result<(), String> {
+    store.set_flagged(&id, flagged)?;
+    let _ = app.emit_to("main", "state-changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn clear_history(store: State<'_, Arc<Store>>, app: AppHandle) -> Result<(), String> {
     store.clear_history()?;
@@ -320,7 +338,7 @@ pub fn copy_history_entry(id: String, store: State<'_, Arc<Store>>) -> Result<()
         .iter()
         .find(|entry| entry.id == id)
         .ok_or_else(|| "That entry no longer exists".to_string())?;
-    crate::paste::copy_text_with(&entry.text, crate::paste::LineEndings::CrLf)
+    crate::paste::copy_text_with(&entry.output, crate::paste::LineEndings::CrLf)
 }
 
 #[allow(dead_code)]

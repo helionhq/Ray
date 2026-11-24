@@ -12,7 +12,7 @@ import type {
   Snapshot,
   Theme,
 } from "../lib/bridge";
-import { api } from "../lib/bridge";
+import { api, RAYNE_URL } from "../lib/bridge";
 import { applyTheme } from "../lib/theme";
 import { hotkeyLabel } from "../lib/format";
 import {
@@ -41,13 +41,18 @@ type Reveals = Record<Provider, boolean>;
 type ProviderFlags = Record<Provider, boolean>;
 type KeyTest = "connected" | "failed" | null;
 
-const emptyDrafts: Drafts = { assemblyai: "", vercel: "" };
-const hidden: Reveals = { assemblyai: false, vercel: false };
+const emptyDrafts: Drafts = { assemblyai: "", vercel: "", rayne: "" };
+const hidden: Reveals = { assemblyai: false, vercel: false, rayne: false };
 const unflagged: ProviderFlags = {
   assemblyai: false,
   vercel: false,
+  rayne: false,
 };
-const untested: Record<Provider, KeyTest> = { assemblyai: null, vercel: null };
+const untested: Record<Provider, KeyTest> = {
+  assemblyai: null,
+  vercel: null,
+  rayne: null,
+};
 
 export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   const [drafts, setDrafts] = useState<Drafts>(emptyDrafts);
@@ -69,7 +74,16 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
   const keyVersions = useRef<Record<Provider, number>>({
     assemblyai: 0,
     vercel: 0,
+    rayne: 0,
   });
+  const [rayneUrl, setRayneUrl] = useState(
+    snapshot.settings.rayne_url ?? RAYNE_URL,
+  );
+
+  // Keep the Advanced draft in sync after a save, a reset, or a refresh.
+  useEffect(() => {
+    setRayneUrl(snapshot.settings.rayne_url ?? RAYNE_URL);
+  }, [snapshot.settings.rayne_url]);
 
   useEffect(() => {
     if (!armedRemove) return;
@@ -248,6 +262,13 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
     } finally {
       setBusy(null);
     }
+  }
+
+  async function saveUrl() {
+    const value = rayneUrl.trim().replace(/\/+$/, "");
+    // Saving the default (or an empty field) clears the override.
+    const stored = !value || value === RAYNE_URL ? null : value;
+    await update({ rayne_url: stored }, "url-rayne");
   }
 
   async function update(patch: Partial<Settings>, id: string) {
@@ -627,7 +648,63 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
             }
           />
         </div>
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Cleanup model</div>
+            <div className="help">
+              Rayne 1, fine-tuned for your dictation and served from your
+              homeserver over the tailnet.
+            </div>
+          </div>
+          <kbd>Rayne 1</kbd>
+        </div>
       </div>
+
+      <div className="group-label">Advanced</div>
+      <details className="card advanced">
+        <summary>
+          <span className="label">Rayne endpoint</span>
+          <span className="advanced-hint">
+            Override the homeserver base URL
+          </span>
+          <ChevronIcon size={12} />
+        </summary>
+        <div className="row">
+          <div className="row-copy">
+            <div className="label">Rayne URL</div>
+            <div className="help">The cleanup server on your tailnet.</div>
+          </div>
+          <div className="url-editor">
+            <input
+              className="input"
+              type="url"
+              value={rayneUrl}
+              onChange={(event) => setRayneUrl(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && busy === null) {
+                  event.preventDefault();
+                  void saveUrl();
+                }
+              }}
+              aria-label="Rayne base URL"
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void saveUrl()}
+              disabled={
+                busy !== null ||
+                rayneUrl.trim().replace(/\/+$/, "") ===
+                  (snapshot.settings.rayne_url ?? RAYNE_URL)
+              }
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </details>
 
       <div className="group-label">General</div>
       <div className="card">
@@ -689,24 +766,6 @@ export function SettingsPage({ snapshot, refresh, notify, updater }: Props) {
                 { launch_at_login: !snapshot.launch_at_login },
                 "autostart",
               )
-            }
-          />
-        </div>
-
-        <div className="row">
-          <div className="row-copy">
-            <div className="label">Keep original transcripts</div>
-            <div className="help">Save the uncleaned text next to each dictation.</div>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={snapshot.settings.keep_raw}
-            aria-label="Keep original transcripts"
-            className="switch"
-            disabled={busy !== null}
-            onClick={() =>
-              void update({ keep_raw: !snapshot.settings.keep_raw }, "raw")
             }
           />
         </div>

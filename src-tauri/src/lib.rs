@@ -110,6 +110,7 @@ pub fn run() {
             commands::add_dictionary,
             commands::remove_dictionary,
             commands::delete_history,
+            commands::set_flagged,
             commands::clear_history,
             commands::copy_text,
             commands::get_unsaved_text,

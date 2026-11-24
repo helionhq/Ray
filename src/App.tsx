@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { api, onEvent, type Snapshot } from "./lib/bridge";
 import { applyTheme } from "./lib/theme";
 import { DictionaryPage } from "./pages/Dictionary";
@@ -120,8 +126,15 @@ export default function App() {
   }
 
   const missingKey = !snapshot.keys.assemblyai;
+  const missingRayneKey =
+    snapshot.settings.cleanup_enabled && !snapshot.keys.rayne;
   const hotkeyIssue = Boolean(snapshot.hotkey_error);
-  const showBanner = missingKey || hotkeyIssue;
+  const showBanner = missingKey || missingRayneKey || hotkeyIssue;
+  const bannerMessages = [
+    missingKey && "Add an AssemblyAI key to start dictating.",
+    missingRayneKey && "Add a Rayne key to clean up transcripts.",
+    hotkeyIssue && "The Right Alt shortcut is unavailable.",
+  ].filter(Boolean) as string[];
 
   return (
     <div className="app">
@@ -163,9 +176,12 @@ export default function App() {
           <div className="banner" role="status">
             <AlertIcon size={14} className="banner-icon" />
             <span className="banner-text">
-              {missingKey && "Add an AssemblyAI key to start dictating."}
-              {missingKey && hotkeyIssue && <span className="banner-sep" />}
-              {hotkeyIssue && "The Right Alt shortcut is unavailable."}
+              {bannerMessages.map((message, index) => (
+                <Fragment key={message}>
+                  {index > 0 && <span className="banner-sep" />}
+                  {message}
+                </Fragment>
+              ))}
             </span>
             <button
               type="button"
