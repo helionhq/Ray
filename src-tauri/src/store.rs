@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config;
+
 const FILE_NAME: &str = "ray.json";
 const MAX_HISTORY: usize = 1_000;
 const MAX_DICTIONARY: usize = 200;
@@ -25,10 +27,15 @@ pub struct Settings {
     pub input_device: Option<String>,
     pub cleanup_enabled: bool,
     pub streaming_enabled: bool,
-    pub keep_raw: bool,
     /// "system", "light", or "dark". Old documents without this field load
     /// with the default because the struct is `#[serde(default)]`.
     pub theme: String,
+    /// The Rayne cleanup model. There is only one (`rayne-1`); the field is
+    /// kept so older stored settings still load.
+    pub cleanup_model: String,
+    /// Optional base-URL override from Settings → Advanced. `None` means the
+    /// homeserver default embedded in the pipeline config.
+    pub rayne_url: Option<String>,
 }
 
 impl Default for Settings {
@@ -38,8 +45,9 @@ impl Default for Settings {
             input_device: None,
             cleanup_enabled: true,
             streaming_enabled: true,
-            keep_raw: true,
             theme: "system".into(),
+            cleanup_model: config::default_cleanup_model(),
+            rayne_url: None,
         }
     }
 }
@@ -53,19 +61,51 @@ fn normalize_theme(theme: &str) -> String {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Trim a user-supplied Rayne base URL to its root (no trailing slash). Empty
+/// input means "use the production default" (`None`). Invalid URLs are
+/// rejected on save; a hand-edited store falls back to the default on load.
+fn normalize_rayne_url(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = url::Url::parse(trimmed)
+        .map_err(|_| "The Rayne base URL must be a valid http(s) URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("The Rayne base URL must be a valid http(s) URL".into());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// One dictation, logged for History and for the Rayne v2 dataset. Every field
+/// the cleanup request used is captured: the raw transcript, the exact
+/// dictionary terms sent, the model, its thinking trace, and the final output.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HistoryEntry {
     pub id: String,
     /// Unix milliseconds.
     pub created_at: i64,
-    pub text: String,
-    pub raw: Option<String>,
-    pub app: Option<String>,
+    /// Final cleaned text (the raw transcript when cleanup was off or failed).
+    pub output: String,
+    /// The uncleaned STT transcript, always kept for v2 training data.
+    pub raw_transcript: Option<String>,
+    /// The exact dictionary terms sent with this request (empty when cleanup
+    /// did not run).
+    pub dictionary: Vec<String>,
+    /// `rayne-1`; `None` when cleanup did not run.
+    pub model: Option<String>,
+    /// Extracted think content; may be an empty string (intentional on short
+    /// dictations). `None` when cleanup did not run or failed.
+    pub thinking: Option<String>,
+    /// The focused app at the start of the dictation, when known.
+    pub app_name: Option<String>,
     pub duration_ms: u64,
-    /// Set when cleanup ran on this dictation ("cleanup"; entries from the
-    /// two-mode era say "clean" or "structured"). Older entries load as `None`.
-    #[serde(default)]
-    pub mode: Option<String>,
+    /// User-marked mistake, collected for Rayne v2.
+    pub flagged: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -169,6 +209,14 @@ impl Store {
             .data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Pre-Rayne entries have no `output` field (they stored `text`); the
+        // v2 log starts fresh, so legacy entries are cleared on first load.
+        let before = data.history.len();
+        data.history.retain(|entry| !entry.output.is_empty());
+        let removed = before - data.history.len();
+        if removed > 0 {
+            eprintln!("[ray] cleared {removed} pre-Rayne history entries (legacy format)");
+        }
         data.history
             .sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
         data.history.truncate(MAX_HISTORY);
@@ -179,6 +227,11 @@ impl Store {
         });
         data.dictionary.truncate(MAX_DICTIONARY);
         data.settings.theme = normalize_theme(&data.settings.theme);
+        data.settings.cleanup_model = config::normalize_cleanup_model(&data.settings.cleanup_model);
+        // A hand-edited URL that no longer parses falls back to the default
+        // rather than breaking every cleanup request.
+        data.settings.rayne_url =
+            normalize_rayne_url(data.settings.rayne_url.as_deref()).unwrap_or(None);
     }
 
     fn persist(&self, data: &StoreData) -> Result<(), String> {
@@ -220,6 +273,7 @@ impl Store {
     }
 
     pub fn update_settings(&self, settings: Settings) -> Result<Settings, String> {
+        let rayne_url = normalize_rayne_url(settings.rayne_url.as_deref())?;
         let mut data = self
             .data
             .lock()
@@ -233,8 +287,9 @@ impl Store {
                 .filter(|name| !name.is_empty()),
             cleanup_enabled: settings.cleanup_enabled,
             streaming_enabled: settings.streaming_enabled,
-            keep_raw: settings.keep_raw,
             theme: normalize_theme(&settings.theme),
+            cleanup_model: config::normalize_cleanup_model(&settings.cleanup_model),
+            rayne_url,
         };
         self.persist(&candidate)?;
         *data = candidate;
@@ -261,6 +316,27 @@ impl Store {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut candidate = data.clone();
         candidate.history.retain(|entry| entry.id != id);
+        self.persist(&candidate)?;
+        *data = candidate;
+        Ok(())
+    }
+
+    /// Mark (or unmark) a dictation as a mistake for the Rayne v2 dataset.
+    pub fn set_flagged(&self, id: &str, flagged: bool) -> Result<(), String> {
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut candidate = data.clone();
+        let entry = candidate
+            .history
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "That entry no longer exists".to_string())?;
+        if entry.flagged == flagged {
+            return Ok(());
+        }
+        entry.flagged = flagged;
         self.persist(&candidate)?;
         *data = candidate;
         Ok(())
@@ -395,8 +471,10 @@ mod tests {
         let settings: Settings =
             serde_json::from_str(r#"{"keep_raw":false,"streaming_enabled":false}"#).unwrap();
         assert_eq!(settings.theme, "system");
-        assert!(!settings.keep_raw);
         assert!(!settings.streaming_enabled);
+        // New fields default cleanly on old documents.
+        assert_eq!(settings.cleanup_model, config::RAYNE_MODEL_ID);
+        assert!(settings.rayne_url.is_none());
     }
 
     #[test]
@@ -414,12 +492,98 @@ mod tests {
     }
 
     #[test]
-    fn history_entries_written_before_modes_load_without_one() {
-        let entry: HistoryEntry = serde_json::from_str(
-            r#"{"id":"a","created_at":1,"text":"hi","raw":null,"app":null,"duration_ms":10}"#,
+    fn pre_rayne_history_entries_are_cleared_on_load() {
+        let dir = std::env::temp_dir().join(format!("ray-store-test-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A legacy entry (text/raw/app) next to a v2 entry (output/...).
+        std::fs::write(
+            dir.join(FILE_NAME),
+            r#"{"history":[
+                {"id":"old","created_at":1,"text":"legacy","raw":null,"app":null,"duration_ms":10,"mode":"cleanup"},
+                {"id":"new","created_at":2,"output":"fresh","raw_transcript":"raw fresh",
+                 "dictionary":["Rayne"],"model":"rayne-1","thinking":"","app_name":"Notepad",
+                 "duration_ms":20,"flagged":false}
+            ]}"#,
         )
         .unwrap();
-        assert_eq!(entry.mode, None);
+        let store = Store::load(&dir);
+        let history = store.snapshot().history;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "new");
+        assert_eq!(history[0].output, "fresh");
+        assert_eq!(history[0].raw_transcript.as_deref(), Some("raw fresh"));
+        assert_eq!(history[0].dictionary, vec!["Rayne".to_string()]);
+        assert_eq!(history[0].model.as_deref(), Some("rayne-1"));
+        assert_eq!(history[0].thinking.as_deref(), Some(""));
+        assert!(!history[0].flagged);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_history_entries_default_flagged_to_false() {
+        let entry: HistoryEntry = serde_json::from_str(
+            r#"{"id":"a","created_at":1,"output":"hi","duration_ms":10}"#,
+        )
+        .unwrap();
+        assert!(!entry.flagged);
+        assert!(entry.dictionary.is_empty());
+        assert!(entry.model.is_none());
+        assert!(entry.thinking.is_none());
+    }
+
+    #[test]
+    fn flagged_is_toggled_and_persisted() {
+        let store = temp_store();
+        let entry = HistoryEntry {
+            id: "a".into(),
+            created_at: 1,
+            output: "text".into(),
+            ..HistoryEntry::default()
+        };
+        store.add_history(entry).unwrap();
+        store.set_flagged("a", true).unwrap();
+        assert!(store.snapshot().history[0].flagged);
+        // Survives a reload from disk.
+        let reloaded = Store::load(store.path.parent().unwrap());
+        assert!(reloaded.snapshot().history[0].flagged);
+        store.set_flagged("a", false).unwrap();
+        assert!(!store.snapshot().history[0].flagged);
+        assert!(store.set_flagged("missing", true).is_err());
+    }
+
+    #[test]
+    fn cleanup_model_and_urls_are_normalized_on_save() {
+        let store = temp_store();
+        let saved = store
+            .update_settings(Settings {
+                cleanup_model: " Rayne-1-Pro ".into(),
+                rayne_url: Some(" http://homeserver:8000/ ".into()),
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(saved.cleanup_model, config::RAYNE_MODEL_ID);
+        assert_eq!(saved.rayne_url.as_deref(), Some("http://homeserver:8000"));
+
+        // Unknown models normalize to the single Rayne model; invalid URLs rejected.
+        let saved = store
+            .update_settings(Settings {
+                cleanup_model: "gemma-4-31b".into(),
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(saved.cleanup_model, config::RAYNE_MODEL_ID);
+        assert!(store
+            .update_settings(Settings {
+                rayne_url: Some("not a url".into()),
+                ..Settings::default()
+            })
+            .is_err());
+        assert!(store
+            .update_settings(Settings {
+                rayne_url: Some("ftp://example.com".into()),
+                ..Settings::default()
+            })
+            .is_err());
     }
 
     #[test]
@@ -467,11 +631,8 @@ mod tests {
         let entry = HistoryEntry {
             id: "a".into(),
             created_at: 1,
-            text: "text".into(),
-            raw: None,
-            app: None,
-            duration_ms: 10,
-            mode: None,
+            output: "text".into(),
+            ..HistoryEntry::default()
         };
         assert!(store.add_history(entry).is_err());
         assert!(store.snapshot().history.is_empty());
@@ -561,11 +722,8 @@ mod tests {
         let entry = HistoryEntry {
             id: "a".into(),
             created_at: 1,
-            text: "text".into(),
-            raw: None,
-            app: None,
-            duration_ms: 10,
-            mode: None,
+            output: "text".into(),
+            ..HistoryEntry::default()
         };
         assert!(store.add_history(entry).is_err());
         assert!(store.add_dictionary("Helion").is_err());
@@ -599,11 +757,10 @@ mod tests {
         let entry = |id: &str, at: i64| HistoryEntry {
             id: id.into(),
             created_at: at,
-            text: format!("text {id}"),
-            raw: None,
-            app: Some("Notepad".into()),
+            output: format!("text {id}"),
+            app_name: Some("Notepad".into()),
             duration_ms: 1000,
-            mode: None,
+            ..HistoryEntry::default()
         };
         store.add_history(entry("a", 1)).unwrap();
         store.add_history(entry("b", 2)).unwrap();

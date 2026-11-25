@@ -8,9 +8,9 @@ Built with Tauri 2 (Rust backend, React + TypeScript frontend). The floating bar
 
 - **Right Alt toggles recording.** A low-level keyboard hook swallows both edges of the modifier so the target app never opens its menu bar. Pressing another key while Right Alt is held cancels the recording and replays the chord with Right Alt down, so AltGr characters (`@`, `€`) and Alt+Tab still work. **Esc** cancels.
 - **AssemblyAI Sync live** streams 16 kHz mono PCM while you talk. Stopping leaves only the tail and final decode (~0.5 s typical). If live fails, Ray falls back to Sync batch, then the asynchronous v2 batch API, using the locally buffered WAV.
-- **Cleanup** sends the transcript through an OpenAI-compatible chat endpoint on the AssemblyAI LLM Gateway (same key as STT). It removes fillers, stutters and self-corrections, fixes misheard words, grammar and punctuation, and formats paragraphs, lists and emails, while keeping your own words and order. Each request is hedged with a duplicate after a length-scaled delay, so a stalled gateway call does not block the paste. If cleanup fails, the raw transcript is pasted rather than lost.
+- **Cleanup** sends the transcript to **Rayne 1**, a model fine-tuned for your dictation and served from your homeserver over the tailnet (`http://homeserver:8000`), through an OpenAI-compatible chat endpoint. There is one model and nothing to pick. Pressing the hotkey fires a non-blocking `/warmup` reachability ping; a request that times out retries with a short backoff. If cleanup fails, the raw transcript is pasted rather than lost.
 - **Paste** saves the clipboard, sets the cleaned text, sends Ctrl+V to the focused window, then restores the clipboard. Restore timing is adaptive (longer for Electron, Office, and browsers) and is skipped if anything else changed the clipboard meanwhile, so slow targets never paste the old contents. Transient dictation text is excluded from Win+V clipboard history and cloud clipboard. If the focused window is elevated, Ray says so instead of silently failing.
-- **History**, a **dictionary** of preferred spellings, and **keys/settings** live in a monochrome Notion/Linear-style window. Closing it hides it; Ray stays in the tray.
+- **History**, a **dictionary** of preferred spellings, and **keys/settings** live in a monochrome Notion/Linear-style window. Closing it hides it; Ray stays in the tray. Every dictation is logged with its raw transcript, the dictionary terms sent, the model, and the final output; entries can be flagged as mistakes for the next Rayne training round.
 - The bar is always-on-top, click-through, non-focusable, hidden from the taskbar, and sits above the taskbar of the monitor with the focused window.
 
 ## Requirements
@@ -41,24 +41,25 @@ for the pipeline, manual releases, and the signing key.
 
 ## Keys
 
-Enter keys in **Settings → Transcription / Cleanup**. They are stored in **Windows Credential Manager** under service `ray`, and are never written to the repo or baked into the binary.
+Enter keys in **Settings → Transcription**. They are stored in **Windows Credential Manager** under service `ray`, and are never written to the repo or baked into the binary.
 
 For development and headless tests, the app also accepts environment variables when no stored key exists:
 
-- `ASSEMBLYAI_API_KEY`
+- `ASSEMBLYAI_API_KEY` — AssemblyAI speech-to-text.
+- `RAYNE_API_KEY` — optional bearer token for a custom Rayne endpoint. The tailnet homeserver needs no key.
 
-Put it in a local `.env` (gitignored) and export it before launching, or set it in the shell. The AssemblyAI key powers both STT and the cleanup model.
+Put them in a local `.env` (gitignored) and export them before launching, or set them in the shell.
 
 ## Swapping the prompt or models
 
 Everything lives in these files:
 
-- `src-tauri/prompts/cleanup.md` — the cleanup system prompt. It supports `{{DICTIONARY}}`, `{{KNOWN_NAMES}}`, `{{APP_NAME}}`, and `{{TRANSCRIPT}}`. Keep it general: personal names and terms belong in the user dictionary (Settings → Dictionary), not in the prompt.
-- `src-tauri/config/pipeline.json` — STT mode/model/endpoints, cleanup provider order, models, temperature, retries, timeouts (`timeout_ms` / `hedge_after_ms` plus a `*_per_word` increment), and the built-in known-names list.
+- `src-tauri/prompts/cleanup.md` — the cleanup system prompt, verbatim from the Rayne production prompt. The user's dictionary is appended as a single `Dictionary: term1, term2, ...` line at request time (omitted when empty). Keep it general: personal names and terms belong in the user dictionary (Settings → Dictionary), not in the prompt.
+- `src-tauri/config/pipeline.json` — STT mode/model/endpoints, the Rayne cleanup provider, temperature, retries, timeouts (`timeout_ms` plus a `*_per_word` increment), and the built-in known-names list.
 
 Rebuild after editing them, or override at runtime without a rebuild by placing `cleanup.md` and/or `pipeline.json` in `%APPDATA%\com.helion.ray\` and pressing **Settings → About → Reload config**. Runtime overrides use the same schema as the checked-in files.
 
-To use a different STT protocol, set `stt.mode` to `sync_live` (default) or `websocket`. To add an LLM provider, add an entry to `cleanup.providers` with an OpenAI-compatible `base_url`, `model`, and one of the `api_key_secret` values (`assemblyai`, `vercel`) and the matching key in Settings.
+To use a different STT protocol, set `stt.mode` to `sync_live` (default) or `websocket`. To add an LLM provider, add an entry to `cleanup.providers` with an OpenAI-compatible `base_url`, `model`, and an `api_key_secret` (`rayne`, `vercel`, or empty for no auth) plus the matching key in Settings. The AssemblyAI LLM Gateway and Groq are retired for cleanup; overrides that still list them fall back to the embedded Rayne default. The Rayne base URL can also be overridden in **Settings → Advanced**.
 
 ## Headless verification
 
@@ -84,7 +85,7 @@ RAY_TEST_FORCE_FALLBACK=1 cargo run ... --selftest ...
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest-mic
 ```
 
-The selftest prints `stop_to_transcript_ms` and `cleanup_ms`, and falls back to batch if the live request fails, exactly like the app. Set `RAY_TEST_WARM=1` to pre-warm the cleanup connection before STT (simulating a recording), and `RAY_TEST_REPEAT_CLEANUP=1` to measure a second, already-warm cleanup call.
+The selftest prints `stop_to_transcript_ms` and `cleanup_ms`, and falls back to batch if the live request fails, exactly like the app. Set `RAY_TEST_WARM=1` to ping the selected model's `/warmup` before STT (simulating the hotkey press), `RAY_TEST_CLEANUP_MODEL=rayne-1-pro` to test Pro instead of Air, and `RAY_TEST_REPEAT_CLEANUP=1` to measure a second, already-warm cleanup call.
 
 A 16 kHz mono WAV can be generated with Deepgram:
 
@@ -103,7 +104,7 @@ src-tauri/src/
   hotkey.rs      WH_KEYBOARD_LL thread: Right Alt toggle, Esc cancel, AltGr chord recovery
   audio.rs       cpal capture, mono downmix, low-pass + resample to 16 kHz PCM16, level meter
   stt.rs         AssemblyAI Sync live, WebSocket streaming, Sync batch, v2 batch fallback
-  cleanup.rs     OpenAI-compatible cleanup with retry/backoff and provider fallback
+  cleanup.rs     Rayne cleanup: think-tag parsing, cold-start retries, provider fallback
   pipeline.rs    recording session state machine and bar/paste orchestration
   paste.rs       clipboard save/restore + Ctrl+V via SendInput
   windows_util.rs bar window styles/positioning, foreground app, launch-at-login

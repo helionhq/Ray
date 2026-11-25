@@ -165,6 +165,26 @@ impl Dictation {
             .cloned()
     }
 
+    /// The single cleanup provider chosen in Settings (Rayne Air or Pro), with
+    /// the user's base-URL override applied. Used by the key test so it checks
+    /// exactly the model dictation will use.
+    pub fn selected_cleanup_provider(&self) -> Option<crate::config::CleanupProvider> {
+        let settings = self.store.settings();
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        config
+            .pipeline
+            .cleanup
+            .selected(
+                settings.rayne_url.as_deref(),
+            )
+            .providers
+            .into_iter()
+            .next()
+    }
+
     pub fn reload_config(&self, app_data: &Path) {
         let config = RuntimeConfig::load(app_data);
         *self
@@ -215,6 +235,20 @@ impl Dictation {
         }
         let target = windows_util::foreground();
 
+        // Ping the selected Rayne model's /warmup the moment the hotkey starts
+        // a recording, so the Modal container restores from its GPU snapshot
+        // while the user speaks. Fire-and-forget: recording never waits on it,
+        // and only the selected model is contacted (the other stays at $0.00).
+        if settings.cleanup_enabled && pipeline.cleanup.enabled {
+            let http = self.http.clone();
+            let cleanup_config = pipeline.cleanup.selected(
+                settings.rayne_url.as_deref(),
+            );
+            tokio::spawn(async move {
+                cleanup::warmup(&http, &cleanup_config).await;
+            });
+        }
+
         // Show the bar before the microphone opens; it should feel instant.
         self.emit_bar(json!({ "phase": "recording" }));
         self.show_bar();
@@ -231,15 +265,6 @@ impl Dictation {
         } else {
             None
         };
-        // Warm the LLM gateway while the user speaks, so the first dictation
-        // does not pay a cold TLS handshake after the hotkey is released.
-        if settings.cleanup_enabled && pipeline.cleanup.enabled {
-            let http = self.http.clone();
-            let cleanup_config = pipeline.cleanup.clone();
-            tokio::spawn(async move {
-                cleanup::warm_connection(&http, &cleanup_config).await;
-            });
-        }
         let (dummy_tx, dummy_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(dummy_rx);
         let audio_tx = stream
@@ -480,29 +505,39 @@ impl Dictation {
         };
 
         let settings = self.store.settings();
-        // Per-request timeout and hedge grow with the dictation's length;
-        // `cleanup::cleanup` applies the same scaling to the config it gets.
-        let cleanup_config = &pipeline.cleanup;
+        // Only the model selected in Settings is contacted. The per-request
+        // timeout grows with the dictation's length; `cleanup::cleanup`
+        // applies the same scaling to the config it gets.
+        let cleanup_config = pipeline.cleanup.selected(
+            settings.rayne_url.as_deref(),
+        );
         let cleanup_timeout_ms = cleanup_config.scaled_for(&raw_text).timeout_ms;
         let mut text = raw_text.clone();
         let mut note: Option<String> = None;
+        let mut thinking: Option<String> = None;
+        let mut dictionary_sent: Vec<String> = Vec::new();
+        let mut model_used: Option<String> = None;
         if cleanup_enabled && pipeline.cleanup.enabled {
             let dictionary = self.store.dictionary();
-            let app_name = target
-                .as_ref()
-                .and_then(|target| target.app.clone())
-                .unwrap_or_else(|| "Unknown app".into());
-            let timeout = Duration::from_millis(cleanup_timeout_ms + 6_000);
+            dictionary_sent = dictionary.clone();
+            model_used = cleanup_config
+                .providers
+                .first()
+                .map(|provider| provider.model.clone());
+            // The outer budget covers the cold-start retry window (a Modal
+            // container restores from its GPU snapshot in ~10-20 s) plus the
+            // length-scaled request timeout and a margin.
+            let timeout = Duration::from_millis(
+                cleanup_timeout_ms + cleanup_config.cold_retry_budget_ms + 10_000,
+            );
             match tokio::time::timeout(
                 timeout,
                 cleanup::cleanup(
                     &self.http,
-                    cleanup_config,
+                    &cleanup_config,
                     &cleanup_prompt,
                     &raw_text,
                     &dictionary,
-                    &pipeline.known_names,
-                    &app_name,
                 ),
             )
             .await
@@ -510,6 +545,7 @@ impl Dictation {
                 Ok(result) => {
                     text = result.text;
                     note = result.note;
+                    thinking = result.thinking;
                 }
                 Err(_) => {
                     note = Some("Cleanup timed out; pasted the raw transcript".into());
@@ -517,16 +553,19 @@ impl Dictation {
             }
         }
 
-        let raw_for_history =
-            (settings.keep_raw && text.trim() != raw_text.trim()).then(|| raw_text.clone());
+        // The v2 log keeps everything the request used: raw transcript,
+        // dictionary, model, thinking trace, and the final output.
         let entry = HistoryEntry {
             id: store::new_id(),
             created_at: store::now_millis(),
-            text: text.clone(),
-            raw: raw_for_history,
-            app: target.as_ref().and_then(|target| target.app.clone()),
+            output: text.clone(),
+            raw_transcript: Some(raw_text.clone()),
+            dictionary: dictionary_sent,
+            model: model_used,
+            thinking,
+            app_name: target.as_ref().and_then(|target| target.app.clone()),
             duration_ms,
-            mode: (cleanup_enabled && pipeline.cleanup.enabled).then(|| "cleanup".to_string()),
+            flagged: false,
         };
         let history_saved = match self.store.add_history(entry) {
             Ok(()) => true,

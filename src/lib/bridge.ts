@@ -4,11 +4,19 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export interface HistoryEntry {
   id: string;
   created_at: number;
-  text: string;
-  raw: string | null;
-  app: string | null;
+  /** Final cleaned text (raw transcript when cleanup was off or failed). */
+  output: string;
+  raw_transcript: string | null;
+  /** Exact dictionary terms sent with this request. */
+  dictionary: string[];
+  /** "rayne-1"; null when cleanup did not run. */
+  model: string | null;
+  /** Extracted think content; may be "" (intentional on short dictations). */
+  thinking: string | null;
+  app_name: string | null;
   duration_ms: number;
-  mode: string | null;
+  /** User-marked mistake, collected for Rayne v2. */
+  flagged: boolean;
 }
 
 export interface InputDevice {
@@ -19,18 +27,26 @@ export interface InputDevice {
 
 export type Theme = "system" | "light" | "dark";
 
+export type CleanupModel = "rayne-1";
+
+/** The Rayne cleanup server on the homeserver (tailnet); mirrors config.rs. */
+export const RAYNE_URL = "http://homeserver:8000";
+
 export interface Settings {
   launch_at_login: boolean;
   input_device: string | null;
   cleanup_enabled: boolean;
   streaming_enabled: boolean;
-  keep_raw: boolean;
   theme: Theme;
+  cleanup_model: CleanupModel;
+  /** Base-URL override; null means the homeserver default above. */
+  rayne_url: string | null;
 }
 
 export interface KeyStatus {
   assemblyai: boolean;
   vercel: boolean;
+  rayne: boolean;
 }
 
 export interface Snapshot {
@@ -44,7 +60,7 @@ export interface Snapshot {
   version: string;
 }
 
-export type Provider = "assemblyai" | "vercel";
+export type Provider = "assemblyai" | "vercel" | "rayne";
 
 /** True only inside a Tauri webview; plain-browser previews have no IPC. */
 export function hasTauri(): boolean {
@@ -72,6 +88,8 @@ export const api = {
   addDictionary: (term: string) => call<string[]>("add_dictionary", { term }),
   removeDictionary: (term: string) => call<string[]>("remove_dictionary", { term }),
   deleteHistory: (id: string) => call<void>("delete_history", { id }),
+  setFlagged: (id: string, flagged: boolean) =>
+    call<void>("set_flagged", { id, flagged }),
   clearHistory: () => call<void>("clear_history"),
   copyText: (text: string) => call<void>("copy_text", { text }),
   startDictation: () => call<void>("start_dictation"),

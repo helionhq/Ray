@@ -3,8 +3,8 @@
 //! Both are embedded in the binary but can be overridden at runtime by files in
 //! the app-data directory (`pipeline.json`, `cleanup.md`). This is the one
 //! place where models, endpoints, and STT options live. The defaults are
-//! AssemblyAI Sync live STT + a Gemma cleanup pass on the AssemblyAI LLM
-//! Gateway.
+//! AssemblyAI Sync live STT + a single Rayne 1 cleanup pass served from the
+//! homeserver over the tailnet.
 
 use std::path::Path;
 
@@ -12,6 +12,20 @@ use serde::{Deserialize, Serialize};
 
 pub const EMBEDDED_PIPELINE: &str = include_str!("../config/pipeline.json");
 pub const EMBEDDED_PROMPT: &str = include_str!("../prompts/cleanup.md");
+
+/// The Rayne cleanup model runs on the homeserver, reached over the tailnet.
+/// Users can override the base URL in Settings → Advanced; this is the default.
+pub const RAYNE_URL: &str = "http://homeserver:8000";
+pub const RAYNE_MODEL_ID: &str = "rayne-1";
+
+pub fn default_cleanup_model() -> String {
+    RAYNE_MODEL_ID.into()
+}
+
+/// There is only one Rayne model; any stored value normalizes to it.
+pub fn normalize_cleanup_model(_model: &str) -> String {
+    RAYNE_MODEL_ID.into()
+}
 pub fn default_known_names() -> Vec<String> {
     [
         "ChatGPT",
@@ -192,6 +206,13 @@ pub struct CleanupConfig {
     pub hedge_after_ms: u64,
     #[serde(default = "default_hedge_after_ms_per_word")]
     pub hedge_after_ms_per_word: u64,
+    /// How long a cleanup request keeps retrying HTTP 503 (or a timeout) while
+    /// the Modal container restores from its GPU snapshot (~10-20 s after
+    /// idle). The hotkey `/warmup` ping normally makes this irrelevant.
+    #[serde(default = "default_cold_retry_budget_ms")]
+    pub cold_retry_budget_ms: u64,
+    #[serde(default = "default_cold_retry_delay_ms")]
+    pub cold_retry_delay_ms: u64,
     pub retries: u32,
     pub backoff_ms: Vec<u64>,
     pub providers: Vec<CleanupProvider>,
@@ -213,14 +234,46 @@ impl CleanupConfig {
             .saturating_add(words.saturating_mul(self.hedge_after_ms_per_word));
         config
     }
+
+    /// Restrict the config to the single Rayne provider and apply the user's
+    /// base-URL override from Settings. Rayne is served from the homeserver
+    /// over the tailnet and needs no API key.
+    pub fn selected(&self, url_override: Option<&str>) -> CleanupConfig {
+        let mut provider = self
+            .providers
+            .iter()
+            .find(|provider| {
+                provider.id.eq_ignore_ascii_case(RAYNE_MODEL_ID)
+                    || provider.model.eq_ignore_ascii_case(RAYNE_MODEL_ID)
+            })
+            .cloned()
+            .unwrap_or_else(|| CleanupProvider {
+                id: RAYNE_MODEL_ID.into(),
+                base_url: format!("{RAYNE_URL}/v1"),
+                model: RAYNE_MODEL_ID.into(),
+                api_key_secret: String::new(),
+                extra_body: None,
+            });
+        if let Some(root) = url_override {
+            let root = root.trim().trim_end_matches('/');
+            if !root.is_empty() {
+                provider.base_url = format!("{root}/v1");
+            }
+        }
+        provider.id = RAYNE_MODEL_ID.into();
+        provider.model = RAYNE_MODEL_ID.into();
+        let mut config = self.clone();
+        config.providers = vec![provider];
+        config
+    }
 }
 
 pub fn default_cleanup_timeout_ms() -> u64 {
-    6_000
+    15_000
 }
 
 pub fn default_timeout_ms_per_word() -> u64 {
-    0
+    40
 }
 
 pub fn default_hedge_after_ms() -> u64 {
@@ -229,6 +282,14 @@ pub fn default_hedge_after_ms() -> u64 {
 
 pub fn default_hedge_after_ms_per_word() -> u64 {
     0
+}
+
+pub fn default_cold_retry_budget_ms() -> u64 {
+    60_000
+}
+
+pub fn default_cold_retry_delay_ms() -> u64 {
+    1_500
 }
 
 impl Default for CleanupConfig {
@@ -241,13 +302,15 @@ impl Default for CleanupConfig {
             timeout_ms_per_word: default_timeout_ms_per_word(),
             hedge_after_ms: default_hedge_after_ms(),
             hedge_after_ms_per_word: default_hedge_after_ms_per_word(),
+            cold_retry_budget_ms: default_cold_retry_budget_ms(),
+            cold_retry_delay_ms: default_cold_retry_delay_ms(),
             retries: 2,
             backoff_ms: vec![300, 900],
             providers: vec![CleanupProvider {
-                id: "assemblyai".into(),
-                base_url: "https://llm-gateway.assemblyai.com/v1".into(),
-                model: "gemma-4-31b".into(),
-                api_key_secret: "assemblyai".into(),
+                id: RAYNE_MODEL_ID.into(),
+                base_url: format!("{RAYNE_URL}/v1"),
+                model: RAYNE_MODEL_ID.into(),
+                api_key_secret: String::new(),
                 extra_body: None,
             }],
         }
@@ -282,10 +345,14 @@ fn is_retired_provider(provider: &CleanupProvider) -> bool {
             .any(|retired| value.eq_ignore_ascii_case(retired))
     };
     // The endpoint is the third signal: older overrides may use a custom id or
-    // secret name but still point at the retired provider's API host.
+    // secret name but still point at a retired provider's API host. The
+    // AssemblyAI LLM Gateway is retired for cleanup (Rayne replaced it); the
+    // AssemblyAI *credential* stays because STT still uses it.
     let uses_retired_host = url::Url::parse(&provider.base_url).is_ok_and(|url| {
-        url.host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case("api.groq.com"))
+        url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("api.groq.com")
+                || host.eq_ignore_ascii_case("llm-gateway.assemblyai.com")
+        })
     });
     is_retired_name(&provider.id) || is_retired_name(&provider.api_key_secret) || uses_retired_host
 }
@@ -364,10 +431,21 @@ mod tests {
         let config = PipelineConfig::default();
         assert_eq!(config.stt.mode, "sync_live");
         assert_eq!(config.stt.sync_live.model, "universal-3-5-pro");
-        assert_eq!(config.cleanup.providers[0].model, "gemma-4-31b");
+        assert_eq!(config.cleanup.providers.len(), 1);
+        assert_eq!(config.cleanup.providers[0].model, RAYNE_MODEL_ID);
+        assert!(config
+            .cleanup
+            .providers
+            .iter()
+            .all(|p| p.api_key_secret.is_empty()));
         assert!(config.cleanup.providers.iter().all(|p| p.id != "groq"));
         assert_eq!(config.cleanup.max_tokens, 3_000);
-        assert!(!EMBEDDED_PROMPT.trim().is_empty());
+        assert_eq!(config.cleanup.temperature, 0.0);
+        // The production prompt, verbatim from the Rayne dataset builder.
+        let prompt = EMBEDDED_PROMPT.trim();
+        assert!(prompt.starts_with("Clean up the raw voice transcript into polished text."));
+        assert!(prompt.ends_with("Output only the cleaned text."));
+        assert!(!prompt.contains("{{"));
         // The built-in lists are general: nothing personal to one user.
         for personal in ["Arham", "Helion", "Ray"] {
             assert!(!config.known_names.iter().any(|name| name == personal));
@@ -401,14 +479,56 @@ mod tests {
                 "backoff_ms":[300,900],"providers":[]}"#,
         )
         .unwrap();
-        assert_eq!(cleanup.timeout_ms, 6_000);
+        assert_eq!(cleanup.timeout_ms, 15_000);
         assert_eq!(cleanup.hedge_after_ms, 2_500);
-        assert_eq!(cleanup.scaled_for("a b c").timeout_ms, 6_000);
+        assert_eq!(cleanup.cold_retry_budget_ms, 60_000);
+        assert_eq!(cleanup.cold_retry_delay_ms, 1_500);
+        assert_eq!(cleanup.scaled_for("a b c").timeout_ms, 15_120);
+    }
+
+    #[test]
+    fn selected_returns_the_single_rayne_model() {
+        let cleanup = CleanupConfig::default();
+        let selected = cleanup.selected(None);
+        assert_eq!(selected.providers.len(), 1);
+        assert_eq!(selected.providers[0].model, RAYNE_MODEL_ID);
+        assert_eq!(selected.providers[0].base_url, format!("{RAYNE_URL}/v1"));
+        assert!(selected.providers[0].api_key_secret.is_empty());
+    }
+
+    #[test]
+    fn selected_applies_the_settings_url_override() {
+        let cleanup = CleanupConfig::default();
+        let overridden = cleanup.selected(Some("http://homeserver:9000/"));
+        assert_eq!(overridden.providers[0].base_url, "http://homeserver:9000/v1");
+        // An empty override keeps the embedded default.
+        let empty = cleanup.selected(Some("  "));
+        assert_eq!(empty.providers[0].base_url, format!("{RAYNE_URL}/v1"));
+    }
+
+    #[test]
+    fn selected_builds_a_rayne_provider_when_an_override_has_none() {
+        let mut cleanup = CleanupConfig::default();
+        cleanup.providers = vec![CleanupProvider {
+            id: "vercel".into(),
+            base_url: "https://ai-gateway.vercel.sh/v1".into(),
+            model: "openai/gpt-5".into(),
+            api_key_secret: "vercel".into(),
+            extra_body: None,
+        }];
+        let selected = cleanup.selected(None);
+        assert_eq!(selected.providers.len(), 1);
+        assert_eq!(selected.providers[0].model, RAYNE_MODEL_ID);
+        assert!(selected.providers[0].api_key_secret.is_empty());
+        assert_eq!(selected.providers[0].base_url, format!("{RAYNE_URL}/v1"));
     }
 
     #[test]
     fn overrides_from_the_two_mode_era_still_load() {
         let dir = temp_dir("legacy-modes");
+        // The AssemblyAI LLM Gateway is retired for cleanup: an override that
+        // only lists it falls back to the embedded Rayne defaults, while the
+        // rest of the override (max_tokens) survives.
         std::fs::write(
             dir.join("pipeline.json"),
             r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
@@ -423,7 +543,7 @@ mod tests {
         let runtime = RuntimeConfig::load(&dir);
         assert_eq!(
             runtime.pipeline.cleanup.providers[0].model,
-            "claude-sonnet-4-5"
+            RAYNE_MODEL_ID
         );
         assert_eq!(runtime.pipeline.cleanup.max_tokens, 1_500);
         assert_eq!(runtime.prompt, EMBEDDED_PROMPT);
@@ -442,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_override_with_only_groq_falls_back_to_embedded_defaults() {
+    fn legacy_override_with_only_retired_providers_falls_back_to_embedded_defaults() {
         let dir = temp_dir("legacy-groq-only");
         // Each provider is identified as retired by a different signal: the
         // id, the secret name, or the API host.
@@ -466,14 +586,16 @@ mod tests {
             serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
             serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
         );
-        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
-        assert_eq!(runtime.pipeline.cleanup.providers[0].model, "gemma-4-31b");
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, RAYNE_MODEL_ID);
+        assert_eq!(runtime.pipeline.cleanup.providers[0].model, RAYNE_MODEL_ID);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn legacy_override_drops_groq_and_keeps_supported_providers_in_order() {
+    fn legacy_override_drops_retired_providers_and_keeps_supported_ones() {
         let dir = temp_dir("legacy-groq-primary");
+        // Groq and the AssemblyAI LLM Gateway are both retired for cleanup;
+        // the Vercel override survives in order.
         std::fs::write(
             dir.join("pipeline.json"),
             r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
@@ -494,13 +616,11 @@ mod tests {
         let providers = &runtime.pipeline.cleanup.providers;
         assert_eq!(
             providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            ["assemblyai", "vercel"]
+            ["vercel"]
         );
-        assert_eq!(providers[0].model, "gemma-4-31b");
-        assert_eq!(providers[0].api_key_secret, "assemblyai");
-        assert_eq!(providers[1].base_url, "https://ai-gateway.vercel.sh/v1");
-        assert_eq!(providers[1].model, "openai/gpt-5");
-        assert_eq!(providers[1].api_key_secret, "vercel");
+        assert_eq!(providers[0].base_url, "https://ai-gateway.vercel.sh/v1");
+        assert_eq!(providers[0].model, "openai/gpt-5");
+        assert_eq!(providers[0].api_key_secret, "vercel");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -512,9 +632,9 @@ mod tests {
             r#"{"stt":{},"cleanup":{"enabled":true,"temperature":0,
                 "max_tokens":1500,"retries":2,"backoff_ms":[300,900],
                 "providers":[
-                    {"id":"assemblyai",
-                        "base_url":"https://llm-gateway.assemblyai.com/v1",
-                        "model":"claude-sonnet-4-5","api_key_secret":"assemblyai",
+                    {"id":"vercel",
+                        "base_url":"https://ai-gateway.vercel.sh/v1",
+                        "model":"openai/gpt-5","api_key_secret":"vercel",
                         "extra_body":{"reasoning":{"effort":"low"}}}
                 ]}}"#,
         )
@@ -525,10 +645,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
             serde_json::json!([{
-                "id": "assemblyai",
-                "base_url": "https://llm-gateway.assemblyai.com/v1",
-                "model": "claude-sonnet-4-5",
-                "api_key_secret": "assemblyai",
+                "id": "vercel",
+                "base_url": "https://ai-gateway.vercel.sh/v1",
+                "model": "openai/gpt-5",
+                "api_key_secret": "vercel",
                 "extra_body": {"reasoning": {"effort": "low"}}
             }])
         );
@@ -550,10 +670,12 @@ mod tests {
         .unwrap();
 
         let runtime = RuntimeConfig::load(&dir);
+        // The gateway provider is retired; the embedded Rayne defaults take
+        // over while the override's token budget survives.
         assert_eq!(runtime.pipeline.cleanup.providers.len(), 1);
         assert_eq!(
             runtime.pipeline.cleanup.providers[0].model,
-            "claude-sonnet-4-5"
+            RAYNE_MODEL_ID
         );
         assert_eq!(runtime.pipeline.cleanup.max_tokens, 1_500);
 
@@ -566,9 +688,8 @@ mod tests {
                 "providers":[
                     {"id":"groq","base_url":"https://api.groq.com/openai/v1",
                         "model":"llama-3.3-70b","api_key_secret":"groq"},
-                    {"id":"assemblyai",
-                        "base_url":"https://llm-gateway.assemblyai.com/v1",
-                        "model":"claude-sonnet-4-5","api_key_secret":"assemblyai"}
+                    {"id":"vercel","base_url":"https://ai-gateway.vercel.sh/v1",
+                        "model":"openai/gpt-5","api_key_secret":"vercel"}
                 ],
                 "modes":{"structured":{"max_tokens":4200}}}}"#,
         )
@@ -583,7 +704,7 @@ mod tests {
                 .iter()
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
-            ["assemblyai"]
+            ["vercel"]
         );
 
         // When an override leaves no supported provider, filtering falls back
@@ -604,11 +725,11 @@ mod tests {
             serde_json::to_value(&runtime.pipeline.cleanup.providers).unwrap(),
             serde_json::to_value(&PipelineConfig::default().cleanup.providers).unwrap()
         );
-        assert_eq!(runtime.pipeline.cleanup.providers[0].id, "assemblyai");
+        assert_eq!(runtime.pipeline.cleanup.providers[0].id, RAYNE_MODEL_ID);
 
         // The embedded default never contains a retired provider.
         let defaults = PipelineConfig::default();
-        assert_eq!(defaults.cleanup.providers[0].id, "assemblyai");
+        assert_eq!(defaults.cleanup.providers[0].id, RAYNE_MODEL_ID);
         assert!(defaults
             .cleanup
             .providers

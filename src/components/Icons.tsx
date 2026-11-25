@@ -150,3 +150,10 @@ export const KeyboardIcon = (props: IconProps) => (
     <path d="M6 10h.01M9.3 10h.01M12.6 10h.01M15.9 10h.01M19 10h.01M6 13.6h.01M9.3 13.6h.01M12.6 13.6h.01M15.9 13.6h.01M19 13.6h.01M7.5 16.3h9" />
   </Icon>
 );
+
+export const FlagIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z" />
+    <path d="M4 22v-7" />
+  </Icon>
+);

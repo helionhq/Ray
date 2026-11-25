@@ -65,7 +65,7 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             provider.base_url = "https://127.0.0.1:9/v1".into();
         }
     }
-    let cleanup_config = config.cleanup.clone();
+    let cleanup_config = config.cleanup.selected(None);
     let cleanup_prompt = config::EMBEDDED_PROMPT;
     let dictionary: Vec<String> = std::env::var("RAY_TEST_DICTIONARY")
         .ok()
@@ -110,10 +110,10 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
         };
 
         if std::env::var("RAY_TEST_WARM").is_ok() {
-            // Simulates the app opening the cleanup connection while the user
+            // Simulates the app pinging /warmup on hotkey press while the user
             // is speaking: the request finishes long before the hotkey is up.
             let warm_started = Instant::now();
-            cleanup::warm_connection(&http, &cleanup_config).await;
+            cleanup::warmup(&http, &cleanup_config).await;
             println!(
                 "[selftest] timing prewarm_ms={}",
                 warm_started.elapsed().as_millis()
@@ -230,8 +230,6 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
             cleanup_prompt,
             &raw,
             &dictionary,
-            &config.known_names,
-            &app_name,
         )
         .await;
         let cleanup_ms = cleanup_started.elapsed().as_millis();
@@ -243,6 +241,9 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                 .unwrap_or_else(|| "raw fallback".into()),
             result.text
         );
+        if let Some(thinking) = &result.thinking {
+            println!("\n--- THINKING ---\n{thinking}");
+        }
         println!(
             "[selftest] timing cleanup_ms={} app_name={:?}",
             cleanup_ms, app_name
@@ -257,8 +258,6 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                 cleanup_prompt,
                 &raw,
                 &dictionary,
-                &config.known_names,
-                &app_name,
             )
             .await;
             println!(
@@ -279,8 +278,6 @@ fn run_selftest_with(path: &str, streaming: bool, resample: bool) -> i32 {
                         cleanup_prompt,
                         &raw,
                         &dictionary,
-                        &config.known_names,
-                        &app_name,
                     )
                     .await;
                     println!(
